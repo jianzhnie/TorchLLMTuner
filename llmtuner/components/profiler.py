@@ -227,6 +227,8 @@ class Profiler:
             raise RuntimeError("Profiler is already active")
         if self._used:
             raise RuntimeError("Profiler has finished; create a new instance")
+        if self.torch_profiler is not None or self.memory_profiler is not None:
+            raise RuntimeError("Profiler cleanup is pending; close it before retrying")
         self._entered = True
         try:
             self.torch_profiler = self.build_torch_profiler()
@@ -247,6 +249,7 @@ class Profiler:
             try:
                 trace.__exit__(exc_type, exc_val, exc_tb)
             except BaseException as error:
+                self.torch_profiler = trace
                 first_error = error
                 try:
                     logger.exception("Failed to stop trace profiler")
@@ -294,9 +297,12 @@ class Profiler:
     def build_torch_profiler(self) -> torch.profiler.profile | None:
         """Create, start, and return the torch profiler, or ``None`` if off.
 
-        Entered here rather than by the caller so the returned handle is
-        already collecting; :meth:`__exit__` is what stops it.
+        The owner retains the handle before entry, including on startup failure.
+        Standalone callers must close this Profiler if startup raises; the normal
+        context entry path handles that cleanup automatically.
         """
+        if self.torch_profiler is not None:
+            raise RuntimeError("Profiler already owns a trace; close it first")
         cfg = self._config
         if not cfg.enable_profiling:
             return None
@@ -389,20 +395,11 @@ class Profiler:
             record_shapes=True,
             **profile_options,
         )
-        try:
-            torch_profiler.__enter__()
-        except BaseException:
-            # Starting a trace can acquire resources before raising. The
-            # outer context has not received this handle yet, so it cannot
-            # release it. Preserve the original failure if stopping also fails.
-            try:
-                torch_profiler.__exit__(*sys.exc_info())
-            except BaseException:
-                try:
-                    logger.exception("Failed to stop partially started trace profiler")
-                except BaseException:
-                    pass  # Preserve the primary error and continue resource cleanup.
-            raise
+        # Transfer ownership before starting: a failed __enter__ can leave a
+        # partially active trace. The enclosing Profiler entry path uses the same
+        # cleanup and retry policy as normal exit, retaining failed handles.
+        self.torch_profiler = torch_profiler
+        torch_profiler.__enter__()
         return torch_profiler
 
     def build_memory_profiler(self) -> MemoryProfiler | None:

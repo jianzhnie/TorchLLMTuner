@@ -10,10 +10,11 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from ...accelerator.capabilities import has as capability
 from ...accelerator.collectives import synchronize_local_errors
+from ...accelerator.distributed import get_world_size
 from ...accelerator.spmd import spmd_context
 from ...components.loss import IGNORE_INDEX
 from ...components.loss_contract import validate_loss_sum, validate_normalization_tokens
@@ -22,12 +23,12 @@ from ...parallel import compatibility
 from ...parallel.pipeline_parallel.microbatch_drivers import (
     run_eval_microbatches,
     run_microbatches,
-    schedule_stages,
 )
 
 
 class PipelineRuntime(Protocol):
     pp_schedule: Any
+    device: torch.device
     error_group: ProcessGroup | None
     pp_has_first_stage: bool
     pp_has_last_stage: bool
@@ -146,14 +147,41 @@ def prepare_pipeline_inputs(
         "Pipeline input splitting", group=runtime.error_group
     ):
         microbatches = runtime.pp_microbatches(batch)
+        require_positive_integer("pipeline microbatch count", len(microbatches))
+    if get_world_size(runtime.error_group) > 1:
+        counts = [None] * get_world_size(runtime.error_group)
+        dist.all_gather_object(counts, len(microbatches), group=runtime.error_group)
+        if any(count != len(microbatches) for count in counts):
+            raise ValueError("Pipeline ranks disagree on microbatch count")
+    geometry = []
     for microbatch in microbatches:
         inputs, labels, extra_kwargs = runtime.preprocess(microbatch)
+        geometry.append(
+            (tuple(inputs.shape), inputs.dtype, tuple(labels.shape), labels.dtype)
+        )
         if runtime.pp_has_first_stage:
             arg_mbs.append((inputs,))
         kwarg_mbs.append(extra_kwargs)
         if target_mbs is not None:
             target_mbs.append(labels)
 
+    if get_world_size(runtime.error_group) > 1:
+        # PP peers share a batch and a CP/TP coordinate. DP replicas may use
+        # different lengths, so compare geometry only within each pipeline.
+        with synchronize_local_errors(
+            "Pipeline input geometry setup", group=runtime.error_group
+        ):
+            pp_mesh = runtime.parallel_dims.get_mesh("pp")
+            peers = [None] * pp_mesh.size()
+            pp_group = pp_mesh.get_group()
+        dist.all_gather_object(peers, geometry, group=pp_group)
+        with synchronize_local_errors(
+            "Pipeline input geometry", group=runtime.error_group
+        ):
+            if any(peer != geometry for peer in peers):
+                raise ValueError(
+                    "Pipeline ranks disagree on prepared token/target shapes or dtypes"
+                )
     return PipelineInputs(args=arg_mbs, kwargs=kwarg_mbs, targets=target_mbs)
 
 
@@ -188,32 +216,14 @@ def run_pipeline_step(
 
     losses: list[torch.Tensor] | None = [] if runtime.pp_has_last_stage else None
     with runtime.param_context(), spmd_context(runtime.parallel_dims):
-        # The private driver accepts already-split microbatches. Its setup is
-        # normally done by step(), so stage backward flags and runtime state
-        # must be initialized explicitly before calling it.
-        runtime.pp_schedule._llmtuner_global_valid_tokens = global_valid_tokens
-        if capability("pipelining_microbatch_drivers"):
-            for stage in schedule_stages(runtime.pp_schedule):
-                stage.has_backward = runtime.pp_schedule._has_backward
-                stage.clear_runtime_states()
-            runtime.pp_schedule._step_microbatches(
-                inputs.args if runtime.pp_has_first_stage else None,
-                inputs.kwargs,
-                inputs.targets,
-                losses,
-                return_outputs=False,
-            )
-        else:
-            # Older torch has no microbatch-form driver: 2.9's ``step`` takes
-            # whole-batch inputs and would swallow these keywords into the model
-            # call. Drive ``_step_microbatches`` directly instead.
-            run_microbatches(
-                runtime.pp_schedule,
-                args=inputs.args if runtime.pp_has_first_stage else None,
-                kwargs=inputs.kwargs,
-                targets=inputs.targets,
-                losses=losses,
-            )
+        run_microbatches(
+            runtime.pp_schedule,
+            args=inputs.args if runtime.pp_has_first_stage else None,
+            kwargs=inputs.kwargs,
+            targets=inputs.targets,
+            losses=losses,
+            normalization_tokens=global_valid_tokens,
+        )
 
     # Only final stages own losses, but every update participant enters the
     # boundary after schedule communication, before reporting/reductions begin.
@@ -246,32 +256,23 @@ def run_pipeline_eval(
 ) -> torch.Tensor | None:
     """Run forward-only microbatches; only the final PP stage returns a loss sum.
 
-    Pin the schedule denominator to one so its losses are summed cross-entropies.
-    The common validation loop normalizes once at the end; training republishes
-    its denominator before the next optimizer step.
+    Use a denominator of one so losses are summed cross-entropies. The driver
+    restores the previous denominator on exit; the common validation loop
+    normalizes once at the end.
     """
     inputs = prepare_pipeline_inputs(runtime, batch)
     losses: list[torch.Tensor] | None = [] if runtime.pp_has_last_stage else None
     with runtime.param_context(), spmd_context(runtime.parallel_dims):
-        runtime.pp_schedule._llmtuner_global_valid_tokens = torch.ones(
-            (), dtype=torch.float32
+        run_eval_microbatches(
+            runtime.pp_schedule,
+            args=inputs.args if runtime.pp_has_first_stage else None,
+            kwargs=inputs.kwargs,
+            targets=inputs.targets,
+            losses=losses,
+            normalization_tokens=torch.ones(
+                (), dtype=torch.float32, device=runtime.device
+            ),
         )
-        args = inputs.args if runtime.pp_has_first_stage else None
-        if capability("pipelining_microbatch_drivers"):
-            runtime.pp_schedule.eval(
-                arg_mbs=args,
-                kwarg_mbs=inputs.kwargs,
-                target_mbs=inputs.targets,
-                losses=losses,
-            )
-        else:
-            run_eval_microbatches(
-                runtime.pp_schedule,
-                args=args,
-                kwargs=inputs.kwargs,
-                targets=inputs.targets,
-                losses=losses,
-            )
     with synchronize_local_errors(
         "Pipeline validation loss result validation", group=runtime.error_group
     ):

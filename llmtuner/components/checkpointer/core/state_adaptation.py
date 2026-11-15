@@ -10,10 +10,56 @@ import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ....accelerator.collectives import synchronize_local_errors
-from .checkpoint_keys import DATALOADER, LR_SCHEDULER, RNG_STATE, TRAIN_STATE
+from .checkpoint_keys import (
+    CHECKPOINT_FORMAT,
+    DATALOADER,
+    LR_SCHEDULER,
+    MODEL,
+    OPTIMIZER,
+    RNG_STATE,
+    TRAIN_STATE,
+)
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
+
+
+def restore_rng_state(
+    states: dict[str, Any],
+    loaded: dict[str, Any],
+    *,
+    available: bool = True,
+    phase_prefix: str = "Checkpoint",
+) -> None:
+    """Validate RNG on every rank before any generator is restored.
+
+    Call after all other restore callbacks and EMA cold start. These callbacks
+    must be local; restore failure is coordinated but does not roll back streams.
+    """
+    with synchronize_local_errors(f"{phase_prefix} RNG validation"):
+        rng = states.get(RNG_STATE) if available else None
+        if rng is not None:
+            incoming = loaded[RNG_STATE]
+            validate = getattr(rng, "validate_state_dict", None)
+            if callable(validate):
+                validate(incoming)
+    with synchronize_local_errors(f"{phase_prefix} RNG restoration"):
+        if rng is not None:
+            rng.load_state_dict(incoming)
+
+
+def restore_categories_before_rng(states: dict[str, Any]) -> tuple[str, ...]:
+    """Order explicit restore callbacks without relying on registration order.
+
+    RNG is restored separately after every callback and any EMA cold start.
+    Other state retains registration order once model and optimizer are loaded.
+    This describes callback dependencies, not a storage backend's IO order.
+    """
+    return tuple(
+        category for category in (MODEL, OPTIMIZER) if category in states
+    ) + tuple(
+        category for category in states if category not in (MODEL, OPTIMIZER, RNG_STATE)
+    )
 
 
 def materialize_local_checkpoint_states(states: dict[str, Any]) -> dict[str, Any]:
@@ -24,7 +70,13 @@ def materialize_local_checkpoint_states(states: dict[str, Any]) -> dict[str, Any
     Independent snapshots also keep load readers away from live metadata.
     """
     result = dict(states)
-    for category in (LR_SCHEDULER, DATALOADER, TRAIN_STATE, RNG_STATE):
+    for category in (
+        CHECKPOINT_FORMAT,
+        LR_SCHEDULER,
+        DATALOADER,
+        TRAIN_STATE,
+        RNG_STATE,
+    ):
         state = result.get(category)
         if isinstance(state, Stateful):
             result[category] = deepcopy(state.state_dict())
@@ -35,7 +87,13 @@ def select_local_preflight_states(states: dict[str, Any]) -> dict[str, Any]:
     """Select ordered collective-free validators without creating read buffers."""
     return {
         category: states[category]
-        for category in (RNG_STATE, DATALOADER, TRAIN_STATE, LR_SCHEDULER)
+        for category in (
+            CHECKPOINT_FORMAT,
+            RNG_STATE,
+            DATALOADER,
+            TRAIN_STATE,
+            LR_SCHEDULER,
+        )
         if category in states
         and callable(getattr(states[category], "validate_state_dict", None))
     }
@@ -46,7 +104,7 @@ def prepare_local_state_preflight(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Select local compatibility validators and isolated read destinations.
 
-    Only progress, data, RNG and scheduler metadata participate. Their state
+    Only format, progress, data, RNG and scheduler metadata participate. Their state
     methods must be collective-free; model weights and optimizer moments stay
     with backend layout adapters. Copy even custom state dictionaries so a
     reader cannot mutate live metadata/tensors before validation succeeds.

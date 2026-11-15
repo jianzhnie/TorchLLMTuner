@@ -112,6 +112,10 @@ class AdamWSwap(torch.optim.AdamW):
         self.memory_fraction = memory_fraction
         self.update_device = torch.device(update_device) if update_device else None
         self._copy_stream = None
+        # Retain even partially constructed prefetch slots until copies drain.
+        self._pending_copies: dict[
+            int, tuple[list[torch.Tensor], list[torch.Tensor]]
+        ] = {}
         self.prefetch_count = 0
         self._failed = False
         self.staging_peak_payload_bytes = 0
@@ -125,7 +129,7 @@ class AdamWSwap(torch.optim.AdamW):
 
     @staticmethod
     def validate_param_groups(groups: list[dict[str, Any]]) -> None:
-        """Reject unsupported update modes, including restored group options."""
+        """Validate live or restored options without state changes or collectives."""
         for group in groups:
             for name in ("capturable", "differentiable", "foreach"):
                 if group.get(name, False):
@@ -296,6 +300,7 @@ class AdamWSwap(torch.optim.AdamW):
                     self._stage(following) if self.prefetch and following else None
                 )
                 self._update_slice(job, staged)
+                self._pending_copies.pop(id(staged.buffers), None)
                 if next_staged is not None:
                     self.staging_peak_payload_bytes = max(
                         self.staging_peak_payload_bytes,
@@ -317,26 +322,50 @@ class AdamWSwap(torch.optim.AdamW):
         finally:
             # In particular, a failed update must not free a pending H2D source
             # or destination while a side stream still uses it.
-            if self._copy_stream is not None:
-                started = time.perf_counter()
-                try:
-                    self._copy_stream.synchronize()
-                except BaseException as error:
-                    self._failed = True
-                    if update_error is not None:
-                        # Keep the update failure primary while retaining the
-                        # cleanup failure in the exception chain.
-                        raise update_error from error
-                    raise
-                self.copy_wait_seconds += time.perf_counter() - started
+            try:
+                self._drain_prefetch()
+            except BaseException as error:
+                if update_error is not None:
+                    # Keep the update failure primary while retaining the
+                    # cleanup failure in the exception chain.
+                    raise update_error from error
+                raise
         return loss
 
-    def close(self) -> None:
-        """Release the optional asynchronous staging stream."""
+    @property
+    def observation_metrics(self) -> dict[str, float]:
+        """Snapshot additive rank-local transfer and staging counters."""
+        return {
+            f"swap/optimizer_local/{key}": float(getattr(self, key))
+            for key in (
+                "h2d_bytes",
+                "d2h_bytes",
+                "host_state_bytes",
+                "staging_peak_payload_bytes",
+                "copy_wait_seconds",
+            )
+        }
+
+    def _drain_prefetch(self) -> None:
+        """Release copy ownership only after synchronization succeeds."""
         stream = self._copy_stream
-        if stream is None:
-            return
-        stream.synchronize()
+        if stream is not None:
+            started = time.perf_counter()
+            try:
+                stream.synchronize()
+            except BaseException:
+                self._failed = True
+                raise
+            self.copy_wait_seconds += time.perf_counter() - started
+        self._pending_copies.clear()
+
+    def close(self) -> None:
+        """Drain staging; retain failed ownership for a later close retry.
+
+        Successful cleanup does not repair partially updated optimizer state;
+        only a successful checkpoint restore clears that failure.
+        """
+        self._drain_prefetch()
         self._copy_stream = None
 
     def _slice_jobs(self, active: list[torch.Tensor]) -> Iterator[SwapSlice]:
@@ -410,8 +439,11 @@ class AdamWSwap(torch.optim.AdamW):
                 self._copy_stream = backend.Stream(device=device)
             # CPU-offload gradients may have just been produced by D2H.
             self._copy_stream.wait_stream(backend.current_stream(device))
+            buffers = []
+            self._pending_copies[id(buffers)] = (sources, buffers)
             with backend.stream(self._copy_stream):
-                buffers = [source.to(device, non_blocking=True) for source in sources]
+                for source in sources:
+                    buffers.append(source.to(device, non_blocking=True))
                 event = self._copy_stream.record_event()
             self.prefetch_count += 1
         else:
@@ -573,6 +605,9 @@ class AdamWSwap(torch.optim.AdamW):
             if name not in self.state.get(p, {})
         )
         self._check_host_capacity(additional)
+        # A prior failed prefetch may still reference the live host moments.
+        # Drain before reusing their storage or replacing state ownership.
+        self.close()
         restored = defaultdict(dict)
         for parameter, incoming, step in plans:
             existing_state = self.state.get(parameter, {})

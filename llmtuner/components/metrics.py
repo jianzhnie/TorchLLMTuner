@@ -8,8 +8,8 @@ existing consumers and publishes the synchronized observations when available.
 Logging performs no collectives. The trainer synchronizes pipeline loss metrics
 before reporting; writer ownership and console rank filtering are independent.
 Unknown device peaks suppress MFU, and empty loading windows report zero.
-External sinks live in ``metric_loggers`` and are re-exported here for existing
-callers. Each owns its resources and propagates configuration/runtime failures.
+External sinks live in ``utils.metric_loggers``. Each owns its resources and
+propagates configuration/runtime failures.
 """
 
 from __future__ import annotations
@@ -28,13 +28,8 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from ..accelerator.device import device_module, device_type
+from ..utils import metric_loggers
 from ..utils.logging import get_distributed_rank, get_logger
-from ..utils.metric_loggers import (
-    BaseLogger,
-    LoggerContainer,
-    TensorBoardLogger,
-    WandBLogger,
-)
 from ..utils.monitoring import (
     Color,
     NoColor,
@@ -58,13 +53,9 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 __all__ = [
-    "BaseLogger",
     "DeviceMemStats",
     "DeviceMemoryMonitor",
-    "LoggerContainer",
     "MetricsProcessor",
-    "TensorBoardLogger",
-    "WandBLogger",
     "build_device_memory_monitor",
     "get_metrics_rank",
     "compute_utilization",
@@ -344,7 +335,6 @@ class MetricsProcessor:
                 if colors_enabled(disable_color_printing=config.disable_color_printing)
                 else NoColor()
             )
-            self._pp_schedule = pp_schedule
             self.gpu_peak_flops = get_peak_flops(self.device_memory_monitor.device_name)
             self.num_flops_per_token = num_flops_per_token
 
@@ -418,14 +408,14 @@ class MetricsProcessor:
         pp_schedule: str,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
-    ) -> BaseLogger:
+    ) -> metric_loggers.BaseLogger:
         """Build the sink this rank should write to.
 
         Returns a no-op logger -- rather than ``None`` -- when nothing is
         enabled or this is not the metrics rank, so the caller has one code path.
         """
         if not (config.enable_tensorboard or config.enable_wandb):
-            return BaseLogger()
+            return metric_loggers.BaseLogger()
 
         if not config.save_for_all_ranks:
             if parallel_dims is None:
@@ -435,7 +425,7 @@ class MetricsProcessor:
                     parallel_dims=parallel_dims, pp_schedule=pp_schedule
                 )
             if get_distributed_rank() != metrics_rank:
-                return BaseLogger()
+                return metric_loggers.BaseLogger()
 
         base_log_dir = os.path.join(
             dump_folder,
@@ -445,13 +435,15 @@ class MetricsProcessor:
         if config.save_for_all_ranks:
             base_log_dir = os.path.join(base_log_dir, f"rank_{get_distributed_rank()}")
 
-        logger_container = LoggerContainer()
+        logger_container = metric_loggers.LoggerContainer()
 
         try:
             if config.enable_wandb:
                 try:
                     logger_container.add_logger(
-                        WandBLogger(base_log_dir, config_dict=config_dict, tag=tag)
+                        metric_loggers.WandBLogger(
+                            base_log_dir, config_dict=config_dict, tag=tag
+                        )
                     )
                 except ImportError as error:
                     # Only the missing-package case: that is a dependency the user
@@ -463,7 +455,9 @@ class MetricsProcessor:
                     ) from error
 
             if config.enable_tensorboard:
-                logger_container.add_logger(TensorBoardLogger(base_log_dir, tag))
+                logger_container.add_logger(
+                    metric_loggers.TensorBoardLogger(base_log_dir, tag)
+                )
 
         except BaseException:
             try:

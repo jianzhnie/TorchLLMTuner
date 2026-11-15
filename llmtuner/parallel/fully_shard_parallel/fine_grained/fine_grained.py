@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
-    FSDPModule,
     MixedPrecisionPolicy,
     OffloadPolicy,
     fully_shard,
@@ -19,43 +18,13 @@ from llmtuner.errors import EnvironmentUnsupportedError
 # Native FSDP remains usable when version-specific private APIs are absent.
 CUSTOM_FSDP_IMPORT_ERROR = None
 try:
-    from .fine_grained_state import FineGrainedFSDPState, apply_fine_grained_fsdp
+    from .fine_grained_state import apply_fine_grained_fsdp
 except (ImportError, EnvironmentUnsupportedError) as error:
     CUSTOM_FSDP_IMPORT_ERROR = error
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp._fully_shard._fsdp_api import DataParallelMeshDims
     from torch.distributed.fsdp._fully_shard._fsdp_common import ShardPlacementFnResult
-
-
-class FSDPCommunicationResources:
-    """Retain model owners until custom FSDP communications have drained."""
-
-    def __init__(self, model_parts: tuple[nn.Module, ...]) -> None:
-        self.model_parts = model_parts
-
-    def close(self) -> None:
-        if CUSTOM_FSDP_IMPORT_ERROR is not None:
-            self.model_parts = ()
-            return
-        seen = set()
-        first_error = None
-        for part in self.model_parts:
-            for module in part.modules():
-                if not isinstance(module, FSDPModule):
-                    continue
-                try:
-                    state = module._get_fsdp_state()
-                    if not isinstance(state, FineGrainedFSDPState) or id(state) in seen:
-                        continue
-                    seen.add(id(state))
-                    state.drain_communications()
-                except BaseException as error:
-                    if first_error is None:
-                        first_error = error
-        if first_error is not None:
-            raise first_error
-        self.model_parts = ()
 
 
 def validate_fsdp_hook_target(

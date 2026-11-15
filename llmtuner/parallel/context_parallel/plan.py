@@ -23,6 +23,10 @@ def resolve_cp_plan(
     Global preflight, PP-local ownership checks and post-TP/EP execution use
     the same selection rules, but each resolves its own live model bindings.
     """
+    if not callable(getattr(model, "set_cp_mesh", None)):
+        raise TypeError(
+            "CP requires the explicit model to provide set_cp_mesh input semantics"
+        )
     if cfg.cp_config.context_parallel_strategy == "kcp":
         return resolve_kcp_plan(model, degree=cfg.cp_size, bindings=bindings)
     if getattr(model, "context_parallel_backend", "standard") == "compressor":

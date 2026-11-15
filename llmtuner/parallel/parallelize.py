@@ -58,6 +58,7 @@ from .fully_shard_parallel.fully_shard_parallel import (
 from .fully_shard_parallel.ownership import FSDPPatternReferences
 from .fully_shard_parallel.plan import resolve_pipeline_fsdp_configs
 from .model_compile import apply_compile, validate_compile_environment
+from .pipeline_parallel.microbatch_drivers import validate_pipeline_schedule
 from .pipeline_parallel.ownership import PipelineOwnership
 from .pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
@@ -77,7 +78,7 @@ from .tensor_parallel.tensor_parallel import (
     resolve_tp_plan,
     validate_pipeline_tp_plan,
 )
-from .topology import ParallelTopology
+from .topology import ParallelTopology, ParallelTopologySnapshot
 
 __all__ = ["parallelize_model"]
 
@@ -175,6 +176,12 @@ def parallelize_model(
         if parallel_dims.dp_cp_enabled:
             chunked_loss_fsdp(chunked_loss_num_chunks, compile=True)
 
+    with synchronize_local_errors("Parallel topology snapshot", group=error_group):
+        topology_snapshot = (
+            ParallelTopologySnapshot.capture(parallel_dims)
+            if parallel_dims is not None
+            else ParallelTopologySnapshot()
+        )
     layouts: list[ModelPartLayout] = []
 
     def apply_stages(
@@ -188,15 +195,6 @@ def parallelize_model(
     ) -> nn.Module:
         """Bind stage options once, then transform the model in declared order."""
         fsdp_cfg = cfg if part_cfg is None else part_cfg
-        references = (
-            FSDPPatternReferences(part, fsdp_cfg)
-            if fsdp_cfg.fsdp_config.fsdp_ignored_modules
-            or any(
-                options.get("hook_module") is not None or options.get("ignored_params")
-                for options in fsdp_cfg.fsdp_config.fsdp_apply_modules.values()
-            )
-            else None
-        )
         layout = ModelPartLayout(
             pipeline_ownership=(
                 None
@@ -204,12 +202,23 @@ def parallelize_model(
                 else pipeline_ownership.parameter_ownership()
             ),
             execution=execution_layout,
+            topology=topology_snapshot,
+        )
+        references = (
+            FSDPPatternReferences(part, fsdp_cfg, replacements=layout.replacements)
+            if fsdp_cfg.fsdp_config.fsdp_ignored_modules
+            or any(
+                options.get("hook_module") is not None or options.get("ignored_params")
+                for options in fsdp_cfg.fsdp_config.fsdp_apply_modules.values()
+            )
+            else None
         )
 
         def record_replacements(modules, parameters):
             if references is not None:
                 references.record_replacements(modules, parameters)
-            layout.replacements.record_replacements(modules, parameters)
+            else:
+                layout.replacements.record_replacements(modules, parameters)
 
         tp_options = {"on_replacement": record_replacements}
         if resolved_tp_plan is not None:
@@ -262,7 +271,9 @@ def parallelize_model(
                 # TP may already have replaced Parameters before EP's
                 # explicit split/rename mapping is emitted.
                 if references is not None:
-                    references = FSDPPatternReferences(part, references.bind(part))
+                    references = FSDPPatternReferences(
+                        part, references.bind(part), replacements=layout.replacements
+                    )
                 part = runners[name](part, on_replacement=record_replacements)
             elif name == "fsdp" and references is not None:
                 part = runners[name](part, cfg=references.bind(part))
@@ -270,7 +281,11 @@ def parallelize_model(
                 part = runners[name](part)
             if on_model_acquired is not None:
                 on_model_acquired(part)
-        layout.refresh(part)
+        with synchronize_local_errors(
+            "Transformed model layout validation", group=error_group
+        ):
+            execution_layout.validate_model(part)
+            layout.refresh(part)
         layouts.append(layout)
         return part
 
@@ -522,6 +537,11 @@ def parallelize_model(
                 stages,
                 cfg=cfg,
                 loss_sum=loss_sum,
+                logits_width=(
+                    None
+                    if global_execution_layout.vocabulary_sharded
+                    else global_execution_layout.vocabulary_size
+                ),
                 **global_execution_layout.loss_kwargs(
                     None if tp_mesh is None else tp_mesh.get_group()
                 ),
@@ -532,6 +552,12 @@ def parallelize_model(
             has_last_stage=has_last_stage,
         )
 
+        # Constructors may communicate. Validate only after they return, then
+        # propagate local contract failures before any rank starts training.
+        with synchronize_local_errors(
+            "Pipeline schedule contract validation", group=error_group
+        ):
+            validate_pipeline_schedule(execution.schedule, stages)
         return ParallelAssembly(execution, tuple(layouts))
 
     resolved_tp_plan = None

@@ -1,13 +1,13 @@
 """Model execution independent of the Trainer lifecycle.
 
-The engine owns forward/backward dispatch and optimizer/scheduler/EMA updates.
-Data iteration, gradient policy, metrics, and checkpointing remain Trainer
-responsibilities.
+The engine owns forward/backward dispatch, parallel gradient synchronization,
+routing state and optimizer/scheduler/EMA updates. Data iteration, clipping
+policy, reporting cadence and checkpointing remain Trainer responsibilities.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from functools import partial
@@ -15,8 +15,9 @@ from typing import Any
 
 import torch
 from torch.distributed import ProcessGroup
+from torch.distributed.tensor import DTensor
 
-from ...accelerator.collectives import synchronize_local_errors
+from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.spmd import spmd_context
 from ...components.loss import chunked_lm_head_cross_entropy, cross_entropy_loss
 from ...components.loss_contract import (
@@ -26,31 +27,34 @@ from ...components.loss_contract import (
     validate_normalization_tokens,
 )
 from ...datasets.contracts import Batch, TrainerBatch
+from ...models.common.aux_loss import AuxLoss
+from ...models.common.moe.bias_update import (
+    collect_routing_load_metrics,
+    reset_routing_statistics,
+)
 from ...models.contracts import DecoderStructure
 from ...models.execution import ModelExecutionCapabilities, validate_training_output
-from ...parallel.execution import ExecutionLayout
+from ...parallel.execution import ExecutionLayout, validate_local_pipeline_layouts
 from ...parallel.topology import ParallelTopology
-from . import pipeline
+from . import gradients, pipeline
 from .batch import prepare_model_inputs
-from .results import StepResult, UpdateResult
+from .results import AccumulationResult, StepResult, UpdateResult
 
 ParamContext = Callable[[], AbstractContextManager[Any]]
 
 
 def loss_vocab_kwargs(
-    model: torch.nn.Module | None,
     parallel_dims: ParallelTopology | None,
     *,
     layout: ExecutionLayout | None = None,
 ) -> dict[str, Any]:
-    """Resolve loss reduction from an explicit model and topology for train/eval."""
+    """Bind loss reduction to declared output ownership, never module attributes."""
     tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
     if layout is not None:
         return layout.loss_kwargs(None if tp_mesh is None else tp_mesh.get_group())
-    vocab_size = getattr(model, "vocab_size", None)
-    if tp_mesh is None or vocab_size is None:
-        return {}
-    return {"tp_group": tp_mesh.get_group(), "global_vocab_size": vocab_size}
+    if tp_mesh is not None:
+        raise ValueError("TP loss requires an explicit ExecutionLayout")
+    return {}
 
 
 @dataclass(slots=True)
@@ -60,7 +64,6 @@ class TrainingEngine:
     model_parts: list[torch.nn.Module]
     parallel_dims: ParallelTopology | None
     device: torch.device
-    max_context_length: int
     chunked_loss_num_chunks: int
     param_context: ParamContext
     execution_layouts: tuple[ExecutionLayout, ...] = ()
@@ -94,6 +97,8 @@ class TrainingEngine:
         init=False, default=None, repr=False, compare=False
     )
 
+    _loss_kwargs: dict[str, Any] = field(init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         if self.chunked_loss_num_chunks > 1 and self.chunked_loss_backward is None:
             raise ValueError("Configured loss does not support chunked backward")
@@ -102,6 +107,12 @@ class TrainingEngine:
         pipeline_enabled = (
             self.parallel_dims is not None and self.parallel_dims.pp_enabled
         )
+        if not self.model_parts:
+            raise ValueError("Training execution requires at least one model part")
+        if not pipeline_enabled and len(self.model_parts) != 1:
+            raise ValueError("Dense execution requires exactly one model part")
+        if pipeline_enabled != (self.pp_schedule is not None):
+            raise ValueError("Pipeline topology and schedule must be enabled together")
         if self.chunked_loss_num_chunks > 1:
             if pipeline_enabled:
                 raise ValueError(
@@ -122,7 +133,10 @@ class TrainingEngine:
                 if self.parallel_dims is not None
                 and getattr(self.parallel_dims, f"{axis}_enabled")
             )
-            for layout in self.execution_layouts:
+            for part, layout in zip(
+                self.model_parts, self.execution_layouts, strict=True
+            ):
+                layout.validate_model(part)
                 if layout.sequence_shard_axes != expected_axes:
                     raise ValueError("Engine topology disagrees with sequence layout")
                 if layout.chunked_loss != (self.chunked_loss_num_chunks > 1):
@@ -133,30 +147,12 @@ class TrainingEngine:
                     raise ValueError(
                         "Dense engine requires a logits-producing model part"
                     )
-            if pipeline_enabled and (
-                any(layout.output == "logits" for layout in self.execution_layouts)
-                != self.pp_has_last_stage
-            ):
-                raise ValueError("Pipeline loss owner disagrees with output layout")
-            stage_inputs = [
-                layout.pipeline_io
-                for layout in self.execution_layouts
-                if layout.pipeline_io is not None
-            ]
-            if pipeline_enabled and stage_inputs:
-                if len(stage_inputs) != len(self.execution_layouts):
-                    raise ValueError("Pipeline parts must all declare stage I/O")
-                if (
-                    any(stage.first for stage in stage_inputs)
-                    != self.pp_has_first_stage
-                ):
-                    raise ValueError("Pipeline token owner disagrees with stage I/O")
-                if len({stage.hidden_size for stage in stage_inputs}) != 1:
-                    raise ValueError("Local pipeline parts disagree on hidden width")
-                if len({stage.activation_dtype for stage in stage_inputs}) != 1:
-                    raise ValueError(
-                        "Local pipeline parts disagree on activation dtype"
-                    )
+            if pipeline_enabled:
+                validate_local_pipeline_layouts(
+                    self.execution_layouts,
+                    has_first_stage=self.pp_has_first_stage,
+                    has_last_stage=self.pp_has_last_stage,
+                )
         capabilities = (
             tuple(layout.capabilities for layout in self.execution_layouts)
             if self.execution_layouts
@@ -179,6 +175,16 @@ class TrainingEngine:
             and not self._output_capabilities.hidden_states
         ):
             raise ValueError("Chunked loss requires model-declared hidden output")
+        # PP schedules own their loss binding; intermediate parts return hidden
+        # activations and must never be bound to the dense LM loss.
+        self._loss_kwargs = (
+            {}
+            if pipeline_enabled
+            else loss_vocab_kwargs(
+                self.parallel_dims,
+                layout=self.execution_layouts[0] if self.execution_layouts else None,
+            )
+        )
         self._run_forward_backward = (
             partial(pipeline.run_pipeline_step, self)
             if pipeline_enabled
@@ -201,12 +207,78 @@ class TrainingEngine:
             raise RuntimeError("Dense execution requires exactly one model part")
         return self.model_parts[0]
 
-    def loss_reduction_kwargs(self) -> dict[str, Any]:
-        """Use the assembled output contract for dense train/evaluation loss."""
-        return loss_vocab_kwargs(
-            self.model,
-            self.parallel_dims,
-            layout=self.execution_layouts[0] if self.execution_layouts else None,
+    def begin_step(self) -> None:
+        """Reset gradient and routing accumulation before reading the step's batches."""
+        if self.optimizer is None:
+            raise RuntimeError(
+                "Optimizer services are not bound to the training engine"
+            )
+        self.optimizer.zero_grad(set_to_none=True)
+        reset_routing_statistics(self.model_parts)
+
+    def prepare_auxiliary_loss(
+        self, local_routing_tokens: int, *, dp_group: ProcessGroup | None
+    ) -> None:
+        """Normalize router loss over non-padding inputs, including masked prompts."""
+        if not AuxLoss.has_pending_counts():
+            return
+        global_routing_tokens = torch.tensor(
+            local_routing_tokens, dtype=torch.int64, device=self.device
+        )
+        if dp_group is not None:
+            all_reduce(global_routing_tokens, group=dp_group)
+        AuxLoss.set_step_denominator(
+            global_routing_tokens, model_parts=self.model_parts
+        )
+
+    def prepare_accumulation_group(self, *, is_last: bool) -> None:
+        """HSDP reduces accumulated gradients only on the final backward group."""
+        if self.parallel_dims is not None and self.parallel_dims.dp_replicate_enabled:
+            for part in self.model_parts:
+                part.set_requires_all_reduce(is_last)
+
+    def synchronize_gradients(self) -> None:
+        """Finish excluded and replicated gradient reductions before clipping."""
+        gradients.allreduce_fsdp_excluded_grads(
+            self.model_parts, parallel_dims=self.parallel_dims
+        )
+        gradients.allreduce_replicated_tp_grads(
+            self.model_parts, parallel_dims=self.parallel_dims
+        )
+
+    def accumulate_results(
+        self, results: Iterable[StepResult], *, retain_loss: bool
+    ) -> AccumulationResult:
+        """Consume executed groups without retaining a list of detached losses.
+
+        The iterable can execute each backward lazily, preserving caller-owned
+        diagnostics around individual groups. Inspect DTensor shards locally;
+        gradient validation coordinates the verdict after all groups finish.
+        """
+        loss_sum = None
+        group_count = 0
+        loss_is_finite = torch.ones((), dtype=torch.int32, device=self.device)
+        for result in results:
+            group_count += 1
+            value = result.loss_sum
+            local = value.to_local() if isinstance(value, DTensor) else value
+            loss_is_finite.logical_and_(torch.isfinite(local).all())
+            if retain_loss:
+                if loss_sum is None:
+                    loss_sum = value.clone()
+                else:
+                    loss_sum.add_(value)
+        with synchronize_local_errors(
+            "Training accumulation result validation", group=self.error_group
+        ):
+            if not group_count:
+                raise ValueError("Training accumulation requires at least one group")
+            return AccumulationResult(loss_sum, loss_is_finite)
+
+    def routing_metrics(self) -> dict[str, float]:
+        """Collect model routing observations only when the caller requests a log."""
+        return collect_routing_load_metrics(
+            self.model_parts, self.parallel_dims, self.device
         )
 
     def preprocess(
@@ -217,7 +289,6 @@ class TrainingEngine:
             batch,
             device=self.device,
             parallel_dims=self.parallel_dims,
-            max_context_length=self.max_context_length,
             error_group=self.error_group,
         )
 
@@ -259,7 +330,7 @@ class TrainingEngine:
         inputs, labels, extra_kwargs = self.preprocess(batch)
         with self.param_context(), spmd_context(self.parallel_dims):
             logits = self._training_output(self.model(inputs, **extra_kwargs), labels)
-            loss = self.loss_sum(logits, labels, **self.loss_reduction_kwargs())
+            loss = self.loss_sum(logits, labels.reshape(-1), **self._loss_kwargs)
             with synchronize_local_errors(
                 "Validation loss result validation", group=self.error_group
             ):
@@ -305,11 +376,11 @@ class TrainingEngine:
         *,
         hidden_states: bool = False,
     ) -> torch.Tensor:
-        """Coordinate local output checks after forward, before loss/backward.
+        """Validate original token geometry, then expose flat rows to loss services.
 
         Forward may communicate and must finish outside this local boundary.
-        Width is checked only when the assembly declares a replicated vocabulary;
-        hidden projections and vocabulary shards retain their own contracts.
+        Width comes from model-declared hidden geometry or the assembled
+        replicated vocabulary; vocabulary shards retain their own contracts.
         """
         with synchronize_local_errors(
             "Model training output validation", group=self.error_group
@@ -317,13 +388,15 @@ class TrainingEngine:
             tensor = self._output_capabilities.output_tensor(
                 output, hidden_states=hidden_states
             )
-            width = None
+            width = self._output_capabilities.hidden_size if hidden_states else None
             if not hidden_states and self.execution_layouts:
                 layout = self.execution_layouts[0]
                 if not layout.vocabulary_sharded:
                     width = layout.vocabulary_size
             validate_training_output(tensor, labels, output_width=width)
-        return tensor
+        # Reshaping a DTensor can communicate. Keep tensor operations outside
+        # the local-only validation boundary and preserve the original autograd.
+        return tensor if tensor.ndim == 2 else tensor.reshape(-1, tensor.shape[-1])
 
     def _backward_chunked(
         self,
@@ -347,10 +420,10 @@ class TrainingEngine:
         loss = self.chunked_loss_backward(
             projection,
             hidden_states,
-            labels,
+            labels.reshape(-1),
             num_chunks=self.chunked_loss_num_chunks,
             grad_scale=1.0 / global_valid_tokens,
-            **self.loss_reduction_kwargs(),
+            **self._loss_kwargs,
         )
         with synchronize_local_errors(
             "Chunked loss result validation", group=self.error_group
@@ -368,7 +441,7 @@ class TrainingEngine:
     ) -> torch.Tensor:
         model = self.model
         logits = self._training_output(model(inputs, **extra_kwargs), labels)
-        loss_sum = self.loss_sum(logits, labels, **self.loss_reduction_kwargs())
+        loss_sum = self.loss_sum(logits, labels.reshape(-1), **self._loss_kwargs)
         del logits
         with synchronize_local_errors(
             "Training loss result validation", group=self.error_group
@@ -385,9 +458,24 @@ class TrainingEngine:
         auxiliary_metrics: Mapping[str, float] | None = None,
     ) -> UpdateResult:
         """Commit an update, then advance scheduler and EMA in the fixed order."""
-        if self.optimizer is None or self.lr_scheduler is None:
-            raise RuntimeError(
-                "Optimizer services are not bound to the training engine"
+        with synchronize_local_errors(
+            "Training update preflight", group=self.error_group
+        ):
+            if self.optimizer is None or self.lr_scheduler is None:
+                raise RuntimeError(
+                    "Optimizer services are not bound to the training engine"
+                )
+            # Validate and snapshot reporting inputs before any parameter write.
+            # Publish this result only after every update operation succeeds.
+            result = UpdateResult(
+                step=step,
+                grad_norm=grad_norm,
+                updated=True,
+                scheduler_advanced=True,
+                ema_advanced=self.ema is not None,
+                auxiliary_metrics={}
+                if auxiliary_metrics is None
+                else auxiliary_metrics,
             )
         self.optimizer.step()
         # The optimizer update is committed if scheduler coordination fails.
@@ -399,11 +487,4 @@ class TrainingEngine:
             if self.ema is not None:
                 # All ranks enter, including PP stages with no tracked tensors.
                 self.ema.step(step)
-        return UpdateResult(
-            step=step,
-            grad_norm=grad_norm,
-            updated=True,
-            scheduler_advanced=True,
-            ema_advanced=self.ema is not None,
-            auxiliary_metrics={} if auxiliary_metrics is None else auxiliary_metrics,
-        )
+        return result

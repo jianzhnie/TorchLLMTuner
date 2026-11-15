@@ -20,7 +20,7 @@ import torch.distributed as dist
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...components.metrics import compute_utilization, model_tflops
-from ...models.common.moe.experts import RoutedExperts
+from ...models.common.moe.observation import DispatchObservation
 from ...utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -114,48 +114,67 @@ class DispatchTimer:
             raise first_error
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class DispatchTimerResources:
-    """Own pending timing events independently of model/checkpoint resources."""
+    """Own installed model bindings and drain them before detaching observers."""
 
-    timers: tuple[DispatchTimer, ...]
+    bindings: tuple[tuple[DispatchObservation, DispatchTimer], ...]
+
+    @property
+    def timers(self) -> tuple[DispatchTimer, ...]:
+        return tuple(dict.fromkeys(timer for _, timer in self.bindings))
 
     def close(self) -> None:
         first_error: BaseException | None = None
+        failed = set()
         for timer in reversed(self.timers):
             try:
                 timer.close()
             except BaseException as error:
+                failed.add(timer)
                 if first_error is None:
                     first_error = error
+        pending = []
+        for boundary, timer in self.bindings:
+            if timer in failed:
+                pending.append((boundary, timer))
+            elif boundary.observer is timer:
+                boundary.observer = None
+        self.bindings = tuple(pending)
         if first_error is not None:
             raise first_error
 
 
 def install_dispatch_timers(
     model_parts: Iterable[torch.nn.Module],
-) -> list[DispatchTimer]:
-    """Observe each native dispatch boundary once, preserving existing timers.
+) -> DispatchTimerResources:
+    """Acquire exclusive ownership of declared model observation boundaries.
 
-    Dedicated fused implementations do not execute this boundary. Do not attach
-    a timer to subclasses and report a misleading zero. Validate ownership before
-    installation so a custom observer is never silently replaced.
+    Models without a forward observation site do not declare this capability.
+    Validate every declaration before mutation so custom observers are never
+    silently replaced and partially installed timers cannot escape on failure.
+    Existing owners must close before another installation can acquire a boundary.
     """
-    targets = dict.fromkeys(
-        module
-        for part in model_parts
-        for module in part.modules()
-        if type(module) is RoutedExperts
-    )
+    targets = {}
+    for part in model_parts:
+        for module in part.modules():
+            boundary = getattr(module, "dispatch_observation", None)
+            if boundary is None:
+                continue
+            if not isinstance(boundary, DispatchObservation):
+                raise TypeError("dispatch_observation must be DispatchObservation")
+            targets[id(boundary)] = boundary
     bindings = []
-    for module in targets:
-        observer = module.dispatch_observer
-        if observer is not None and not isinstance(observer, DispatchTimer):
-            raise ValueError("Native expert dispatch already has a different observer")
-        bindings.append((module, observer if observer is not None else DispatchTimer()))
-    for module, timer in bindings:
-        module.dispatch_observer = timer
-    return list(dict.fromkeys(timer for _, timer in bindings))
+    for boundary in targets.values():
+        if boundary.observer is not None:
+            raise ValueError(
+                "Model dispatch boundary already has an observer; "
+                "close its owner before installing dispatch timers"
+            )
+        bindings.append((boundary, DispatchTimer()))
+    for boundary, timer in bindings:
+        boundary.observer = timer
+    return DispatchTimerResources(tuple(bindings))
 
 
 class TrainingObserver:

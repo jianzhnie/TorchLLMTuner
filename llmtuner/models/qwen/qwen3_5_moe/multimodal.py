@@ -14,7 +14,6 @@
 # limitations under the License.
 """Qwen3.5 MoE model with portable core operators and the Turbo forward and loss."""
 
-import inspect
 from collections.abc import Callable
 from functools import partial
 
@@ -32,7 +31,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeVisionConfig,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, can_return_tuple
+from transformers.utils import TransformersKwargs
 from transformers.vision_utils import get_vision_position_ids
 
 try:
@@ -46,6 +45,8 @@ except ImportError:
     get_vision_attention_seqlens = unsupported_qwen_cp
     get_vision_interpolation_indices_and_weights = unsupported_qwen_cp
 
+from ...execution import ModelExecutionCapabilities
+from ..checkpoint import qwen35_multimodal_configuration
 from ..context_parallel import (
     GatedDeltaNet,
     cal_split_sizes,
@@ -110,15 +111,9 @@ class Qwen3_5MoeGatedDeltaNet(hf.Qwen3_5MoeGatedDeltaNet):
         super().__init__(config, layer_idx)
         self.norm = Qwen3_5MoeRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
         self.cp_group = None
-        self.gdn_implementation = getattr(
-            config,
-            "gdn_implementation",
-            "auto" if getattr(config, "use_fused_gdn", False) else "eager",
-        )
+        self.gdn_implementation = getattr(config, "gdn_implementation", "eager")
         self.causal_conv1d_implementation = getattr(
-            config,
-            "causal_conv1d_implementation",
-            "auto" if getattr(config, "use_fused_causal_conv1d", False) else "eager",
+            config, "causal_conv1d_implementation", "eager"
         )
 
     def causal_conv1d_fn(
@@ -680,12 +675,8 @@ class Qwen3_5MoeVisionModel(hf.Qwen3_5MoeVisionModel):
 
     def __init__(self, config: Qwen3_5MoeVisionConfig) -> None:
         super().__init__(config)
-        self._rotary_takes_hidden_states = (
-            len(inspect.signature(self.rotary_pos_emb.forward).parameters) == 2
-        )
         self.cp_group = None
         self.merger = Qwen3_5MoeVisionPatchMerger(config, use_postshuffle_norm=False)
-        self.cp_group = None
 
     def forward(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs
@@ -881,6 +872,20 @@ class Qwen3_5MoeModel(hf.Qwen3_5MoeModel):
 class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
     """Qwen3.5 MoE with native HF expert weights and the Turbo forward/loss."""
 
+    @property
+    def checkpoint_configuration(self) -> dict[str, object]:
+        return qwen35_multimodal_configuration(self.config)
+
+    @property
+    def execution_capabilities(self) -> ModelExecutionCapabilities:
+        return ModelExecutionCapabilities(
+            hidden_states=True, hidden_size=self.config.text_config.hidden_size
+        )
+
+    @property
+    def vocab_size(self) -> int:
+        return self.config.text_config.vocab_size
+
     @classmethod
     def _can_set_experts_implementation(cls) -> bool:
         return True
@@ -939,7 +944,6 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
         for block in self.model.visual.blocks:
             block.attn.cp_group = ulysses_group
 
-    @can_return_tuple
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -955,9 +959,22 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
         mm_token_type_ids: torch.IntTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        *,
+        skip_lm_head: bool = False,
+        return_dict: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | hf.Qwen3_5MoeCausalLMOutputWithPast:
-        """Compute multimodal outputs and the configured LM and router losses."""
+    ) -> torch.Tensor | tuple | hf.Qwen3_5MoeCausalLMOutputWithPast:
+        """Compute multimodal logits/loss, or uncached full hidden states."""
+        if skip_lm_head:
+            if (
+                past_key_values is not None
+                or cache_position is not None
+                or kwargs.get("use_cache", False)
+            ):
+                raise ValueError(
+                    "Hidden-state training output does not support KV cache"
+                )
+            kwargs["use_cache"] = False
         if self.cp_group is not None:
             if kwargs.get("output_router_logits", False):
                 raise NotImplementedError(
@@ -986,34 +1003,29 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
             inputs_embeds=inputs_embeds,
             mm_token_type_ids=mm_token_type_ids,
             cache_position=cache_position,
+            return_dict=True,
             **kwargs,
         )
         hidden_states = outputs[0]
+        if skip_lm_head:
+            return hidden_states
         slice_indices = (
             slice(-logits_to_keep, None)
             if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
 
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
-        logits = None
-        chunk_loss_enabled = getattr(self, "enable_chunk_loss", False)
-        if chunk_loss_enabled:
-            # Training injects either legacy chunk loss or CCE through loss_function.
-            # # Both consume the full sequence; logits_to_keep only selects returned
-            # logits.
-            loss = self.lm_head(hidden_states, self.loss_function, labels)
-        else:
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
-            if labels is not None:
-                if self.cp_group is not None:
-                    loss = cp_compute_lm_loss(logits, labels, group=self.cp_group)
-                else:
-                    loss = self.loss_function(
-                        logits=logits,
-                        labels=labels,
-                        vocab_size=self.config.text_config.vocab_size,
-                    )
+        if labels is not None:
+            if self.cp_group is not None:
+                loss = cp_compute_lm_loss(logits, labels, group=self.cp_group)
+            else:
+                loss = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                )
 
         aux_loss = None
         if kwargs.get("output_router_logits", False):
@@ -1028,7 +1040,7 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
                     loss.device
                 )
 
-        return hf.Qwen3_5MoeCausalLMOutputWithPast(
+        result = hf.Qwen3_5MoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
@@ -1038,6 +1050,9 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
             rope_deltas=outputs.rope_deltas,
             router_logits=outputs.router_logits,
         )
+        if return_dict is None:
+            return_dict = self.config.return_dict
+        return result if return_dict else result.to_tuple()
 
 
 __all__ = ["Qwen3_5MoeForConditionalGeneration"]

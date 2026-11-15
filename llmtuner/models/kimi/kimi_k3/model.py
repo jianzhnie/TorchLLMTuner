@@ -62,7 +62,7 @@ from transformers.modeling_outputs import (
 
 from ....errors import UnsupportedCombinationError
 from ...common.cast_linear import build_lm_head
-from ...common.input_preparation import prepare_text_inputs
+from ...common.input_preparation import prepare_text_inputs, restore_text_batch_rows
 from ...common.moe.layer import MoE
 from ...common.validation import temporary_attention_mask
 from ...configuration import (
@@ -302,7 +302,62 @@ class KimiTextDecoder(nn.Module):
 class KimiLinearForCausalLM(PreTrainedModel):
     """Explicit causal model tree with Kimi-specific initialization and loss."""
 
-    execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
+    @property
+    def execution_capabilities(self) -> ModelExecutionCapabilities:
+        return ModelExecutionCapabilities(
+            hidden_states=True, hidden_size=self.config.hidden_size
+        )
+
+    @property
+    def checkpoint_configuration(self) -> dict[str, object]:
+        """Declare Kimi MLA, recurrent attention and expert routing semantics."""
+        return {
+            name: getattr(self.config, name, None)
+            for name in (
+                "vocab_size",
+                "hidden_size",
+                "head_dim",
+                "intermediate_size",
+                "num_hidden_layers",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "hidden_act",
+                "rms_norm_eps",
+                "attn_mask_type",
+                "is_causal",
+                "rope_parameters",
+                "max_position_embeddings",
+                "q_lora_rank",
+                "kv_lora_rank",
+                "qk_nope_head_dim",
+                "qk_rope_head_dim",
+                "v_head_dim",
+                "mla_use_nope",
+                "mla_use_output_gate",
+                "linear_attn_config",
+                "attn_res_block_size",
+                "num_experts",
+                "num_experts_per_token",
+                "num_shared_experts",
+                "moe_intermediate_size",
+                "moe_renormalize",
+                "moe_router_activation_func",
+                "routed_scaling_factor",
+                "first_k_dense_replace",
+                "moe_layer_freq",
+                "use_grouped_topk",
+                "num_expert_group",
+                "topk_group",
+                "topk_method",
+                "latent_moe_use_norm",
+                "routed_expert_hidden_size",
+                "activation_situ_beta",
+                "activation_situ_linear_beta",
+                "num_nextn_predict_layers",
+                "tie_word_embeddings",
+                "pad_token_id",
+            )
+        }
 
     decoder_structure = DecoderStructure(
         decoder="model",
@@ -367,14 +422,10 @@ class KimiLinearForCausalLM(PreTrainedModel):
         mesh: Any,
         *,
         load_balancer: str | None = None,
-        strategy: str = "kv_allgather",
-        mask_mesh: Any = None,
     ) -> None:
         """Record CP metadata; KDA validates recurrence constraints later."""
         self.cp_mesh = mesh
         self._cp_load_balancer = load_balancer
-        self._cp_mask_mesh = mesh if mask_mesh is None else mask_mesh
-        self._cp_strategy = strategy
 
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize missing linear/embedding weights without overwriting loads."""
@@ -450,14 +501,12 @@ class KimiLinearForCausalLM(PreTrainedModel):
         batch: Any,
         *,
         parallel_dims: Any,
-        max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Expose Kimi's text input contract to the Trainer."""
         inputs, labels, extra = prepare_text_inputs(
             self,
             batch,
             parallel_dims=parallel_dims,
-            max_context_length=max_context_length,
             preserve_batch_rows=True,
         )
         if "input_batch_shape" in extra and "attention_masks" in extra:
@@ -482,15 +531,9 @@ class KimiLinearForCausalLM(PreTrainedModel):
             raise ValueError("Specify only one of positions and position_ids")
         if attention_masks is not None and kwargs.get("attention_mask") is not None:
             raise ValueError("Specify only one of attention_masks and attention_mask")
-        flat_input = input_ids is not None and input_ids.ndim == 1
-        if input_batch_shape is not None:
-            if not flat_input:
-                raise ValueError("input_batch_shape requires flat Trainer tokens")
-            input_ids = input_ids.reshape(input_batch_shape)
-            if labels is not None:
-                labels = labels.reshape(input_batch_shape)
-        elif flat_input:
-            input_ids = input_ids.unsqueeze(0)
+        input_ids, labels, flat_input = restore_text_batch_rows(
+            input_ids, labels, batch_shape=input_batch_shape
+        )
         if positions is not None:
             if positions.ndim == 1 and input_batch_shape is not None:
                 positions = positions.reshape(input_batch_shape)

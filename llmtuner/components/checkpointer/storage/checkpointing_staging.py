@@ -9,6 +9,7 @@ from contextvars import copy_context
 from functools import wraps
 from types import MethodType
 from typing import Any
+from weakref import WeakSet
 
 import torch
 
@@ -25,6 +26,8 @@ except ImportError as error:
 
 logger = get_logger(__name__)
 
+_adapted_stagers: WeakSet[Any] = WeakSet()
+
 
 def _npu_stage(
     self: Any,
@@ -32,7 +35,7 @@ def _npu_stage(
     keys_not_requiring_copy: Sequence[str] = (),
 ) -> dict[str, Any] | Future[dict[str, Any]]:
     """Submit a producer event without entering an upstream CUDA context."""
-    with torch.npu.device(self._llmtuner_npu_device):
+    with torch.npu.device(self.staging_device):
         ready = torch.Event(enable_timing=True)
         ready.record(torch.accelerator.current_stream())
     if self._config.use_async_staging:
@@ -49,7 +52,7 @@ def _npu_stage(
 
 
 def _npu_init_worker(self: Any) -> None:
-    torch.npu.set_device(self._llmtuner_npu_device)
+    torch.npu.set_device(self.staging_device)
 
 
 def _npu_copy_stage(
@@ -71,7 +74,7 @@ def _npu_copy_stage(
         payload = state_dict.copy()
         for key in keys_not_requiring_copy:
             payload.pop(key, None)
-    with torch.npu.device(self._llmtuner_npu_device):
+    with torch.npu.device(self.staging_device):
         # NPU timing needs the producer event to be explicitly completed before
         # elapsed_time, even after the dependent stream's end event completes.
         ready.synchronize()
@@ -130,14 +133,14 @@ def adapt_npu_staging(manager: Any) -> bool:
 
     if type(stager) is not DefaultStager or not stager._accelerator_available:
         return False
-    if getattr(stager, "_llmtuner_npu_event_wait", False):
+    if stager in _adapted_stagers:
         return False
     if hasattr(stager, "_stage_on_worker"):
-        stager._llmtuner_npu_device = torch.npu.current_device()
+        stager.staging_device = torch.npu.current_device()
         stager.stage = MethodType(_npu_stage, stager)
         stager._init_worker_thread = MethodType(_npu_init_worker, stager)
         stager._stage = MethodType(_npu_copy_stage, stager)
-        stager._llmtuner_npu_event_wait = True
+        _adapted_stagers.add(stager)
         logger.info("Applied instance-scoped NPU worker staging")
         return True
     original_stage = stager._stage
@@ -156,6 +159,6 @@ def adapt_npu_staging(manager: Any) -> bool:
         return original_stage(state_dict, current_stream_ready, keys_not_requiring_copy)
 
     stager._stage = stage_after_producer
-    stager._llmtuner_npu_event_wait = True
+    _adapted_stagers.add(stager)
     logger.info("Applied instance-scoped torch_checkpointing 0.1.0 NPU staging wait")
     return True

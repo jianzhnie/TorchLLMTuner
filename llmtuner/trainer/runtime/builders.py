@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from contextlib import AbstractContextManager
+    from types import TracebackType
 
     from torch import nn
     from torch.distributed import ProcessGroup
@@ -34,7 +34,15 @@ if TYPE_CHECKING:
 
 
 class PipelineScheduleFactory(Protocol):
-    """Build a torch pipeline schedule with the assembled vocabulary loss."""
+    """Build a training schedule retaining the supplied stages in order.
+
+    Pass PipelineLoss (or an equivalent callable with mutable scalar tensor
+    global_valid_tokens) as the schedule's loss_fn. The driver scopes this
+    denominator to each invocation. The returned schedule must support the
+    installed Torch microbatch API and have backward enabled. logits_width is
+    the declared replicated vocabulary width and must be checked before loss;
+    None leaves vocabulary-sharded geometry to the sharded loss contract.
+    """
 
     def __call__(
         self,
@@ -45,6 +53,7 @@ class PipelineScheduleFactory(Protocol):
         loss_sum: LossSum | None,
         tp_group: ProcessGroup | None = None,
         global_vocab_size: int | None = None,
+        logits_width: int | None = None,
     ) -> _PipelineSchedule: ...
 
 
@@ -107,6 +116,23 @@ class StepProfiler(Protocol):
     def step(self) -> None: ...
 
 
+class ProfilerOwner(Protocol):
+    """Own tracing resources across failed entry and retryable shutdown."""
+
+    def __enter__(self) -> StepProfiler: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None: ...
+
+    def close(self) -> None:
+        """Release resources; retain failed releases for a later close attempt."""
+        ...
+
+
 class SchedulerFactory(Protocol):
     """Build schedules over the actual inner optimizers, without Trainer."""
 
@@ -145,7 +171,7 @@ class CheckpointFactory(Protocol):
 
 
 class ProfilerFactory(Protocol):
-    """Return a context owner; optional close() enables shutdown retries.
+    """Return a context owner with explicit, retryable close semantics.
 
     The entered value may differ from the context owner and only needs step().
     Factories own partial construction and context owners clean failed entry.
@@ -158,7 +184,7 @@ class ProfilerFactory(Protocol):
         *,
         global_step: int,
         base_folder: str,
-    ) -> AbstractContextManager[StepProfiler]: ...
+    ) -> ProfilerOwner: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,14 +197,22 @@ class TrainingBuilders:
     support the existing state, iteration, hook and update interfaces. Metrics
     factories must return a processor supporting reporting and close().
 
+    Services with background resources must expose close(). A failed scheduler
+    close retains its optimizer until a later close attempt succeeds. Factories
+    own cleanup of resources created before their result is returned.
+    Optimizer services may expose observation_metrics as a snapshot of named
+    rank-local scalar counters; training reporting consumes it without inspecting
+    optimizer implementations.
+
     loss receives the run configuration and returns LossFunctions. A pipeline
     schedule factory accepts stages, parallel cfg, loss_sum and vocabulary
     reduction keywords, using build_pipeline_schedule's calling convention.
 
     profiler accepts profiler config, global_step and base_folder, and returns
-    a context manager whose entered value supports step(). checkpoint accepts
-    the selected manager's constructor arguments and returns a manager with
-    save/load/wait/close and requires_close_retry lifecycle semantics.
+    a context manager with close() whose entered value supports step(). checkpoint
+    accepts the selected manager's constructor arguments and returns a manager with
+    save/load/wait/close semantics. Failed close calls retain the manager and
+    its dependencies for retry; successful close calls must be idempotent.
     """
 
     loss: Callable[[LLMTunerConfig], LossFunctions] | None = None

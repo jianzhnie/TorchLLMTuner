@@ -65,21 +65,6 @@ class CompatibilityRule:
 # == assembly phase: verdicts called from the guard sites =================
 
 
-def fused_qkv_tp() -> None:
-    """The HF fused projection must not bypass independent TP projection collectives."""
-    raise UnsupportedCombinationError(
-        "model.qkv_projection='fused' does not yet support tensor parallelism; "
-        "use separate projections until fused collective boundaries are adapted."
-    )
-
-
-def eager_flex_parallel(family: str) -> None:
-    """Eager Flex must not silently replace TP/CP mask and collective boundaries."""
-    raise UnsupportedCombinationError(
-        f"eager Flex {family} mask/collective boundaries are not adapted; use auto"
-    )
-
-
 def validation_once_requires_dp1(dp_world_size: int) -> None:
     """steps=-1 stops each rank when its own shard is exhausted; with DP > 1 the ranks
     can exhaust at different iterations and hang on the pass's collectives.
@@ -324,18 +309,6 @@ def shared_expert_tp_ep(block: object) -> None:
 
 
 ENTRIES: tuple[CompatibilityRule, ...] = (
-    CompatibilityRule(
-        eager_flex_parallel,
-        "assembly",
-        UnsupportedCombinationError,
-        "parallel/context_parallel/context_parallel.py::apply_cp",
-    ),
-    CompatibilityRule(
-        fused_qkv_tp,
-        "assembly",
-        UnsupportedCombinationError,
-        "parallel/tensor_parallel/tensor_parallel.py::validate_tp_model_options",
-    ),
     CompatibilityRule(
         validation_once_requires_dp1,
         "assembly",

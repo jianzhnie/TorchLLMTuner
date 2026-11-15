@@ -244,21 +244,21 @@ def main():
             )
         elif failure_stage == "mesh":
             inner = resumed.optimizers[0]
-            original_validate_plan = inner._validate_plan_across_ranks
+            original_validate_plan = inner.validate_loaded_state
 
             def fail_mesh_plan():
                 original_validate_plan()
                 if dist.get_rank() == 0:
                     raise ValueError("injected DistMuon mesh plan failure")
 
-            inner._validate_plan_across_ranks = fail_mesh_plan
+            inner.validate_loaded_state = fail_mesh_plan
             error = None
             try:
                 resumed.load_state_dict(state)
             except (ValueError, RuntimeError) as caught:
                 error = caught
             finally:
-                del inner._validate_plan_across_ranks
+                del inner.validate_loaded_state
             outcomes = [None] * dist.get_world_size()
             dist.all_gather_object(outcomes, (type(error).__name__, str(error)))
             assert outcomes[0][0] == "ValueError", outcomes

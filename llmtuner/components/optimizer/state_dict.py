@@ -56,7 +56,7 @@ def init_optim_state(optim: torch.optim.Optimizer) -> None:
     * **Loading.** DCP writes *into* the tensors a state dict reports rather
       than calling ``load_state_dict``. A fresh optimizer reports none, so there
       is nothing to write into and the restored run trains with a cold
-      optimizer. ``OptimizersContainer.state_dict`` calls this for that case.
+      optimizer. ``OptimizerCheckpointState.state_dict`` calls this for that case.
 
     The step runs with zero gradients and ``lr=0`` so parameters are untouched;
     the materialized state is then reset, so the first real update is still Adam

@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -36,7 +36,8 @@ from ....utils.garbage_collection import GarbageCollection
 from ....utils.logging import get_logger
 from ..storage import filesystem
 from ..storage.storage import CheckpointStorage
-from .checkpoint_keys import EMA, LR_SCHEDULER, MODEL, OPTIMIZER
+from .checkpoint_keys import CHECKPOINT_FORMAT, EMA, LR_SCHEDULER, MODEL, OPTIMIZER
+from .format_state import CheckpointFormatState
 from .model_state import ModelCheckpointState
 
 if TYPE_CHECKING:
@@ -190,6 +191,8 @@ class BaseCheckpointManager(ABC):
             config.enable,
             async_mode if config.enable else None,
             config.load_only if config.enable else None,
+            config.sharded_tensor_parallel if config.enable else None,
+            config.sharded_expert_parallel if config.enable else None,
         )
         configurations = [None] * dist.get_world_size()
         dist.all_gather_object(configurations, configuration)
@@ -243,7 +246,22 @@ class BaseCheckpointManager(ABC):
                 f"effective checkpoint folder, got {self.folder}"
             )
         self.interval = config.interval
+        with synchronize_local_errors("Checkpoint state registration"):
+            if any(not isinstance(key, str) or not key for key in states):
+                raise ValueError("Checkpoint state names must be nonempty strings")
+            reserved = states.keys() & {
+                CHECKPOINT_FORMAT,
+                MODEL,
+                OPTIMIZER,
+                LR_SCHEDULER,
+                EMA,
+            }
+            if reserved:
+                raise ValueError(
+                    f"Extra checkpoint states use reserved names: {sorted(reserved)}"
+                )
         self.states = {
+            CHECKPOINT_FORMAT: CheckpointFormatState.capture(model_parts),
             MODEL: ModelCheckpointState(
                 model_parts,
                 runtime_layouts=runtime_layouts,
@@ -256,11 +274,8 @@ class BaseCheckpointManager(ABC):
         }
         if ema is not None:
             self.states[EMA] = ema
-        # Own the mapping and preserve optimizer-before-scheduler load order,
-        # even when the caller's dictionary already contains core state keys.
-        self.states.update(
-            (key, value) for key, value in states.items() if key not in self.states
-        )
+        # Own the mapping and preserve optimizer-before-scheduler load order.
+        self.states.update(states)
 
         # -- loading and saving policy --
         self.load_only = config.load_only
@@ -314,13 +329,16 @@ class BaseCheckpointManager(ABC):
             # Source discovery is local IO: successful ranks can still disagree
             # about visibility or latest step. Agree before any rank returns or
             # enters the reader's collective state restoration.
-            selection = (resolved, sorted(states) if states is not None else None)
+            # Stateful callbacks may communicate. Equal key sets with different
+            # insertion order can still enter different collectives first.
+            selection = (resolved, tuple(states) if states is not None else None)
             selections = [None] * get_world_size()
             dist.all_gather_object(selections, selection)
             if any(candidate != selection for candidate in selections):
                 raise RuntimeError(
                     "Checkpoint ranks discovered inconsistent restore sources or "
-                    "state categories; check storage visibility and load configuration"
+                    "ordered state categories; check storage visibility, state "
+                    "registration order and load configuration"
                 )
         if resolved is None:
             return False
@@ -472,6 +490,11 @@ class BaseCheckpointManager(ABC):
                     self.last_save_model_only if last_step else None,
                     self.last_save_in_hf if last_step else None,
                     self.export_dtype if last_step else None,
+                    (
+                        (MODEL,)
+                        if last_step and self.last_save_model_only
+                        else tuple(self.states)
+                    ),
                 )
                 if should_save
                 else None
@@ -495,12 +518,13 @@ class BaseCheckpointManager(ABC):
             if any(candidate[3] != save_configuration for candidate in gathered):
                 raise RuntimeError(
                     "Checkpoint ranks supplied inconsistent save configuration; "
-                    "check backend, folder, async mode and final export options"
+                    "check backend, folder, async mode, final export options "
+                    "and state registration order"
                 )
         started = time.monotonic()
         saved = False
         try:
-            saved = self._save(curr_step, last_step)
+            saved = self._save(curr_step, last_step, should_save=should_save)
             return saved
         finally:
             if saved:
@@ -524,26 +548,20 @@ class BaseCheckpointManager(ABC):
                 time.monotonic() - started
             )
 
-    @property
-    def requires_close_retry(self) -> bool:
-        """Whether this manager still owns resources requiring close().
-
-        Remains true after an interrupted drain or backend cleanup failure.
-        Once resources have been released, a reported worker error does not
-        require retaining dependencies such as the training dataloader.
-        """
-        return getattr(self, "_initialized", False)
-
     def close(self) -> None:
         """Release background threads and other resources.
 
         Safe to call at any point in the object's life: ``__del__`` routes here,
         and it can run on a partially constructed object whose ``__init__``
-        raised. ``_close`` is a no-op when that happened, so implementations of
-        it may assume their own attributes exist. Interrupted waits preserve
+        raised. Backends mark failed construction cleanup only after their
+        cleanup attributes exist; close then retries that cleanup without
+        enabling load/save operations. Interrupted waits preserve
         live worker resources so close can be retried after completion.
         """
         if not getattr(self, "_initialized", False):
+            if getattr(self, "_construction_cleanup_pending", False):
+                self._close()
+                self._construction_cleanup_pending = False
             return
         first_error: BaseException | None = None
         for release in (
@@ -650,6 +668,27 @@ class BaseCheckpointManager(ABC):
         if retention is not None:
             self._purge_stale_checkpoints(**retention, completed=True)
 
+    def _consume_pending_future(
+        self,
+        field: Literal["staging_future", "save_future"],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Consume completed work once; retain live work after interrupted waits.
+
+        Backends validate their async mode before delegating. No collective runs
+        here: save/load boundaries coordinate errors, while close stays local.
+        """
+        future = getattr(self, field)
+        if future is None:
+            return
+        setattr(self, field, None)
+        try:
+            future.result(timeout=timeout)
+        finally:
+            if not future.done():
+                setattr(self, field, future)
+
     @abstractmethod
     def _wait_for_saving(self) -> None:
         """Await ``save_future`` and clear it. Only called when it is set."""
@@ -713,6 +752,8 @@ class BaseCheckpointManager(ABC):
         if model_only:
             return {MODEL: self.states[MODEL]}
 
+        if CHECKPOINT_FORMAT in self.exclude_from_loading:
+            raise ValueError("Native checkpoint format validation cannot be excluded")
         for exclude_key in self.exclude_from_loading:
             if exclude_key not in self.states:
                 raise ValueError(f"{exclude_key} not found in state_dict.")
@@ -723,8 +764,14 @@ class BaseCheckpointManager(ABC):
         }
 
     @abstractmethod
-    def _save(self, curr_step: int, last_step: bool = False) -> bool:
-        """Implement ``save``. Only called when checkpointing is enabled."""
+    def _save(
+        self, curr_step: int, last_step: bool = False, *, should_save: bool
+    ) -> bool:
+        """Apply the coordinated save decision, retaining optional idle prewarming.
+
+        The public entry point owns cadence and cross-rank agreement. Backends
+        must consume should_save without recomputing policy or changing it.
+        """
 
     @abstractmethod
     def _maybe_wait_for_staging(self) -> None:

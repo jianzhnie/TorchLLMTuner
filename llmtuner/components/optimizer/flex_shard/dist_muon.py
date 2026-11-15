@@ -486,6 +486,23 @@ class DistMuon(Optimizer):
         self._matrix_views_by_fqn = matrix_views_by_fqn
         self._direction_row_scale_by_fqn = direction_row_scale_by_fqn
 
+    def load_local_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Load and rebuild locally; caller must then validate_loaded_state.
+
+        Load hooks must not communicate. The container coordinates local
+        failures across ranks before entering the separate mesh validation.
+        """
+        previous = getattr(self, "_defer_load_plan_validation", False)
+        self._defer_load_plan_validation = True
+        try:
+            self.load_state_dict(state_dict)
+        finally:
+            self._defer_load_plan_validation = previous
+
+    def validate_loaded_state(self) -> None:
+        """Collectively validate rebuilt plans after all local loads succeed."""
+        self._validate_plan_across_ranks()
+
     def _validate_plan_across_ranks(self) -> None:
         _validate_bucket_plans_across_ranks(
             self._bucket_plans,

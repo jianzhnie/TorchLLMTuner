@@ -1,21 +1,8 @@
-"""Drive a torch pipeline schedule one already-split microbatch set at a time.
+"""Adapt pre-split microbatches to the installed Torch pipeline schedule API.
 
-torch 2.10 added ``_PipelineSchedule.eval(arg_mbs=...)`` and
-``_step_microbatches(..., return_outputs=...)``. torch 2.9 (the Ascend /
-``torch_npu`` stack) has neither: its ``step``/``eval`` take *whole-batch*
-inputs and declare ``**kwargs``, so microbatch keywords would be swallowed and
-forwarded into the model call rather than routed to the schedule. That is a
-silent misroute, not a failure, which is why the capability exists and why this
-module exists next to it.
-
-What ``step()`` does before handing off to ``_step_microbatches`` is a handful
-of lines over ``schedule._stage(s)`` -- set ``has_backward``, clear the stages'
-runtime state -- and that sequence is the same in 2.9 and 2.10. Reproducing it
-lets the older build run PP instead of refusing to start.
-
-Neither driver returns outputs, matching the ``return_outputs=False`` the 2.10
-driver is called with: llmtuner's train and validation paths consume the
-per-microbatch losses, never the last stage's activations.
+Own version-specific calls, loss normalization state and stage initialization
+here so training orchestration does not depend on private schedule fields.
+Both drivers collect losses without returning final-stage activations.
 """
 
 from __future__ import annotations
@@ -25,12 +12,17 @@ from collections.abc import Iterator
 from functools import wraps
 from types import FunctionType, MethodType, SimpleNamespace
 from typing import Any
+from weakref import WeakSet
 
 import torch
 
+from ...accelerator.capabilities import has as capability
+from ...components.loss_contract import validate_normalization_tokens
 from ...errors import EnvironmentUnsupportedError
 
 __all__ = ["run_eval_microbatches", "run_microbatches", "schedule_stages"]
+
+_adapted_rng_methods: WeakSet[FunctionType] = WeakSet()
 
 
 def bind_stage_rng(schedule: Any) -> None:
@@ -40,9 +32,11 @@ def bind_stage_rng(schedule: Any) -> None:
     Older schedules without this initialization method require no adapter.
     """
     method = getattr(schedule, "_initialize_pp_stages", None)
-    if method is None or getattr(method, "_llmtuner_stage_rng", False):
+    if method is None:
         return
     function = getattr(method, "__func__", None)
+    if isinstance(function, FunctionType) and function in _adapted_rng_methods:
+        return
     if not isinstance(function, FunctionType):
         raise EnvironmentUnsupportedError(
             "Pipeline RNG adapter requires a Python metadata initialization method"
@@ -76,7 +70,7 @@ def bind_stage_rng(schedule: Any) -> None:
     )
     bound.__kwdefaults__ = function.__kwdefaults__
     wraps(function)(bound)
-    bound._llmtuner_stage_rng = True
+    _adapted_rng_methods.add(bound)
     schedule._initialize_pp_stages = MethodType(bound, schedule)
 
 
@@ -93,6 +87,44 @@ def schedule_stages(schedule: Any) -> list[Any]:
     return list(stages)
 
 
+def validate_pipeline_schedule(schedule: Any, stages: list[Any]) -> None:
+    """Check a factory's local driver contract without invoking model execution."""
+    actual = schedule_stages(schedule)
+    if len(actual) != len(stages) or any(
+        left is not right for left, right in zip(actual, stages, strict=True)
+    ):
+        raise ValueError("Pipeline schedule must retain the assembled stage order")
+    if getattr(schedule, "_has_backward", None) is not True:
+        raise ValueError("Training pipeline schedule must enable backward")
+    methods = ["_step_microbatches"]
+    if capability("pipelining_microbatch_drivers"):
+        methods.append("eval")
+    for name in methods:
+        if not callable(getattr(schedule, name, None)):
+            raise TypeError(f"Pipeline schedule requires callable {name}")
+    loss = getattr(schedule, "_loss_fn", None)
+    if not callable(loss):
+        raise TypeError(
+            "Pipeline schedule requires a callable normalization-aware loss"
+        )
+    validate_normalization_tokens(getattr(loss, "global_valid_tokens", None))
+
+
+@contextlib.contextmanager
+def _loss_normalization(
+    schedule: Any, normalization_tokens: torch.Tensor
+) -> Iterator[None]:
+    """Keep a step's denominator from leaking into later calls or retaining it."""
+    validate_normalization_tokens(normalization_tokens)
+    loss = schedule._loss_fn
+    previous = loss.global_valid_tokens
+    loss.global_valid_tokens = normalization_tokens
+    try:
+        yield
+    finally:
+        loss.global_valid_tokens = previous
+
+
 def run_microbatches(
     schedule: Any,
     *,
@@ -100,18 +132,25 @@ def run_microbatches(
     kwargs: list[dict[str, Any]],
     targets: list[Any] | None,
     losses: list[Any] | None,
+    normalization_tokens: torch.Tensor,
 ) -> None:
-    """Run one training microbatch set on a schedule without microbatch drivers.
+    """Run one training microbatch set with the installed schedule driver.
 
     Mirrors 2.9's ``step()`` setup exactly: the schedule's ``_has_backward``
     picks the stages' mode, and it is left as the caller set it (the training
     path runs with backward enabled).
     """
-    for stage in schedule_stages(schedule):
-        stage.has_backward = schedule._has_backward
-        stage.clear_runtime_states()
-    bind_stage_rng(schedule)
-    schedule._step_microbatches(args, kwargs, targets, losses)
+    with _loss_normalization(schedule, normalization_tokens):
+        for stage in schedule_stages(schedule):
+            stage.has_backward = schedule._has_backward
+            stage.clear_runtime_states()
+        bind_stage_rng(schedule)
+        if capability("pipelining_microbatch_drivers"):
+            schedule._step_microbatches(
+                args, kwargs, targets, losses, return_outputs=False
+            )
+        else:
+            schedule._step_microbatches(args, kwargs, targets, losses)
 
 
 def run_eval_microbatches(
@@ -121,20 +160,31 @@ def run_eval_microbatches(
     kwargs: list[dict[str, Any]],
     targets: list[Any] | None,
     losses: list[Any] | None,
+    normalization_tokens: torch.Tensor,
 ) -> None:
-    """Run one forward-only microbatch set on a schedule without eval drivers.
+    """Run one forward-only microbatch set with the installed schedule driver.
 
     Mirrors 2.9's ``eval()``: ``_has_backward`` decides the mode, so it is
     forced off for the duration and restored afterwards, and the stages are
     primed with the same flag so the schedule never takes a backward step.
     """
-    previous = schedule._has_backward
-    schedule._has_backward = False
-    try:
-        for stage in schedule_stages(schedule):
-            stage.has_backward = False
-            stage.clear_runtime_states()
-        bind_stage_rng(schedule)
-        schedule._step_microbatches(args, kwargs, targets, losses)
-    finally:
-        schedule._has_backward = previous
+    with _loss_normalization(schedule, normalization_tokens):
+        stages = schedule_stages(schedule)
+        stage_modes = [stage.has_backward for stage in stages]
+        previous = schedule._has_backward
+        try:
+            if capability("pipelining_microbatch_drivers"):
+                schedule.eval(
+                    arg_mbs=args, kwarg_mbs=kwargs, target_mbs=targets, losses=losses
+                )
+                return
+            schedule._has_backward = False
+            for stage in stages:
+                stage.has_backward = False
+                stage.clear_runtime_states()
+            bind_stage_rng(schedule)
+            schedule._step_microbatches(args, kwargs, targets, losses)
+        finally:
+            schedule._has_backward = previous
+            for stage, mode in zip(stages, stage_modes, strict=True):
+                stage.has_backward = mode

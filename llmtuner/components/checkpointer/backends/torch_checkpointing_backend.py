@@ -64,20 +64,21 @@ if TYPE_CHECKING:
 from ....utils.logging import get_logger
 from ..core.base import BaseCheckpointManager, purge_thread
 from ..core.checkpoint_keys import (
+    CHECKPOINT_FORMAT,
     DATALOADER,
     EMA,
     LR_SCHEDULER,
     MODEL,
     OPTIMIZER,
-    RNG_STATE,
     TRAIN_STATE,
 )
-from ..core.random_state import RNGCheckpointState
 from ..core.state_adaptation import (
     adapt_hf_model_state,
     materialize_local_checkpoint_states,
     prepare_hf_model_state,
     prepare_local_state_preflight,
+    restore_categories_before_rng,
+    restore_rng_state,
     validate_local_preflight_selection,
     validate_local_state_preflight,
 )
@@ -557,6 +558,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 if hasattr(self, "_manager"):
                     self._close()
             except BaseException:
+                self._construction_cleanup_pending = True
                 try:
                     logger.exception("Backend cleanup failed during construction")
                 except BaseException:
@@ -688,9 +690,11 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 into=state_dict,
                 strict=True,
             )
-            for key, target in states.items():
-                if key == RNG_STATE:
-                    continue  # Restore after all callbacks and EMA reseeding below.
+            # Registration order is not a dependency contract. Optimizer group
+            # restoration must precede scheduler restoration; RNG stays last,
+            # after all callbacks and EMA reseeding below.
+            for key in restore_categories_before_rng(states):
+                target = states[key]
                 if self._is_stateful(target):
                     # These built-in states restore locally. Coordinate each
                     # callback before a peer can reach later EMA/TP/EP work.
@@ -698,7 +702,8 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                     # their callbacks must stay outside local error regions.
                     with (
                         synchronize_local_errors(f"Checkpoint {key} restoration")
-                        if key in {LR_SCHEDULER, DATALOADER, TRAIN_STATE}
+                        if key
+                        in {CHECKPOINT_FORMAT, LR_SCHEDULER, DATALOADER, TRAIN_STATE}
                         else nullcontext()
                     ):
                         target.load_state_dict(state_dict[key])
@@ -715,15 +720,8 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         with synchronize_local_errors("Checkpoint EMA cold start"):
             if MODEL in states and EMA in self.states and EMA not in states:
                 self.states[EMA].reset_from_model()
-        if not from_hf and RNG_STATE in states:
-            # User callbacks and model hooks can draw from default generators.
-            # Restore those streams last, matching the DCP backend contract.
-            with synchronize_local_errors("Checkpoint RNG validation"):
-                rng_state = states[RNG_STATE]
-                if isinstance(rng_state, RNGCheckpointState):
-                    rng_state.validate_state_dict(state_dict[RNG_STATE])
-            with synchronize_local_errors("Checkpoint rng_state restoration"):
-                states[RNG_STATE].load_state_dict(state_dict[RNG_STATE])
+        if not from_hf:
+            restore_rng_state(states, state_dict)
 
     @staticmethod
     def _is_stateful(obj: Any) -> bool:
@@ -752,8 +750,9 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         assert payload is not None
         return payload
 
-    def _save(self, curr_step: int, last_step: bool = False) -> bool:
-        should_save = self._should_save(curr_step, last_step)
+    def _save(
+        self, curr_step: int, last_step: bool = False, *, should_save: bool
+    ) -> bool:
         # Prewarm on a step we are not saving, so the first real save does not
         # pay for pinned-buffer allocation.
         if not should_save and self._should_prewarm():
@@ -878,14 +877,9 @@ class TorchCheckpointingManager(BaseCheckpointManager):
     def _wait_for_saving(self) -> None:
         # Completed failures are consumed once. A timeout or interruption
         # leaves the write active, so subsequent saves must still wait for it.
-        save_future = self.save_future
-        assert save_future is not None
-        self.save_future = None
-        try:
-            save_future.result(timeout=self._manager_config.save.wait_timeout_secs)
-        finally:
-            if not save_future.done():
-                self.save_future = save_future
+        self._consume_pending_future(
+            "save_future", timeout=self._manager_config.save.wait_timeout_secs
+        )
 
     def _close(self) -> None:
         def close_purge_worker() -> None:

@@ -33,7 +33,7 @@ def forward_packed_experts(
             scores.reshape(-1, 1), expert_ids.reshape(-1, 1)
         )
     else:
-        dispatcher = module._llmtuner_local_dispatcher
+        dispatcher = module.local_dispatcher
         routed, counts, metadata = dispatcher.dispatch(
             flat_hidden, scores, expert_ids, counts
         )

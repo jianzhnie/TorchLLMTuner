@@ -11,7 +11,12 @@ from typing import Any
 
 import torch
 
-from ...datasets.contracts import Batch, TrainerBatch
+from ...datasets.contracts import (
+    Batch,
+    TrainerBatch,
+    validate_token_alignment,
+    validated_token_fields,
+)
 from ...errors import UnsupportedCombinationError
 from ...parallel.context_parallel.input_sharding import (
     shard_batch_for_cp,
@@ -22,25 +27,46 @@ from ...parallel.topology import ParallelTopology
 from .attention.masks import build_dense_attention_mask
 from .targets import next_token_targets
 
-__all__ = ["prepare_text_inputs"]
+__all__ = ["prepare_text_inputs", "restore_text_batch_rows"]
+
+
+def restore_text_batch_rows(
+    input_ids: torch.Tensor | None,
+    labels: torch.Tensor | None,
+    *,
+    batch_shape: tuple[int, int] | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, bool]:
+    """Restore declared independent rows before model execution and causal loss.
+
+    The boolean records the caller's flat layout for output restoration. Position
+    broadcasting, padding and attention/recurrent semantics remain model-owned.
+    """
+    flat_input = input_ids is not None and input_ids.ndim == 1
+    if batch_shape is None:
+        return input_ids.unsqueeze(0) if flat_input else input_ids, labels, flat_input
+    if not flat_input:
+        raise ValueError("input_batch_shape requires flat Trainer tokens")
+    if (
+        not isinstance(batch_shape, tuple)
+        or len(batch_shape) != 2
+        or any(type(size) is not int or size <= 0 for size in batch_shape)
+    ):
+        raise ValueError("input_batch_shape must contain two positive integers")
+    if input_ids.numel() != batch_shape[0] * batch_shape[1]:
+        raise ValueError("input_batch_shape does not match input token count")
+    if labels is not None:
+        if labels.ndim == 1 and labels.numel() == input_ids.numel():
+            labels = labels.reshape(batch_shape)
+        elif tuple(labels.shape) != batch_shape:
+            raise ValueError("labels must match the declared input batch layout")
+    return input_ids.reshape(batch_shape), labels, flat_input
 
 
 def _batch_fields(
     batch: Batch | TrainerBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    tokens = batch.input_ids if isinstance(batch, Batch) else batch["input"]
-    if tokens.ndim not in (1, 2):
-        raise ValueError("Text input must have shape [tokens] or [batch, sequence]")
-    if tokens.dtype not in (torch.int32, torch.int64):
-        raise TypeError("Text input must contain int32 or int64 token indices")
-    labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
-    if labels.dtype not in (torch.int32, torch.int64):
-        raise TypeError("labels must contain int32 or int64 target indices")
+    tokens, labels = validated_token_fields(batch)
     if isinstance(batch, Batch):
-        # Synthetic labels are unshifted. Their row width controls which
-        # terminal targets become ignored, so equal numel alone is insufficient.
-        if labels.shape != tokens.shape:
-            raise ValueError("Synthetic labels must have the same shape as input_ids")
         return (
             tokens.reshape(-1),
             next_token_targets(labels.reshape(-1), seq_len=tokens.shape[-1]),
@@ -63,10 +89,19 @@ def _batch_fields(
         raise ValueError(
             f"Text explicit models cannot consume multimodal fields: {names}"
         )
-    inputs = tokens.reshape(-1)
-    labels = labels.reshape(-1)
     positions = batch.get("positions")
     padding_mask = batch.get("padding_mask")
+    for name, value in (
+        ("positions", positions),
+        ("padding_mask", padding_mask),
+    ):
+        if value is None:
+            continue
+        validate_token_alignment(tokens, value, name=name)
+    if positions is not None and positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError("positions must contain int32 or int64 token indices")
+    inputs = tokens.reshape(-1)
+    labels = labels.reshape(-1)
     if positions is not None:
         positions = positions.reshape(-1)
     if padding_mask is not None:
@@ -79,7 +114,6 @@ def prepare_text_inputs(
     batch: Batch | TrainerBatch,
     *,
     parallel_dims: ParallelTopology | None,
-    max_context_length: int | None = None,
     preserve_batch_rows: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Normalize and shard a text batch without inspecting model structure.
@@ -90,23 +124,7 @@ def prepare_text_inputs(
     Models opting into row preservation consume input_batch_shape in forward;
     the helper retains layout only, not attention/recurrent reset mathematics.
     """
-    del max_context_length
     inputs, labels, positions, padding_mask = _batch_fields(batch)
-    for name, value in (
-        ("labels", labels),
-        ("positions", positions),
-        ("padding_mask", padding_mask),
-    ):
-        if value is not None and value.numel() != inputs.numel():
-            raise ValueError(
-                f"{name} has {value.numel()} tokens, but input has {inputs.numel()}"
-            )
-        if value is not None and value.device != inputs.device:
-            raise ValueError(
-                f"{name} is on {value.device}, but input is on {inputs.device}"
-            )
-    if positions is not None and positions.dtype not in (torch.int32, torch.int64):
-        raise TypeError("positions must contain int32 or int64 token indices")
     config = getattr(model, "config", None)
     if config is None:
         raise TypeError(f"{type(model).__name__} must expose a config")

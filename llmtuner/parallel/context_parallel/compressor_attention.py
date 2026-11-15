@@ -233,6 +233,42 @@ def compressor_attention_forward(group):
     return forward
 
 
+def _validate_compressor_execution(*modules: torch.nn.Module, degree: int) -> None:
+    for module in modules:
+        if not callable(getattr(module, "forward_compressor_context_parallel", None)):
+            raise TypeError("Compressor CP requires model-owned forward interfaces")
+        validate = getattr(module, "validate_compressor_context_parallel", None)
+        if not callable(validate):
+            raise TypeError("Compressor CP requires model-owned execution validation")
+        validate(degree=degree)
+
+
+def _validate_compressor_configuration(
+    decoder: torch.nn.Module,
+    attentions: tuple[torch.nn.Module, ...],
+    *,
+    cfg: ParallelConfig,
+    degree: int,
+) -> None:
+    if cfg.cp_size != degree:
+        raise ValueError("Compressor CP degree does not match configuration")
+    if cfg.cp_config.context_parallel_strategy != "ulysses":
+        raise ValueError(
+            "DeepSeek V4 Compressor CP currently requires strategy='ulysses'"
+        )
+    if cfg.tp_size != 1 or cfg.pp_size != 1:
+        raise ValueError(
+            "DeepSeek V4 Compressor CP TP/PP composition is not implemented"
+        )
+    if cfg.cp_config.context_parallel_load_balancer is not None:
+        raise ValueError(
+            "Compressor CP requires contiguous shards with no load balancer"
+        )
+    if not attentions:
+        raise ValueError("Compressor CP requires attention targets")
+    _validate_compressor_execution(decoder, *attentions, degree=degree)
+
+
 def resolve_compressor_plan(
     model: torch.nn.Module,
     *,
@@ -250,39 +286,7 @@ def resolve_compressor_plan(
         raise TypeError("Compressor CP requires an explicit decoder structure")
     decoder = registered_submodule(model, structure.decoder)
     attentions = tuple(dict.fromkeys(structure.bind_attentions(model)))
-    if cfg.cp_config.context_parallel_strategy != "ulysses":
-        raise ValueError(
-            "DeepSeek V4 Compressor CP currently requires strategy='ulysses'"
-        )
-    if cfg.tp_size != 1 or cfg.pp_size != 1:
-        raise ValueError(
-            "DeepSeek V4 Compressor CP TP/PP composition is not implemented"
-        )
-    if cfg.cp_config.context_parallel_load_balancer is not None:
-        raise ValueError(
-            "Compressor CP requires contiguous shards with no load balancer"
-        )
-    if getattr(decoder.config, "attn_mask_type", "causal") != "causal":
-        raise ValueError("Compressor CP does not support packed document attention")
-    if not attentions or any(
-        getattr(attention, "layer_type", None)
-        not in (
-            "heavily_compressed_attention",
-            "compressed_sparse_attention",
-            "sliding_attention",
-        )
-        for attention in attentions
-    ):
-        raise ValueError("Compressor CP encountered an unsupported attention layer")
-    for attention in attentions:
-        if attention.num_heads % degree:
-            raise ValueError(
-                "Compressor CP requires query heads divisible by the CP degree"
-            )
-        if attention.attention_dropout != 0:
-            raise ValueError(
-                "Compressor CP dropout random-stream equivalence is not implemented"
-            )
+    _validate_compressor_configuration(decoder, attentions, cfg=cfg, degree=degree)
     paths = {
         id(module): path for path, module in reversed(tuple(model.named_modules()))
     }
@@ -304,19 +308,15 @@ def apply_compressor_context_parallel(
     *,
     cp_mesh: DeviceMesh,
     cfg: ParallelConfig,
-    resolved_plan: ParallelPlan | None = None,
+    resolved_plan: ParallelPlan,
 ) -> torch.nn.Module:
     """Consume current bindings and prepare all forwards before installation.
 
-    Standalone callers may omit the plan. Assembly resolves after TP/EP so the
+    Assembly resolves after TP/EP so the
     snapshot describes the modules and parameters that will actually execute.
     """
     degree = cp_mesh.size()
-    plan = (
-        resolve_compressor_plan(model, degree=degree, cfg=cfg)
-        if resolved_plan is None
-        else resolved_plan
-    )
+    plan = resolved_plan
     if (
         plan.stage != "cp"
         or plan.implementation != "compressor"
@@ -338,23 +338,21 @@ def apply_compressor_context_parallel(
     attention_ids = [id(target.module) for target in plan.targets[1:]]
     if len(set(attention_ids)) != len(attention_ids):
         raise ValueError("Compressor CP plan contains duplicate attention targets")
-    if plan.decoder_structure is not None:
-        structure = plan.decoder_structure
-        expected = {id(module) for module in structure.bind_attentions(model)}
-        if (
-            set(attention_ids) != expected
-            or plan.targets[0].path != structure.decoder
-            or plan.targets[0].module
-            is not registered_submodule(model, structure.decoder)
-        ):
-            raise ValueError("Compressor CP plan must cover its declared decoder slots")
-    decoder = plan.targets[0].module
-    attentions = [target.module for target in plan.targets[1:]]
-    if any(
-        not callable(getattr(target, "forward_compressor_context_parallel", None))
-        for target in (decoder, *attentions)
+    structure = plan.decoder_structure
+    if not isinstance(structure, DecoderStructure):
+        raise ValueError("Compressor CP execution requires a declared DecoderStructure")
+    expected = {id(module) for module in structure.bind_attentions(model)}
+    if (
+        set(attention_ids) != expected
+        or plan.targets[0].path != structure.decoder
+        or plan.targets[0].module is not registered_submodule(model, structure.decoder)
     ):
-        raise TypeError("Compressor CP requires model-owned forward interfaces")
+        raise ValueError("Compressor CP plan must cover its declared decoder slots")
+    decoder = plan.targets[0].module
+    attentions = tuple(target.module for target in plan.targets[1:])
+    _validate_compressor_configuration(decoder, attentions, cfg=cfg, degree=degree)
+    if not callable(getattr(model, "set_cp_mesh", None)):
+        raise TypeError("Compressor CP requires model-owned set_cp_mesh semantics")
     group = cp_mesh.get_group()
     pending = [
         (
@@ -367,5 +365,5 @@ def apply_compressor_context_parallel(
     for attention, forward in pending:
         attention.forward = forward
     decoder.forward = decoder_forward
-    model.set_cp_mesh(cp_mesh, strategy="compressor_ulysses")
+    model.set_cp_mesh(cp_mesh)
     return model

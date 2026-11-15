@@ -24,7 +24,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
 
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 
@@ -45,16 +44,8 @@ from ..datasets.contracts import (
 )
 from ..memory.activation_swap import (
     ActivationSwapResources,
-    reset_activation_swap_metrics,
 )
-from ..models.common.aux_loss import AuxLoss
-from ..models.common.moe.bias_update import (
-    collect_routing_load_metrics,
-    reset_routing_statistics,
-)
-from ..parallel.fully_shard_parallel.fine_grained.fine_grained import (
-    FSDPCommunicationResources,
-)
+from ..parallel.fully_shard_parallel.resources import FSDPCommunicationResources
 from ..parallel.model_compile import rollback_compile_settings_on_error
 from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
@@ -226,10 +217,8 @@ class Trainer:
             builders=getattr(self, "_builders", None),
             parallel_dims=environment.parallel_dims,
             error_group=error_group,
+            on_service_acquired=lambda name, service: setattr(self, name, service),
         )
-        self.optimizer = optimizer_stack.optimizer
-        self.lr_scheduler = optimizer_stack.lr_scheduler
-        self.ema = optimizer_stack.ema
         self.training_engine = assembly.create_training_engine(
             cfg,
             model_assembly=model_assembly,
@@ -264,7 +253,7 @@ class Trainer:
             builders=getattr(self, "_builders", None),
         )
 
-        self.metrics = assembly.build_metrics_processor(
+        assembly.build_metrics_processor(
             cfg,
             prepared_model.config,
             parallel_dims=environment.parallel_dims,
@@ -272,28 +261,25 @@ class Trainer:
             num_trainable_parameters=prepared_model.num_trainable_parameters,
             error_group=error_group,
             builders=getattr(self, "_builders", None),
+            on_service_acquired=lambda name, service: setattr(self, name, service),
         )
         self.training_observer = TrainingObserver(
             self.metrics, environment.device, group=error_group
         )
-        self.dispatch_timers = []
         if cfg.metrics.measure_moe_dispatch:
             with synchronize_local_errors(
                 "Dispatch observer installation", group=error_group
             ):
-                self.dispatch_timers = install_dispatch_timers(
+                self.dispatch_timer_resources = install_dispatch_timers(
                     model_assembly.model_parts
                 )
-                self.dispatch_timer_resources = DispatchTimerResources(
-                    tuple(self.dispatch_timers)
-                )
-            if not self.dispatch_timers:
+            if not self.dispatch_timer_resources.timers:
                 logger.warning(
-                    "Dispatch timing requested, but no native RoutedExperts boundary "
+                    "Dispatch timing requested, but no model dispatch boundary "
                     "was found; dispatch timing is unavailable for this model."
                 )
         if cfg.activation_swap:
-            reset_activation_swap_metrics()
+            self.activation_swap_resources.reset_metrics()
         # The trainer synchronizes PP loss metrics to every stage before logging.
         set_log_ranks(cfg.metrics.log_ranks)
         if environment.device.type == "npu":
@@ -328,7 +314,9 @@ class Trainer:
 
     # -- the step, one function per level --------------------------------------
 
-    def microbatch(self, batch: Batch | TrainerBatch) -> dict[str, Any]:
+    def microbatch(
+        self, batch: Batch | TrainerBatch
+    ) -> batch_runtime.AccumulationBatch:
         """Everything one accumulation group's forward/backward needs.
 
         Body in ``batch.py``.
@@ -349,7 +337,7 @@ class Trainer:
 
     def forward_backward_step(
         self,
-        microbatch: dict[str, Any],
+        microbatch: batch_runtime.AccumulationBatch,
         *,
         global_valid_tokens: torch.Tensor,
     ) -> StepResult:
@@ -397,8 +385,7 @@ class Trainer:
         # are off, and llmtuner runs no graph path: freeing the gradient buffers
         # outright rather than zeroing them in place is both cheaper and what
         # makes the accumulated-gradient bookkeeping below trivially correct.
-        self.optimizer.zero_grad(set_to_none=True)
-        reset_routing_statistics(self.model_parts)
+        self.training_engine.begin_step()
 
         # Snapshot the lr *before* the schedule advances below. The value
         # reported for a step must be the one the optimizer applied during it;
@@ -420,7 +407,7 @@ class Trainer:
         # Read the entire accumulation window on the host before the first
         # forward: every group's gradient uses the same global token denominator.
         # Counting must precede CP/TP sequence sharding and PP microbatch splits.
-        microbatches: deque[dict[str, Any]] = deque()
+        microbatches: deque[batch_runtime.AccumulationBatch] = deque()
         local_valid_tokens = 0
         local_routing_tokens = 0
         for _ in range(self.cfg.gradient_accumulation_steps):
@@ -453,17 +440,10 @@ class Trainer:
             "Training step has zero valid tokens; cannot normalize the loss.",
         )
 
-        # Router losses cover every non-padding input token, including SFT
-        # prompts whose labels are masked from the main cross-entropy loss.
-        if AuxLoss.has_pending_counts():
-            global_routing_tokens = torch.tensor(
-                local_routing_tokens, dtype=torch.int64, device=self.device
-            )
-            if dp_mesh is not None:
-                all_reduce(global_routing_tokens, group=dp_mesh.get_group())
-            AuxLoss.set_step_denominator(
-                global_routing_tokens, model_parts=self.model_parts
-            )
+        self.training_engine.prepare_auxiliary_loss(
+            local_routing_tokens,
+            dp_group=None if dp_mesh is None else dp_mesh.get_group(),
+        )
 
         # Forward can mutate checkpointed state too: running buffers and
         # embedding max_norm weights are examples. Finish the previous snapshot
@@ -481,49 +461,23 @@ class Trainer:
             if staging_failure is not None:
                 raise staging_failure
 
-        # Process each group, then free it. Loss values are retained only on a
-        # logging step: backward has already consumed them, and non-logging
-        # steps need only the on-device finiteness verdict. On logging steps,
-        # take ownership of the first detached value and accumulate later
-        # groups in place, avoiding a list plus a final stack proportional to
-        # ``gradient_accumulation_steps``.
-        accumulated_loss: torch.Tensor | None = None
-        # int32 is supported by NCCL reductions, unlike bool.
-        loss_is_finite = torch.ones((), dtype=torch.int32, device=self.device)
-        while microbatches:
-            microbatch = microbatches.popleft()
-            # HSDP accumulates locally until the final group, then all-reduces
-            # the accumulated gradient once for this optimizer step.
-            if parallel_dims is not None and parallel_dims.dp_replicate_enabled:
-                is_last = not microbatches
-                for part in self.model_parts:
-                    part.set_requires_all_reduce(is_last)
-            step_result = self.forward_backward_step(
-                microbatch, global_valid_tokens=global_valid_tokens
-            )
-            detached_loss = step_result.loss_sum
-            del microbatch
-            local_loss = (
-                detached_loss.to_local()
-                if isinstance(detached_loss, DTensor)
-                else detached_loss
-            )
-            loss_is_finite.logical_and_(torch.isfinite(local_loss).all())
-            if should_log:
-                if accumulated_loss is None:
-                    accumulated_loss = detached_loss.clone()
-                else:
-                    accumulated_loss.add_(detached_loss)
+        def executed_groups() -> Iterator[StepResult]:
+            while microbatches:
+                microbatch = microbatches.popleft()
+                self.training_engine.prepare_accumulation_group(
+                    is_last=not microbatches
+                )
+                result = self.forward_backward_step(
+                    microbatch, global_valid_tokens=global_valid_tokens
+                )
+                del microbatch
+                yield result
 
-        # FSDP exclusions retain ordinary local gradients after accumulation.
-        gradients.allreduce_fsdp_excluded_grads(
-            self.model_parts, parallel_dims=self.parallel_dims
+        accumulation = self.training_engine.accumulate_results(
+            executed_groups(), retain_loss=should_log
         )
-        # After the last backward, before clipping: replicated parameters under
-        # TP hold token-partial gradients that nothing else reduces.
-        gradients.allreduce_replicated_tp_grads(
-            self.model_parts, parallel_dims=self.parallel_dims
-        )
+
+        self.training_engine.synchronize_gradients()
 
         self.before_gradient_clipping()
         grad_norm = gradients.clip_and_check_finite(
@@ -535,57 +489,55 @@ class Trainer:
             step=self.step,
             error_group=self.error_group,
             reduction_meshes=reduction_meshes,
-            loss_is_finite=loss_is_finite,
+            loss_is_finite=accumulation.loss_is_finite,
         )
 
-        routing_metrics = (
-            collect_routing_load_metrics(
-                self.model_parts, self.parallel_dims, self.device
-            )
-            if should_log
-            else {}
-        )
+        routing_metrics = self.training_engine.routing_metrics() if should_log else {}
         update_result = self.training_engine.optimizer_step(
             self.step, grad_norm=grad_norm, auxiliary_metrics=routing_metrics
         )
-        grad_norm = update_result.grad_norm
 
         if not should_log:
             return None
-
-        assert accumulated_loss is not None
 
         # All accumulation groups have contributed their raw token loss here.
         # Dividing by the step's global valid-token count reports the same
         # average that normalized the gradients, independent of DP rank and
         # accumulation boundaries.
-        result = metrics_runtime.build_step_metrics(
-            ntokens_seen=self.ntokens_seen,
-            device=self.device,
-            pp_has_last_stage=self.training_engine.pp_has_last_stage,
-            accumulated_loss=accumulated_loss,
-            global_valid_tokens=global_valid_tokens,
-            local_valid_tokens=local_valid_tokens,
-            local_valid_tokens_tensor=local_valid_tokens_tensor,
-            reduction_meshes=reduction_meshes,
-            grad_norm=grad_norm,
-            lr_metrics=lr_metrics,
-        )
         update_result = metrics_runtime.collect_update_metrics(
             update_result,
             parallel_dims=self.parallel_dims,
             model_parts=self.model_parts,
         )
-        result.update(update_result.auxiliary_metrics)
+        result = metrics_runtime.build_step_metrics(
+            ntokens_seen=self.ntokens_seen,
+            device=self.device,
+            pp_has_last_stage=self.training_engine.pp_has_last_stage,
+            accumulation=accumulation,
+            global_valid_tokens=global_valid_tokens,
+            local_valid_tokens=local_valid_tokens,
+            local_valid_tokens_tensor=local_valid_tokens_tensor,
+            reduction_meshes=reduction_meshes,
+            update=update_result,
+            lr_metrics=lr_metrics,
+        )
         with synchronize_local_errors(
             "Training resource observation", group=self.error_group
         ):
             result.update(
                 metrics_runtime.collect_resource_metrics(
-                    activation_swap_enabled=self.cfg.activation_swap,
+                    activation_swap=(
+                        self.activation_swap_resources
+                        if self.cfg.activation_swap
+                        else None
+                    ),
                     optimizer=self.optimizer,
                     checkpointer=self.checkpointer,
-                    dispatch_timers=self.dispatch_timers,
+                    dispatch_timers=(
+                        self.dispatch_timer_resources.timers
+                        if self.dispatch_timer_resources is not None
+                        else ()
+                    ),
                 )
             )
         return result
@@ -674,10 +626,8 @@ class Trainer:
                         base_folder=self.cfg.dump_folder,
                         builders=getattr(self, "_builders", None),
                     )
-                    # Keep optional retry ownership even if __enter__ fails.
-                    # Context-only custom profilers retain their own cleanup.
-                    if callable(getattr(profiler_context, "close", None)):
-                        self.profiler_resource = profiler_context
+                    # Own cleanup before entry, including partially started traces.
+                    self.profiler_resource = profiler_context
                     profiler = stack.enter_context(profiler_context)
                     if not callable(getattr(profiler, "step", None)):
                         raise TypeError("Entered profiler must provide step()")
@@ -846,7 +796,10 @@ class Trainer:
             ("dataloader", ("checkpointer",)),
             ("ema", ("checkpointer", "fsdp_communication_resources")),
             ("lr_scheduler", ("checkpointer",)),
-            ("optimizer", ("checkpointer", "fsdp_communication_resources")),
+            (
+                "optimizer",
+                ("checkpointer", "fsdp_communication_resources", "lr_scheduler"),
+            ),
             ("gc_handler", ()),
         ):
             if any(getattr(self, owner, None) is not None for owner in dependencies):
@@ -856,18 +809,18 @@ class Trainer:
                 continue
             close = getattr(resource, "close", None)
             if name in ("ema", "lr_scheduler", "optimizer") and not callable(close):
-                # Ordinary tensor-only services have no shutdown operation.
+                # Tensor-only services need no shutdown, but their ownership
+                # must end so dependent resources can be released below.
+                setattr(self, name, None)
                 continue
             setattr(self, name, None)
             try:
                 close()
             except BaseException as error:
-                if name != "checkpointer" or getattr(
-                    resource, "requires_close_retry", False
-                ):
-                    # Failed sinks, loader/GC owners, and interrupted checkpoint
-                    # waits may retain resources. Keep their owner for a retry.
-                    setattr(self, name, resource)
+                # A failed close leaves ownership indeterminate. Keep every
+                # resource owner for retry, including injected checkpoint
+                # managers that do not expose a retry capability flag.
+                setattr(self, name, resource)
                 if first_error is None:
                     first_error = error
                 try:

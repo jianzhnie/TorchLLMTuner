@@ -30,10 +30,10 @@ from torch.optim import Optimizer
 from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.distributed import get_world_size
 from ...config.ema_config import validate_ema_schedule
-from ...parallel.assembly import ModelPartLayout, capture_model_part_layouts
+from ...parallel.assembly import ModelPartLayout
 from ...utils.logging import get_logger
 from ...utils.module_names import canonical_fqn
-from .optimizer import OptimizersContainer
+from .checkpoint_state import OptimizerCheckpointState
 
 __all__ = ["EMA"]
 
@@ -154,16 +154,12 @@ class EMAStateOptimizer(Optimizer):
         return averages
 
 
-class EMA(OptimizersContainer):
-    """Pseudo-optimizer maintaining an online EMA of model weights.
+class EMA(OptimizerCheckpointState):
+    """Maintain an online EMA independently of training optimizer mutation.
 
-    Subclasses ``OptimizersContainer`` to reuse its FQN-flattened,
-    resharding-safe ``state_dict()``/``load_state_dict()`` while overriding
-    ``__init__``/``step()``/``zero_grad()`` -- this is never a real training
-    optimizer. Never merged into ``Trainer.optimizer`` or the LR scheduler
-    container -- it is a sibling object, only built when the run configures
-    one (``training.ema``), and stepped explicitly from
-    ``train_step()``.
+    Shares only FQN checkpoint serialization and resharding with the optimizer
+    container. The training engine calls step(current_step) explicitly; EMA has
+    no gradient clearing, optimizer hooks or scheduler-facing parameter groups.
 
     Args:
         model_parts: the model chunks to track, one per pipeline stage.
@@ -179,8 +175,8 @@ class EMA(OptimizersContainer):
             Measured in EMA firings, not raw steps. A normal resume needs no
             bias -- the firing count already continues correctly on its own.
         update_every_n_steps: only fire the EMA update every N optimizer steps.
-        buffer_patterns: regex patterns (``re.search``, matched against buffer
-            all registered buffer aliases) selecting which buffers also
+        buffer_patterns: regex patterns (``re.search``, matched against all
+            wrapper-free registered buffer aliases) selecting which buffers also
             get an EMA tracked alongside trainable parameters. Empty (default):
             no buffers tracked.
         runtime_layouts: final parameter ownership from model assembly. When
@@ -214,14 +210,7 @@ class EMA(OptimizersContainer):
         # The tracked scope is fixed; caller-owned list edits must not detach
         # model parts from the optimizer groups constructed below.
         self.model_parts = list(model_parts)
-        self.runtime_layouts = tuple(runtime_layouts)
-        self._bound_layout_parameters = None
-        if not self.runtime_layouts:
-            self.runtime_layouts = capture_model_part_layouts(self.model_parts)
-        self._validate_runtime_layouts()
-        self._bound_layout_parameters = tuple(
-            dict(layout.parameter_bindings) for layout in self.runtime_layouts
-        )
+        self._bind_runtime_layouts(runtime_layouts)
 
         buffer_groups = (
             [self._selected_buffers(model) for model in self.model_parts]
@@ -267,7 +256,7 @@ class EMA(OptimizersContainer):
                 list(buffer_patterns),
             )
 
-        # OptimizersContainer.state_dict()/load_state_dict() (reused as-is)
+        # OptimizerCheckpointState.state_dict()/load_state_dict() (reused as-is)
         # iterate self.optimizers and merge each one's FQN-keyed flat dict, so
         # folding _buffer_optimizers in here is what gives buffer EMA the same
         # "ema" checkpoint key as parameters.
@@ -292,19 +281,6 @@ class EMA(OptimizersContainer):
                 "already does).",
                 ", ".join(low_precision),
             )
-
-        # Buffers are tracked tensors too. A buffer-only EMA must remain usable
-        # even when the model has no trainable parameters.
-        tracked_tensors = [
-            tensor
-            for optimizer in self.optimizers
-            for group in optimizer.param_groups
-            for tensor in group["params"]
-        ]
-        self._initialize_optimizer_interface(tracked_tensors)
-
-    def zero_grad(self, *args, **kwargs) -> None:
-        pass  # never called by the training loop; no-op for safety
 
     # Takes the step rather than an optimizer closure: the firing count has to
     # be derived from it, and this is never merged into Trainer.optimizer.
@@ -359,7 +335,8 @@ class EMA(OptimizersContainer):
         """Match all aliases and track each buffer once under its first name."""
         primary_names: dict[int, str] = {}
         selected: dict[int, tuple[str, torch.Tensor]] = {}
-        for name, buffer in model.named_buffers(remove_duplicate=False):
+        for path, buffer in model.named_buffers(remove_duplicate=False):
+            name = canonical_fqn(path)
             primary_names.setdefault(id(buffer), name)
             if any(pattern.search(name) for pattern in self._buffer_patterns):
                 selected.setdefault(id(buffer), (primary_names[id(buffer)], buffer))
@@ -370,11 +347,10 @@ class EMA(OptimizersContainer):
         self._validate_runtime_layouts()
         groups = []
         for layout in self.runtime_layouts:
-            names = layout.canonical_parameter_names
             groups.append(
                 [
-                    (names[paths[0]], parameter)
-                    for parameter, paths in layout.parameter_aliases.items()
+                    (name, parameter)
+                    for parameter, name in layout.parameter_state_names.items()
                     if parameter.requires_grad
                 ]
             )

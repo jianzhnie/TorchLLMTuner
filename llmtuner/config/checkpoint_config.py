@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from llmtuner.components.checkpointer.core.checkpoint_keys import (
+    CHECKPOINT_FORMAT,
     LR_SCHEDULER,
     MODEL,
     OPTIMIZER,
@@ -152,6 +153,8 @@ class CheckpointConfig:
                 "are kept, as the latest may still be in the process of being "
                 "saved."
             )
+        if CHECKPOINT_FORMAT in self.exclude_from_loading:
+            raise ConfigError("Native checkpoint format validation cannot be excluded")
         if MODEL in self.exclude_from_loading:
             raise ConfigError(
                 f"checkpoint.exclude_from_loading must not contain {MODEL!r}."

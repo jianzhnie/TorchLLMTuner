@@ -84,6 +84,7 @@ from ..core.state_adaptation import (
     materialize_local_checkpoint_states,
     prepare_hf_model_state,
     prepare_local_state_preflight,
+    restore_rng_state,
     validate_local_preflight_selection,
     validate_local_state_preflight,
 )
@@ -316,22 +317,22 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                         daemon=True,
                     )
                     self.purge_thread.start()
+                logger.info(
+                    "Checkpointing active. Checkpoints will be loaded from and saved "
+                    f"to {self.folder}"
+                )
         except BaseException:
             # Release locally acquired groups and any started thread. Local
             # service errors have already been coordinated above.
             try:
                 self._close()
             except BaseException:
+                self._construction_cleanup_pending = True
                 try:
                     logger.exception("DCP cleanup failed during construction")
                 except BaseException:
                     pass  # Preserve the original construction failure.
             raise
-
-        logger.info(
-            "Checkpointing active. Checkpoints will be loaded from and saved "
-            f"to {self.folder}"
-        )
 
         # Last, and load-bearing: everything above can raise (the HF-option
         # guard most notably), and ``__del__`` runs ``close`` on whatever was
@@ -363,11 +364,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         for release in releases:
             try:
                 release()
-            except Exception as error:
-                if self.stager is not None:
-                    # A failed shutdown can leave staging threads alive even
-                    # for ordinary exceptions. Retain their groups for retry.
-                    raise
+            except BaseException as error:
                 if first_error is None:
                     first_error = error
                 else:
@@ -375,8 +372,11 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                         logger.exception("Additional DCP resource cleanup failure")
                     except BaseException:
                         pass  # Preserve the first resource cleanup failure.
-        # A failed join/close may leave a worker alive. Keep its stager
-        # and communication groups owned until a subsequent close succeeds.
+        # Retention uses storage independently of the staging communication
+        # groups. Attempt both releases even after failure, but never destroy
+        # groups while a failed stager shutdown may still have live workers.
+        if self.stager is not None and first_error is not None:
+            raise first_error
         for name in ("staging_pg", "pg"):
             group = getattr(self, name, None)
             if group is None:
@@ -613,11 +613,15 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     ),
                 )
             if load_changed_source_layout(
-                checkpoint_id, states=states, adapter=self.sd_adapter
+                checkpoint_id,
+                states=states,
+                adapter=self.sd_adapter,
+                ema_to_reset=(
+                    self.states.get(EMA)
+                    if MODEL in states and EMA not in states
+                    else None
+                ),
             ):
-                with synchronize_local_errors("Checkpoint EMA cold start"):
-                    if MODEL in states and EMA in self.states and EMA not in states:
-                        self.states[EMA].reset_from_model()
                 return
         state_dict = self._flatten_model_state(states)
 
@@ -647,7 +651,6 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             # DCP's Stateful callback order is not an optimizer-before-scheduler
             # contract. Restore the scheduler only after optimizer groups load.
             scheduler = states.get(LR_SCHEDULER)
-            rng_state = states.get(RNG_STATE)
             # DCP invokes Stateful callbacks after its own coordinated IO.
             # These local callbacks need a separate boundary before peers can
             # enter model/EMA communication. Keep collective-bearing states
@@ -695,17 +698,11 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             if MODEL in states and EMA in self.states and EMA not in states:
                 self.states[EMA].reset_from_model()
         if not from_hf:
-            # All ranks must reject invalid streams before any peer resumes.
-            # These phases are local only; DCP and model collectives stay above.
-            with synchronize_local_errors("Checkpoint RNG validation"):
-                if rng_state is not None and planner.has_rng_state:
-                    rng_state.validate_state_dict(state_dict[RNG_STATE])
-            with synchronize_local_errors("Checkpoint RNG restoration"):
-                if rng_state is not None and planner.has_rng_state:
-                    # Restore last: model hooks and Stateful callbacks may draw RNG.
-                    rng_state.load_state_dict(state_dict[RNG_STATE])
+            restore_rng_state(states, state_dict, available=planner.has_rng_state)
 
-    def _save(self, curr_step: int, last_step: bool = False) -> bool:
+    def _save(
+        self, curr_step: int, last_step: bool = False, *, should_save: bool
+    ) -> bool:
         """Save the checkpoint for the current step.
 
         A save happens when any of these hold:
@@ -716,7 +713,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         Returns:
             Whether a checkpoint was written or an asynchronous save submitted.
         """
-        if not self._should_save(curr_step, last_step):
+        if not should_save:
             return False
 
         self._wait_for_pending_save()
@@ -906,13 +903,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 "but self.async_mode isn't ASYNC_WITH_PINNED_MEM."
             )
 
-        staging_future = self.staging_future
-        self.staging_future = None
-        try:
-            staging_future.result()
-        finally:
-            if not staging_future.done():
-                self.staging_future = staging_future
+        self._consume_pending_future("staging_future")
 
     def _wait_for_saving(self) -> None:
         """Wait for any background save to complete.
@@ -929,14 +920,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 "self.save_future is not None, but self.async_mode is DISABLED."
             )
 
-        save_future = self.save_future
-        assert save_future is not None
-        self.save_future = None
-        try:
-            save_future.result()
-        finally:
-            if not save_future.done():
-                self.save_future = save_future
+        self._consume_pending_future("save_future")
 
     def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
         if not self._storage.isfile(filesystem.join(checkpoint_dir, ".metadata")):

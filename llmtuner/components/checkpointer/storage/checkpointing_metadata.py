@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from ....accelerator.collectives import synchronize_local_errors
 from ....accelerator.distributed import get_comm_device
 from ....utils.logging import get_logger
 
@@ -25,22 +26,29 @@ logger = get_logger(__name__)
 def _gather_pickled_metadata(
     manager: Any, data: Any, process_group: ProcessGroup | None = None
 ) -> dict[int, Any]:
-    device = get_comm_device(process_group)
-    serialized = pickle.dumps(data)
-    payload = len(serialized).to_bytes(8, byteorder="little") + serialized
-    maximum = torch.tensor([len(payload)], dtype=torch.int64, device=device)
+    # Keep communication outside local failure boundaries: a peer must not
+    # enter the next collective after another rank failed serialization or IO.
+    with synchronize_local_errors("Checkpoint metadata encoding", group=process_group):
+        device = get_comm_device(process_group)
+        serialized = pickle.dumps(data)
+        payload = len(serialized).to_bytes(8, byteorder="little") + serialized
+        maximum = torch.tensor([len(payload)], dtype=torch.int64, device=device)
     dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=process_group)
-    padded = payload + b"\0" * (int(maximum.item()) - len(payload))
-    local = torch.frombuffer(bytearray(padded), dtype=torch.uint8).to(device)
-    gathered = [
-        torch.empty_like(local) for _ in range(dist.get_world_size(process_group))
-    ]
+    with synchronize_local_errors("Checkpoint metadata buffers", group=process_group):
+        padded = payload + b"\0" * (int(maximum.item()) - len(payload))
+        local = torch.frombuffer(bytearray(padded), dtype=torch.uint8).to(device)
+        gathered = [
+            torch.empty_like(local) for _ in range(dist.get_world_size(process_group))
+        ]
     dist.all_gather(gathered, local, group=process_group)
-    result = {}
-    for rank, tensor in enumerate(gathered):
-        raw = tensor.cpu().numpy().tobytes()
-        length = int.from_bytes(raw[:8], byteorder="little")
-        result[rank] = pickle.loads(raw[8 : 8 + length])
+    with synchronize_local_errors("Checkpoint metadata decoding", group=process_group):
+        result = {}
+        for rank, tensor in enumerate(gathered):
+            raw = tensor.cpu().numpy().tobytes()
+            length = int.from_bytes(raw[:8], byteorder="little")
+            if not 0 < length <= len(raw) - 8:
+                raise ValueError(f"Invalid checkpoint metadata length from rank {rank}")
+            result[rank] = pickle.loads(raw[8 : 8 + length])
     return result
 
 

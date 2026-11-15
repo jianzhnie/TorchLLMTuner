@@ -999,6 +999,50 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         logits=True, hidden_states=False
     )
 
+    @property
+    def checkpoint_configuration(self) -> dict[str, object]:
+        """Compose text, visual geometry and media insertion contracts."""
+        vision = self.vision_tower.config
+        projector = self.config.vision_config
+        return {
+            "text": self.language_model.checkpoint_configuration,
+            "vision": {
+                name: getattr(vision, name, None)
+                for name in (
+                    "patch_size",
+                    "init_pos_emb_height",
+                    "init_pos_emb_width",
+                    "init_pos_emb_time",
+                    "pos_emb_type",
+                    "num_attention_heads",
+                    "num_hidden_layers",
+                    "hidden_size",
+                    "intermediate_size",
+                    "merge_kernel_size",
+                    "merge_type",
+                    "qkv_hidden_size",
+                    "norm_type",
+                    "attn_bias",
+                    "patch_embed_proj_bias",
+                    "mlp_type",
+                    "linear_bias",
+                    "pos_emb_interpolation_mode",
+                )
+            },
+            "projector": {
+                name: getattr(projector, name, None)
+                for name in (
+                    "mm_projector_type",
+                    "mm_hidden_size",
+                    "text_hidden_size",
+                    "merge_kernel_size",
+                    "projector_hidden_act",
+                    "projector_ln_eps",
+                )
+            },
+            "media_placeholder_token_id": self.config.media_placeholder_token_id,
+        }
+
     @classmethod
     def _supports_default_dynamic_cache(cls) -> bool:
         return False

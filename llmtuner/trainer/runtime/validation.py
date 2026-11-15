@@ -35,6 +35,7 @@ from ...datasets.loader_builder import build_dataloader
 from .batch import (
     fetch_batch,
     resolve_data_parallel_rank,
+    validated_batch_token_counts,
 )
 from .reductions import resolve_loss_reduction_meshes
 
@@ -107,9 +108,10 @@ def count_validation_batch_tokens(
     # Counting and metric updates are local and may fail on only one rank.
     # Agree on success before any peer enters the DP token collective.
     with synchronize_local_errors("Validation token accounting", group=error_group):
-        labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
-        metrics.add_tokens(labels.numel())
-        local_valid_tokens = token_counter(batch)
+        num_tokens, local_valid_tokens = validated_batch_token_counts(
+            batch, token_counter=token_counter
+        )
+        metrics.add_tokens(num_tokens)
         global_valid_tokens = torch.tensor(
             local_valid_tokens, dtype=torch.int64, device=device
         )

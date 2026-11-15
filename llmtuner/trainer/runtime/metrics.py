@@ -9,11 +9,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from ...accelerator.collectives import all_reduce
-from ...components.optimizer.adamw_swap import AdamWSwap
-from ...memory.activation_swap import activation_swap_metrics
 from ...models.common.aux_loss import collect_aux_loss_metrics
 from .reductions import TrainingReductionMeshes
-from .results import UpdateResult
+from .results import AccumulationResult, UpdateResult
 
 if TYPE_CHECKING:
     from ...parallel.topology import ParallelTopology
@@ -22,7 +20,7 @@ if TYPE_CHECKING:
 
 def collect_resource_metrics(
     *,
-    activation_swap_enabled: bool,
+    activation_swap: Any,
     optimizer: Any,
     checkpointer: Any,
     dispatch_timers: Iterable[DispatchTimer] = (),
@@ -33,26 +31,8 @@ def collect_resource_metrics(
     Byte counters are cumulative; device transfer seconds consume the log window.
     """
     result = {}
-    if activation_swap_enabled:
-        result.update(
-            {
-                f"swap/activation_local/{key}": float(value)
-                for key, value in activation_swap_metrics().items()
-            }
-        )
-    optimizers = getattr(optimizer, "optimizers", ())
-    swaps = [optimizer for optimizer in optimizers if isinstance(optimizer, AdamWSwap)]
-    if swaps:
-        for key in (
-            "h2d_bytes",
-            "d2h_bytes",
-            "host_state_bytes",
-            "staging_peak_payload_bytes",
-            "copy_wait_seconds",
-        ):
-            result[f"swap/optimizer_local/{key}"] = float(
-                sum(getattr(optimizer, key) for optimizer in swaps)
-            )
+    result.update(getattr(activation_swap, "observation_metrics", {}).copy())
+    result.update(getattr(optimizer, "observation_metrics", {}).copy())
     result.update(getattr(checkpointer, "observation_metrics", {}).copy())
     timers = tuple(dispatch_timers)
     if timers:
@@ -67,15 +47,18 @@ def build_step_metrics(
     ntokens_seen: int,
     device: torch.device,
     pp_has_last_stage: bool,
-    accumulated_loss: torch.Tensor,
+    accumulation: AccumulationResult,
     global_valid_tokens: torch.Tensor,
     local_valid_tokens: int,
     local_valid_tokens_tensor: torch.Tensor,
     reduction_meshes: TrainingReductionMeshes,
-    grad_norm: torch.Tensor,
+    update: UpdateResult,
     lr_metrics: dict[str, float],
 ) -> dict[str, float]:
     """Reduce loss and token metrics without rank-local collective guards."""
+    accumulated_loss = accumulation.loss_sum
+    if accumulated_loss is None:
+        raise ValueError("Step reporting requires an accumulation result with loss_sum")
     dp_mesh = reduction_meshes.dp_mesh
     pp_mesh = reduction_meshes.pp_mesh
     loss_mesh = reduction_meshes.loss_mesh
@@ -113,10 +96,12 @@ def build_step_metrics(
     metrics = {
         "loss": float(loss_sum),
         "max_loss": float(local_max),
-        "grad_norm": float(grad_norm),
         "n_tokens_seen": global_ntokens_seen,
     }
+    if update.grad_norm is not None:
+        metrics["grad_norm"] = float(update.grad_norm)
     metrics.update(lr_metrics)
+    metrics.update(update.auxiliary_metrics)
     return metrics
 
 

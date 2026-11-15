@@ -66,6 +66,7 @@ class ShardedLinear(nn.Module):
     """
 
     shard_dim: int
+    sequence_transform: str
     uses_collectives = True
 
     def __init__(
@@ -97,6 +98,19 @@ class ShardedLinear(nn.Module):
             self.use_symm_mem = use_symm_mem
 
 
+def _sequence_parallel_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Size]:
+    """Expose collective rows without interleaving batches across TP ranks."""
+    if x.ndim not in (2, 3):
+        raise ValueError("TP projection input must be [T, K] or [1, T, K]")
+    if x.ndim == 3 and x.shape[0] != 1:
+        raise ValueError(
+            "TP realizers gather/reduce rows in rank order; a batched "
+            f"[B, T, K] input with B={x.shape[0]} would interleave batches "
+            "across ranks after the fold. Flatten to [T, K] or keep B=1."
+        )
+    return x.reshape(-1, x.shape[-1]), x.shape[:-1]
+
+
 class ColumnParallelLinear(ShardedLinear):
     """Column-parallel projection: output features split across TP ranks.
 
@@ -110,23 +124,14 @@ class ColumnParallelLinear(ShardedLinear):
     """
 
     shard_dim = 0
+    sequence_transform = "gather"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # The collective primitives are strictly 2D (sequence-major rows), but
         # the HF decoder feeds [B, T, K] hidden states: fold the leading dims
         # and restore them after, with the row count multiplied by tp_size --
         # that is the all-gathered sequence length.
-        if x.ndim not in (2, 3):
-            raise ValueError("TP projection input must be [T, K] or [1, T, K]")
-        if x.ndim == 3 and x.shape[0] != 1:
-            raise ValueError(
-                "TP realizers gather/reduce rows in rank order; a batched "
-                f"[B, T, K] input with B={x.shape[0]} would interleave batches "
-                "across ranks after the fold. Flatten to [T, K] or keep B=1 "
-                "(the HF wrapper always runs B=1)."
-            )
-        lead = x.shape[:-1]
-        x_2d = x.reshape(-1, x.shape[-1])
+        x_2d, lead = _sequence_parallel_rows(x)
         if self.use_symm_mem:
             y_2d = AllGatherLinear.apply(
                 x_2d, self.weight, None, self.group, self.group.group_name
@@ -148,22 +153,13 @@ class RowParallelLinear(ShardedLinear):
     """
 
     shard_dim = 1
+    sequence_transform = "scatter"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Mirror of ColumnParallelLinear.forward: fold to 2D for the collective, then
         # restore the leading dims with the row count divided by tp_size --
         # that is the reduce-scattered sequence shard.
-        if x.ndim not in (2, 3):
-            raise ValueError("TP projection input must be [T, K] or [1, T, K]")
-        if x.ndim == 3 and x.shape[0] != 1:
-            raise ValueError(
-                "TP realizers gather/reduce rows in rank order; a batched "
-                f"[B, T, K] input with B={x.shape[0]} would interleave batches "
-                "across ranks after the fold. Flatten to [T, K] or keep B=1 "
-                "(the HF wrapper always runs B=1)."
-            )
-        lead = x.shape[:-1]
-        x_2d = x.reshape(-1, x.shape[-1])
+        x_2d, lead = _sequence_parallel_rows(x)
         if self.use_symm_mem:
             y_2d = LinearReduceScatter.apply(
                 x_2d, self.weight, None, self.group, self.group.group_name
@@ -189,6 +185,7 @@ class ColwiseLinearNoGather(ShardedLinear):
     """
 
     shard_dim = 0
+    sequence_transform = "preserve"
     uses_collectives = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

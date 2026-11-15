@@ -376,10 +376,9 @@ def main() -> None:
             )
 
             reset_mc2_dispatch_metrics()
+        swap_resources = trainer.activation_swap_resources
         if config.activation_swap:
-            from llmtuner.memory.activation_swap import reset_activation_swap_metrics
-
-            reset_activation_swap_metrics()
+            swap_resources.reset_metrics()
         trainer.train()
         with synchronize_local_errors("Benchmark runtime provenance"):
             runtime_after = runtime_metadata()
@@ -407,7 +406,7 @@ def main() -> None:
                 ),
                 "default_dtype": str(torch.get_default_dtype()),
                 "resident_bytes": summarize_resident_memory(
-                    trainer.model, trainer.optimizer.optimizers
+                    trainer.model, trainer.training_engine.optimizer.optimizers
                 ),
                 "residency_scope": (
                     "rank-local logical tensor bytes; DTensor uses to_local(); "
@@ -415,7 +414,8 @@ def main() -> None:
                     "not allocator peaks or activation/workspace measurements"
                 ),
                 "optimizer_defaults": [
-                    optimizer.defaults for optimizer in trainer.optimizer.optimizers
+                    optimizer.defaults
+                    for optimizer in trainer.training_engine.optimizer.optimizers
                 ],
             }
             if config.parallel.ep_config.ep_token_dispatcher == "mc2":
@@ -425,9 +425,7 @@ def main() -> None:
 
                 local["mc2_dispatch"] = mc2_dispatch_metrics()
             if config.activation_swap:
-                from llmtuner.memory.activation_swap import activation_swap_metrics
-
-                local["activation_swap"] = activation_swap_metrics()
+                local["activation_swap"] = swap_resources.metrics_snapshot()
         gathered = [None] * dist.get_world_size()
         dist.all_gather_object(gathered, local)
         with synchronize_local_errors("Benchmark report"):

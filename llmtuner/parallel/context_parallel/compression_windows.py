@@ -148,10 +148,11 @@ def compress_csa_windows(module, hidden_states, *, group):
 def select_csa_windows(module, hidden_states, q_residual, position_ids, *, group):
     """Run the discrete CSA indexer against all globally compressed keys.
 
-    Follows Transformers 5.9.0 DeepseekV4Indexer.forward. Selection indices have
-    no gradient, matching HF topk indices; compression for attention stays live.
+    Selection uses the same model-owned scorer as the full-sequence path.
+    Indices have no gradient; compression for attention stays live.
     """
     with synchronize_local_errors("CSA indexer input validation", group=group):
+        module.validate_indexer_inputs(hidden_states, q_residual)
         batch, length, _ = hidden_states.shape
         expected = torch.arange(length, device=hidden_states.device)
         expected = expected + dist.get_rank(group) * length
@@ -159,8 +160,6 @@ def select_csa_windows(module, hidden_states, q_residual, position_ids, *, group
             position_ids, expected[None].expand(batch, -1)
         ):
             raise ValueError("CSA indexer requires contiguous global position_ids")
-        if q_residual.shape != (batch, length, module.q_b_proj.in_features):
-            raise ValueError("CSA indexer q_residual shape does not match local input")
     entries, _ = compress_csa_windows(module, hidden_states, group=group)
     batch, _, _, width = entries.shape
     length = hidden_states.shape[1]
@@ -178,6 +177,6 @@ def select_csa_windows(module, hidden_states, q_residual, position_ids, *, group
     received = entries.new_empty((sum(counts), batch, width))
     dist.all_to_all_single(received, send, counts, [last - first] * size, group=group)
     keys = received.transpose(0, 1)
-    return module.select_context_parallel_windows(
+    return module.select_compressed_windows(
         hidden_states, q_residual, position_ids, keys
     )

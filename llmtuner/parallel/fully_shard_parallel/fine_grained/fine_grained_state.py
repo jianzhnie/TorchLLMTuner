@@ -48,6 +48,7 @@ from torch.distributed.fsdp._fully_shard._fully_shard import (
 from llmtuner.errors import EnvironmentUnsupportedError
 from llmtuner.models.common.aux_loss import in_checkpoint_recompute
 
+from ..communication import drain_fsdp_communications
 from .fine_grained_param_group import init_fine_grained_param_groups
 
 if not hasattr(FSDPState(), "_fsdp_param_groups") or not hasattr(
@@ -188,61 +189,12 @@ class FineGrainedFSDPState(FSDPState):
                 context.reduce_scatter_states.clear()
 
     def drain_communications(self) -> None:
-        """Wait for retained communication work without resetting gradients.
-
-        Streams are shared between contexts and borrowed here. Keep all buffer
-        references if any wait fails so shutdown can be retried safely.
-        """
-        streams = {}
-        for context in self.communication_contexts:
-            for name in (
-                "all_gather_copy_in_stream",
-                "all_gather_stream",
-                "reduce_scatter_stream",
-                "all_reduce_stream",
-            ):
-                stream = getattr(context, name, None)
-                if stream is not None:
-                    streams[id(stream)] = stream
-        waitables = dict(streams)
-        for context in self.communication_contexts:
-            # A construction failure may precede native context.lazy_init().
-            retained = list(getattr(context, "reduce_scatter_states", ()))
-            all_gather_state = getattr(context, "all_gather_state", None)
-            if all_gather_state is not None:
-                retained.append(all_gather_state)
-            for pending in retained:
-                if pending.event is not None:
-                    waitables[id(pending.event)] = pending.event
-            for event in getattr(context, "_last_post_reduce_events", {}).values():
-                waitables[id(event)] = event
+        """Drain every custom context while preserving failed waits for retry."""
         states = self._state_ctx.all_states or [self]
-        for state in states:
-            for group in state._fsdp_param_groups:
-                for param in group.fsdp_params:
-                    if param.grad_offload_event is not None:
-                        event = param.grad_offload_event
-                        waitables[id(event)] = event
-        first_error = None
-        for waitable in waitables.values():
-            try:
-                waitable.synchronize()
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
-        if first_error is not None:
-            raise first_error
-        for context in self.communication_contexts:
-            if hasattr(context, "all_gather_state"):
-                context.all_gather_state = None
-            for name in (
-                "reduce_scatter_states",
-                "_last_post_reduce_events",
-                "post_forward_order",
-            ):
-                container = getattr(context, name, None)
-                if container is not None:
-                    container.clear()
+        drain_fsdp_communications(
+            (context for state in states for context in state.communication_contexts),
+            (group for state in states for group in state._fsdp_param_groups),
+        )
 
     def _reset_iter_state(self) -> None:
         if self._is_root is False:

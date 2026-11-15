@@ -23,8 +23,8 @@ runtime schedules, which are rejected rather than honored.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
@@ -44,8 +44,13 @@ from llmtuner.config.utils import require_integer_at_least
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...components.loss import cross_entropy_loss
-from ...components.loss_contract import LossSum
+from ...components.loss_contract import (
+    LossSum,
+    validate_loss_sum,
+    validate_normalization_tokens,
+)
 from ...models.contracts import DecoderStructure
+from ...models.execution import validate_training_output
 from ...utils.logging import get_logger
 from ..topology import ParallelTopology
 from .hccl_schedule import hccl_1f1b_schedule_class
@@ -77,96 +82,54 @@ class PipelineParallelSetup:
     has_last_stage: bool
 
 
-def scalar_loss_fn(
-    pred: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    global_valid_tokens: torch.Tensor,
-    tp_group: dist.ProcessGroup | None = None,
-    global_vocab_size: int | None = None,
-    loss_sum: LossSum | None = None,
-) -> torch.Tensor:
-    """Summed next-token CE over one microbatch, as a bare scalar.
+@dataclass(slots=True, kw_only=True)
+class PipelineLoss:
+    """Own the schedule loss configuration and current normalization denominator.
 
-    The bound token-sum loss receives aligned ``labels``:
-    aligned (``pred[t]`` predicts ``labels[t]``, ``IGNORE_INDEX`` at document
-    boundaries), so no shift happens here. Schedules backward the returned
-    scalar directly; execution result objects remain outside this boundary.
-
-    ``global_valid_tokens`` is handed in by :func:`make_schedule_loss_fn` (it
-    has to be passed down: the denominator spans every rank and every
-    microbatch, so no single call could compute it). Dividing here is what
-    makes the schedule's own backward produce summed/G -- the step's normalized
-    gradient -- with one division per microbatch instead of a rescale applied
-    afterwards.
-
-    Token dimensions are flattened at this boundary: explicit stages may return
-    [B, S, V], while prepared flat-token stages return [T, V]. Neither shape
-    changes the summed loss or the global normalization.
-
-    The caller divides it back out for reporting.
-
-    ``tp_group`` / ``global_vocab_size`` go
-    straight to :func:`cross_entropy_loss`; a full-vocab (replicated) head
-    keeps ``pred.shape[-1] == global_vocab_size`` and takes the plain path, so
-    the default is the old behaviour.
-    """
-    return (cross_entropy_loss if loss_sum is None else loss_sum)(
-        pred.reshape(-1, pred.shape[-1]),
-        labels.reshape(-1),
-        tp_group=tp_group,
-        global_vocab_size=global_vocab_size,
-    ) / global_valid_tokens
-
-
-def make_schedule_loss_fn(
-    schedule: _PipelineSchedule,
-    *,
-    tp_group: dist.ProcessGroup | None = None,
-    global_vocab_size: int | None = None,
-    loss_sum: LossSum | None = None,
-) -> Callable[..., torch.Tensor]:
-    """The schedule's ``loss_fn``, reading the denominator from either route.
-
-    The two schedule drivers hand ``global_valid_tokens`` over differently, and
-    this is the one place that difference is absorbed:
-
-    * Torch's public ``PipelineSchedule.step`` forwards ``loss_kwargs`` into
-      ``loss_fn(output, target, **loss_kwargs)``. That is upstream torchtitan's
-      wiring, and the kwarg therefore wins when it is present.
-    * The private pre-split driver (``_step_microbatches``, which llmtuner uses
-      so its already-cut micro-batches are not re-split) has no loss-kwargs
-      parameter at all; the denominator is read off the schedule attribute that
-      ``run_pipeline_step`` publishes before every call.
-
-    Returning the closure rather than a lambda also makes this testable without
-    a live pipeline, which a lambda defined inline could not be.
-
-    ``tp_group`` and ``global_vocab_size`` are constant for the whole run, so
-    they are captured here at build time (where the pre-split model still
-    exists and knows its vocabulary) rather than read off the schedule on every
-    call the way the per-step denominator has to be. The closure is what the
-    schedule actually calls, so both drivers receive them.
+    Pre-split drivers update this object before execution. Public schedule
+    drivers may supply an explicit denominator through loss_kwargs.
     """
 
-    def _schedule_loss_fn(
+    tp_group: dist.ProcessGroup | None = None
+    global_vocab_size: int | None = None
+    logits_width: int | None = None
+    loss_sum: LossSum = cross_entropy_loss
+    global_valid_tokens: torch.Tensor = field(
+        default_factory=lambda: torch.ones((), dtype=torch.float32)
+    )
+
+    def __post_init__(self) -> None:
+        if self.logits_width is not None and (
+            type(self.logits_width) is not int or self.logits_width <= 0
+        ):
+            raise ValueError("Pipeline logits width must be a positive integer")
+        if not callable(self.loss_sum):
+            raise TypeError("Pipeline loss_sum must be callable")
+
+    def __call__(
+        self,
         pred: torch.Tensor,
         labels: torch.Tensor,
         *,
         global_valid_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if global_valid_tokens is None:
-            global_valid_tokens = schedule._llmtuner_global_valid_tokens
-        return scalar_loss_fn(
-            pred,
-            labels,
-            global_valid_tokens=global_valid_tokens,
-            tp_group=tp_group,
-            global_vocab_size=global_vocab_size,
-            loss_sum=loss_sum,
+        # Validate original axes before flattening; equal token counts alone
+        # must not hide a swapped batch/sequence layout.
+        validate_training_output(pred, labels, output_width=self.logits_width)
+        denominator = (
+            self.global_valid_tokens
+            if global_valid_tokens is None
+            else global_valid_tokens
         )
-
-    return _schedule_loss_fn
+        validate_normalization_tokens(denominator, device=pred.device)
+        loss = self.loss_sum(
+            pred.reshape(-1, pred.shape[-1]),
+            labels.reshape(-1),
+            tp_group=self.tp_group,
+            global_vocab_size=self.global_vocab_size,
+        )
+        validate_loss_sum(loss, device=pred.device)
+        return loss / denominator
 
 
 def get_pipeline_metadata(
@@ -335,18 +298,12 @@ def apply_pp(
 
     Every member of ``error_group`` (the default world group when omitted)
     must call this entry point in the same order. Only local partition checks
-    run inside that coordination boundary; mesh access and stage construction
-    follow it and retain their own distributed failure semantics.
+    run inside that coordination boundary. Each PP group then agrees on the
+    partition and schedule metadata before stage construction; collectives
+    themselves stay outside the local error boundaries.
     """
     with synchronize_local_errors("Pipeline partition validation", group=error_group):
         structure = getattr(model, "decoder_structure", None)
-        if isinstance(structure, DecoderStructure) and (
-            not callable(getattr(model, "validate_pipeline_partition", None))
-            or not callable(getattr(model, "configure_pipeline_stage", None))
-        ):
-            raise NotImplementedError(
-                "Explicit PP requires model-owned partition validation and stage I/O"
-            )
         parallelism = cfg
         validate_microbatches(parallel_dims, cfg, global_batch_size)
 
@@ -434,8 +391,26 @@ def apply_pp(
             module_names_per_stage,
             replicated_module_names=replicated_module_names,
         )
+        partition_signature = (
+            tuple(tuple(names) for names in module_names_per_stage),
+            replicated_module_names,
+            parallelism.pp_config.pipeline_parallel_schedule,
+            parallelism.pp_config.num_pp_microbatches,
+            global_batch_size,
+        )
 
     pp_mesh = parallel_dims.get_mesh("pp")
+    signatures = [None] * pp_mesh.size()
+    # Compare only ranks exchanging pipeline activations. Keep the collective
+    # outside local error coordination, then propagate disagreement to all
+    # assembly participants before any group constructs its stages.
+    dist.all_gather_object(signatures, partition_signature, group=pp_mesh.get_group())
+    with synchronize_local_errors("Pipeline partition agreement", group=error_group):
+        if any(signature != partition_signature for signature in signatures):
+            raise ValueError(
+                "Pipeline ranks disagree on module partitions, replicated modules, "
+                "schedule, microbatch count or global batch size"
+            )
     stages, model_parts = split_model_into_stages(
         model,
         pp_mesh,
@@ -455,20 +430,22 @@ def build_pipeline_schedule(
     cfg: ParallelConfig,
     tp_group: dist.ProcessGroup | None = None,
     global_vocab_size: int | None = None,
+    logits_width: int | None = None,
     loss_sum: LossSum | None = None,
 ) -> _PipelineSchedule:
     """Build the schedule that drives this rank's stages.
 
     Vendored from torchtitan's ``_build_pipeline_schedule``, minus the
     csv-loaded runtime schedule. ``scale_grads=False`` because the loss is a
-    sum over tokens -- the trainer normalizes by the global token count after
-    the reduction, so the schedule must not average over microbatches.
+    sum over tokens divided by the global token count before backward, so
+    the schedule must not average over microbatches again.
 
     ``tp_group`` / ``global_vocab_size`` are the vocab-parallel loss arguments
     for this run, or ``None`` when TP is off or the vocabulary is unknown; they
-    are handed to :func:`make_schedule_loss_fn` and are a no-op while the
+    are handed to :class:`PipelineLoss` and are a no-op while the
     ``lm_head`` is replicated, because :func:`cross_entropy_loss` dispatches on
-    the logits' shape.
+    the logits' shape. ``logits_width`` separately declares a replicated
+    vocabulary width and is checked before invoking the selected loss service.
     """
     parallelism = cfg
     if parallelism.pp_config.pipeline_parallel_schedule_csv:
@@ -497,41 +474,27 @@ def build_pipeline_schedule(
             "a bubble in the pipeline."
         )
 
+    schedule_loss = PipelineLoss(
+        tp_group=tp_group,
+        global_vocab_size=global_vocab_size,
+        logits_width=logits_width,
+        loss_sum=cross_entropy_loss if loss_sum is None else loss_sum,
+    )
     if issubclass(schedule_class, PipelineScheduleMulti):
         schedule = schedule_class(
             stages,
             n_microbatches=num_microbatches,
-            loss_fn=scalar_loss_fn,
+            loss_fn=schedule_loss,
             scale_grads=False,
         )
     else:
         schedule = schedule_class(
             stages[0],
             n_microbatches=num_microbatches,
-            loss_fn=scalar_loss_fn,
+            loss_fn=schedule_loss,
             scale_grads=False,
         )
-    # Torch 2.10's public ``step`` accepts a whole batch and splits tensor
-    # kwargs itself; llmtuner has already built microbatches because positions
-    # and labels are sequence-sharded before PP. Keep the denominator as a
-    # per-step schedule attribute and use the internal pre-split driver below.
-    #
-    # The ``loss_fn=`` handed to the constructor above is a placeholder: the
-    # real one has to read the schedule object that only exists after the
-    # constructor returns, so it is installed here.
-    #
-    # ``make_schedule_loss_fn`` absorbs the one difference between the two
-    # drivers: the public ``step`` carries the denominator in ``loss_kwargs``
-    # (upstream torchtitan's wiring), the private pre-split driver reads it off
-    # the schedule attribute that the body republishes on every call.
     bind_stage_rng(schedule)
-    schedule._llmtuner_global_valid_tokens = torch.ones((), dtype=torch.float32)
-    schedule._loss_fn = make_schedule_loss_fn(
-        schedule,
-        tp_group=tp_group,
-        global_vocab_size=global_vocab_size,
-        loss_sum=loss_sum,
-    )
     logger.info(
         f"Using pipeline schedule {parallelism.pp_config.pipeline_parallel_schedule} "
         f"with {num_microbatches} microbatches and {num_total_stages} stages."

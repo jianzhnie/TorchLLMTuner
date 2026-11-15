@@ -39,7 +39,7 @@ class EMAConfig:
     """Only fire the EMA update every N real optimizer steps."""
 
     buffer_patterns: list[str] = field(default_factory=list)
-    """Regex patterns (``re.search``, against buffer FQNs) selecting which
+    """Regex patterns against wrapper-free buffer FQNs and aliases selecting which
     buffers also get an EMA tracked -- e.g. an MoE's ``expert_bias_E``. Empty
     (default): no buffers tracked."""
 

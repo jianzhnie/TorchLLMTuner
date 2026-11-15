@@ -19,10 +19,10 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 
 from ....accelerator.collectives import synchronize_local_errors
 from ....models.state import SourceLayoutMigration
-from ....utils.logging import get_logger
 from ....utils.module_names import canonical_fqn
 from ...optimizer.state_dict import validate_full_optimizer_state
 from .checkpoint_keys import (
+    CHECKPOINT_FORMAT,
     DATALOADER,
     EMA,
     LR_SCHEDULER,
@@ -32,12 +32,12 @@ from .checkpoint_keys import (
     TRAIN_STATE,
 )
 from .state_adaptation import (
+    restore_categories_before_rng,
+    restore_rng_state,
     select_local_preflight_states,
     validate_local_preflight_selection,
     validate_local_state_preflight,
 )
-
-logger = get_logger(__name__)
 
 
 class SourceLayoutLoadPlanner(DefaultLoadPlanner):
@@ -64,6 +64,7 @@ def source_destinations(
     selected = {}
     destinations = {}
     training_categories = {
+        CHECKPOINT_FORMAT,
         OPTIMIZER,
         EMA,
         LR_SCHEDULER,
@@ -84,7 +85,12 @@ def source_destinations(
             and isinstance(entry, TensorStorageMetadata)
             and root not in training_categories
         )
-        if root in (OPTIMIZER, EMA) or model_tensor:
+        model_extra_state = root == "_extra_state" or root.endswith("._extra_state")
+        if model_extra_state:
+            # Extra state can flatten into nested dictionaries or lists. Only
+            # its module FQN contains wrapper segments; payload keys are data.
+            path = (root, *path[1:])
+        elif root in (OPTIMIZER, EMA) or model_tensor:
             path = tuple(
                 canonical_fqn(segment, wrapper_segments=("_orig_mod",))
                 if isinstance(segment, str)
@@ -93,7 +99,7 @@ def source_destinations(
             )
         if path[0] in {OPTIMIZER, EMA} and path[0] not in states:
             continue
-        if path[0] in states or model_tensor:
+        if path[0] in states or model_tensor or model_extra_state:
             destination = tuple(path)
             if destination in destinations:
                 raise ValueError(
@@ -123,9 +129,17 @@ def _agree_migration_choice(choice: object) -> None:
 
 
 def load_changed_source_layout(
-    checkpoint_id: str, *, states: dict[str, Any], adapter: Any
+    checkpoint_id: str,
+    *,
+    states: dict[str, Any],
+    adapter: Any,
+    ema_to_reset: Any | None = None,
 ) -> bool:
-    """Apply declared full-source conversion, returning False for ordinary loads."""
+    """Apply full-source conversion, returning False for ordinary loads.
+
+    The caller may supply an excluded EMA owner to reseed from restored model
+    weights. Its local reset runs before RNG restoration and only on migration.
+    """
     with synchronize_local_errors("Checkpoint source migration selection"):
         state_format = getattr(adapter, "state_format", None)
         resolve = getattr(state_format, "source_layout_migration", None)
@@ -158,6 +172,27 @@ def load_changed_source_layout(
         storage_reader=reader,
         planner=SourceLayoutLoadPlanner(flat),
     )
+    with synchronize_local_errors(f"{name} checkpoint source records"):
+        loaded = {}
+        for key, path in selected.items():
+            set_element(loaded, path, flat[key])
+        missing_categories = set(states) - {MODEL} - loaded.keys()
+        if missing_categories:
+            raise ValueError(
+                f"{name} layout migration missing training state categories: "
+                f"{sorted(missing_categories)}"
+            )
+
+    # Direct callers need the same metadata preflight as backend-managed loads.
+    # Do not create fresh reader buffers: the isolated source records are ready.
+    with synchronize_local_errors(f"{name} checkpoint metadata validator selection"):
+        preflight_states = select_local_preflight_states(states)
+    validate_local_preflight_selection(preflight_states)
+    validate_local_state_preflight(
+        preflight_states,
+        loaded,
+    )
+
     # These templates may gather EP/TP tensors. Keep their collectives outside
     # the local-only error boundary and reuse their full logical shapes below.
     templates = {
@@ -166,23 +201,6 @@ def load_changed_source_layout(
         if category in states
     }
     with synchronize_local_errors(f"{name} checkpoint layout conversion"):
-        loaded = {}
-        for key, path in selected.items():
-            set_element(loaded, path, flat[key])
-        missing_categories = set(states) - {MODEL} - loaded.keys()
-        if RNG_STATE in missing_categories:
-            # Match the ordinary DCP loader's legacy contract. An existing but
-            # malformed RNG category still goes through strict validation.
-            missing_categories.remove(RNG_STATE)
-            logger.warning(
-                "Legacy checkpoint has no RNG state; random training "
-                "cannot resume with exact stream continuity."
-            )
-        if missing_categories:
-            raise ValueError(
-                f"{name} layout migration missing training state categories: "
-                f"{sorted(missing_categories)}"
-            )
         model = {key: value for key, value in loaded.items() if key not in states}
         model = migration.convert_model(model)
         for category in templates:
@@ -195,17 +213,6 @@ def load_changed_source_layout(
             validate_full_optimizer_state(
                 loaded[category], template, context=f"{name} {category}"
             )
-
-    # Direct callers need the same metadata preflight as backend-managed loads.
-    # Do not create fresh reader buffers: the isolated source records are ready.
-    with synchronize_local_errors(f"{name} checkpoint metadata validator selection"):
-        preflight_states = select_local_preflight_states(states)
-    validate_local_preflight_selection(preflight_states)
-    validate_local_state_preflight(
-        preflight_states,
-        loaded,
-        missing_categories=frozenset({RNG_STATE} - loaded.keys()),
-    )
 
     # Model first, optimizer before scheduler, RNG last. Each object's existing
     # validator remains authoritative for keys, topology and shape contracts.
@@ -227,22 +234,24 @@ def load_changed_source_layout(
     for category in (OPTIMIZER, EMA):
         if category in states:
             loaded[category] = place(loaded[category], templates[category])
-    states[MODEL].load_state_dict(model)
-    if OPTIMIZER in states:
-        states[OPTIMIZER].load_state_dict(loaded[OPTIMIZER])
-    for category, state in states.items():
-        if category in (MODEL, OPTIMIZER, RNG_STATE):
-            continue
-        # These callbacks are local. Coordinate failures before peers can
-        # enter EMA or RNG collectives; EMA's own EP/TP communication must
-        # remain outside this local-only boundary.
+    for category in restore_categories_before_rng(states):
+        # Only built-in metadata callbacks are local. Model, optimizer, EMA
+        # and custom states may communicate and keep their own boundaries.
         with (
             synchronize_local_errors(f"{name} checkpoint {category} restoration")
             if category in (LR_SCHEDULER, DATALOADER, TRAIN_STATE)
             else nullcontext()
         ):
-            state.load_state_dict(loaded[category])
-    with synchronize_local_errors(f"{name} checkpoint RNG restoration"):
-        if RNG_STATE in states and RNG_STATE in loaded:
-            states[RNG_STATE].load_state_dict(loaded[RNG_STATE])
+            states[category].load_state_dict(
+                model if category == MODEL else loaded[category]
+            )
+    with synchronize_local_errors("Checkpoint EMA cold start"):
+        if ema_to_reset is not None:
+            ema_to_reset.reset_from_model()
+    restore_rng_state(
+        states,
+        loaded,
+        available=RNG_STATE in loaded,
+        phase_prefix=f"{name} checkpoint",
+    )
     return True

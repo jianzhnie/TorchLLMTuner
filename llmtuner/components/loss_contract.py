@@ -47,7 +47,8 @@ def validate_loss_sum(
 class LossFunctions:
     """Token-summed loss and optional head/chunk backward implementation.
 
-    token_sum receives aligned logits/labels and vocabulary reduction keywords,
+    token_sum receives aligned [tokens, vocabulary] logits, [tokens] labels and
+    vocabulary reduction keywords,
     returns an unnormalized scalar, and does not run backward. chunked_backward
     accepts the same arguments as chunked_lm_head_cross_entropy, performs scaled
     backward internally, and returns detached unnormalized loss. Custom losses

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
 from time import perf_counter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import torch
 from torch.distributed import ProcessGroup
@@ -18,6 +18,8 @@ from ...datasets.contracts import (
     Batch,
     DataloaderExhaustedError,
     TrainerBatch,
+    validate_token_alignment,
+    validated_token_fields,
 )
 from ...datasets.loader_builder import build_dataloader as build_dataset_dataloader
 from ...models.execution import validate_prepared_model_inputs
@@ -143,15 +145,36 @@ def count_valid_tokens(batch: Batch | TrainerBatch) -> int:
         # silently lacks the key still produces a correct denominator.
         labels = batch["labels"]
         num_valid_tokens = int((labels != IGNORE_INDEX).sum())
+    return _validate_valid_token_count(num_valid_tokens, batch["labels"].numel())
+
+
+def _validate_valid_token_count(count: int, label_count: int) -> int:
+    """Apply the same denominator bounds to collators and injected counters."""
     if (
-        isinstance(num_valid_tokens, bool)
-        or not isinstance(num_valid_tokens, int)
-        or not 0 <= num_valid_tokens <= batch["labels"].numel()
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or not 0 <= count <= label_count
     ):
         raise ValueError(
             "num_valid_tokens must be an integer between 0 and the number of labels"
         )
-    return num_valid_tokens
+    return count
+
+
+def validated_batch_token_counts(
+    batch: Batch | TrainerBatch,
+    *,
+    token_counter: Callable[[Batch | TrainerBatch], int],
+) -> tuple[int, int]:
+    """Validate raw fields and local counts before any token reduction.
+
+    This operation is local; training and validation own their respective
+    distributed error boundaries and must call it inside those boundaries.
+    """
+    _, labels = validated_token_fields(batch)
+    num_tokens = labels.numel()
+    num_valid_tokens = _validate_valid_token_count(token_counter(batch), num_tokens)
+    return num_tokens, num_valid_tokens
 
 
 def count_routing_tokens(batch: Batch | TrainerBatch) -> int:
@@ -160,8 +183,21 @@ def count_routing_tokens(batch: Batch | TrainerBatch) -> int:
         return batch.input_ids.numel()
     padding_mask = batch.get("padding_mask")
     if padding_mask is not None:
+        validate_token_alignment(batch["input"], padding_mask, name="padding_mask")
         return int((~padding_mask.to(torch.bool)).sum())
     return batch["input"].numel()
+
+
+class AccumulationBatch(TypedDict):
+    """Host batch and unsharded counts for one gradient-accumulation group.
+
+    Valid targets normalize the LM loss; routing tokens normalize auxiliary
+    losses and include tokens whose LM targets are ignored.
+    """
+
+    batch: Batch | TrainerBatch
+    num_valid_tokens: int
+    num_routing_tokens: int
 
 
 def prepare_microbatch(
@@ -169,16 +205,16 @@ def prepare_microbatch(
     *,
     valid_token_counter: Callable[[Batch | TrainerBatch], int] = count_valid_tokens,
     error_group: ProcessGroup | None = None,
-) -> tuple[dict[str, Any], int]:
+) -> tuple[AccumulationBatch, int]:
     """Return host-batch counts and the unsharded label count without mutation.
 
     The caller owns cumulative training counters and sequence-replica correction.
     Coordinate every local count before callers commit any training state.
     """
     with synchronize_local_errors("Training token accounting", group=error_group):
-        labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
-        num_tokens = labels.numel()
-        num_valid_tokens = valid_token_counter(batch)
+        num_tokens, num_valid_tokens = validated_batch_token_counts(
+            batch, token_counter=valid_token_counter
+        )
         num_routing_tokens = count_routing_tokens(batch)
     return (
         {
@@ -213,7 +249,6 @@ def prepare_model_inputs(
     *,
     device: torch.device,
     parallel_dims: Any,
-    max_context_length: int,
     error_group: ProcessGroup | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Connect a batch to the explicit model's input contract.
@@ -230,11 +265,10 @@ def prepare_model_inputs(
         if not callable(prepare_inputs):
             raise TypeError(
                 f"{type(model).__name__} must implement "
-                "prepare_inputs(batch, parallel_dims=..., max_context_length=...)"
+                "prepare_inputs(batch, parallel_dims=...)"
             )
         prepared = prepare_inputs(
             move_batch_to_device(batch, device),
             parallel_dims=parallel_dims,
-            max_context_length=max_context_length,
         )
         return validate_prepared_model_inputs(prepared)

@@ -33,6 +33,7 @@ import torch.nn.functional as F
 
 from ....accelerator.capabilities import has
 from ..activation import SwiGLU
+from .observation import DispatchObservation
 
 if TYPE_CHECKING:
     from ....parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
@@ -287,7 +288,11 @@ class RoutedExperts(nn.Module):
         super().__init__()
         self.inner_experts = grouped_experts
         self.token_dispatcher = dispatcher
-        self.dispatch_observer = None
+        # Fused subclasses can replace forward without entering this boundary.
+        # They must explicitly declare their own observation site if supported.
+        self.dispatch_observation = (
+            DispatchObservation() if type(self) is RoutedExperts else None
+        )
 
     def forward(
         self,
@@ -298,8 +303,8 @@ class RoutedExperts(nn.Module):
     ) -> torch.Tensor:
         """Dispatch tokens to experts, run them, and combine the results."""
         with (
-            self.dispatch_observer.measure(x_TD.device)
-            if self.dispatch_observer is not None
+            self.dispatch_observation.measure(x_TD.device)
+            if self.dispatch_observation is not None
             else nullcontext()
         ):
             (

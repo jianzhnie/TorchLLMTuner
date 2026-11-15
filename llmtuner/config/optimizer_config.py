@@ -17,7 +17,9 @@ class ParamGroupConfig:
     """One parameter group and the optimizer that owns it."""
 
     pattern: str
-    """Regex matched against parameter FQNs, e.g. ``r".*\\.bias$"``, ``r".*"``."""
+    """Regex matched against wrapper-free parameter FQNs and aliases.
+
+    Examples: ``r".*\\.bias$"``, ``r".*"``."""
 
     optimizer_name: str
     """Optimizer: ``Adam``, ``AdamW``, ``AdamWSwap``, or ``DistMuon``."""

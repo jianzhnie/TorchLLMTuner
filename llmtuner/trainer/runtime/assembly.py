@@ -58,7 +58,7 @@ from ...models.flops import flops_estimation_note, flops_per_token
 from ...models.registry import resolve_state_format
 from ...parallel import compatibility
 from ...parallel.assembly import ModelPartLayout, validate_model_part_layouts
-from ...parallel.execution import ExecutionLayout
+from ...parallel.execution import ExecutionLayout, validate_local_pipeline_layouts
 from ...parallel.parallelize import parallelize_model
 from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 from ...utils import logging as logging_utils
@@ -66,8 +66,6 @@ from .builders import PipelineScheduleFactory, TrainingBuilders
 from .engine import ParamContext, TrainingEngine
 
 if TYPE_CHECKING:
-    from contextlib import AbstractContextManager
-
     from torch.distributed.checkpoint.stateful import Stateful
     from transformers import PretrainedConfig
 
@@ -75,7 +73,7 @@ if TYPE_CHECKING:
     from ...config.observability_config import ProfilerConfig
     from ...datasets.contracts import BaseDataLoader
     from ...parallel.topology import ParallelTopology
-    from .builders import StepProfiler
+    from .builders import ProfilerOwner
     from .environment import RuntimeEnvironment
 
 
@@ -85,16 +83,19 @@ def build_profiler(
     global_step: int,
     base_folder: str,
     builders: TrainingBuilders | None = None,
-) -> AbstractContextManager[StepProfiler]:
+) -> ProfilerOwner:
     """Construct an unentered tracing owner for Trainer's loop lifecycle.
 
     The factory owns partial construction. Trainer retains the returned owner
-    before entering it, so optional close retries remain available on failure.
+    before entering it, so close retries remain available on failure.
     """
     factory = None if builders is None else builders.profiler
     if factory is None:
         factory = Profiler
-    return factory(config, global_step=global_step, base_folder=base_folder)
+    owner = factory(config, global_step=global_step, base_folder=base_folder)
+    if not callable(getattr(owner, "close", None)):
+        raise TypeError("Profiler factory must return an owner with close()")
+    return owner
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,20 +130,11 @@ class ModelAssembly:
             validate_model_part_layouts(self.model_parts, self.layouts)
             execution = self.execution_layouts
             if self.pp_schedule is not None:
-                # Local parts may be nonadjacent under interleaved schedules.
-                # parallelize_model validates adjacency in global stage order.
-                if any(layout.pipeline_io is None for layout in execution):
-                    raise ValueError(
-                        "Pipeline execution layouts require stage I/O declarations"
-                    )
-                if any(layout.input_kind == "tokens" for layout in execution) != (
-                    self.pp_has_first_stage
-                ):
-                    raise ValueError("Pipeline token owner disagrees with stage I/O")
-                if any(layout.output == "logits" for layout in execution) != (
-                    self.pp_has_last_stage
-                ):
-                    raise ValueError("Pipeline loss owner disagrees with output layout")
+                validate_local_pipeline_layouts(
+                    execution,
+                    has_first_stage=self.pp_has_first_stage,
+                    has_last_stage=self.pp_has_last_stage,
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,12 +483,12 @@ def create_training_engine(
     all update participants, not only ranks sharing a DP or PP mesh axis.
     """
     with synchronize_local_errors("Training engine construction", group=error_group):
+        model_assembly.validate_layouts()
         return TrainingEngine(
             model_parts=model_assembly.model_parts,
             execution_layouts=model_assembly.execution_layouts,
             parallel_dims=parallel_dims,
             device=device,
-            max_context_length=cfg.max_seq_len,
             chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
             param_context=param_context,
             loss_sum=loss_functions.token_sum,
@@ -521,13 +513,22 @@ def build_optimizer_stack(
     error_group: ProcessGroup | None = None,
     layouts: tuple[ModelPartLayout, ...] = (),
     builders: TrainingBuilders | None = None,
+    on_service_acquired: Callable[[str, Any], None],
 ) -> OptimizerStack:
     """Build optimizer services against the final parallel parameter layout.
 
     Pass the same error group to parameter planning and scheduler/EMA creation.
     This group coordinates failures; it does not change gradient ownership.
+    on_service_acquired takes ownership of the built-in optimizer before inner
+    construction, and of other services immediately after their factories return.
+    Injected factories own partial construction until they return a service.
+    It must only retain the object, without raising or performing device work.
+    The caller retains failed releases for retry and closes services in dependency
+    order, even when construction fails before this function returns.
     """
     with synchronize_local_errors("Optimizer layout validation", group=error_group):
+        if not callable(on_service_acquired):
+            raise TypeError("Optimizer services require a callable resource owner")
         if layouts:
             validate_model_part_layouts(model_parts, layouts)
     factories = builders or TrainingBuilders()
@@ -548,57 +549,47 @@ def build_optimizer_stack(
             parallel_dims.get_optional_mesh("pp") if parallel_dims is not None else None
         ),
         runtime_layouts=layouts,
+        **(
+            {"on_acquired": lambda owner: on_service_acquired("optimizer", owner)}
+            if factories.optimizer is None
+            else {}
+        ),
     )
 
-    lr_scheduler = None
-    ema = None
-    try:
-        with synchronize_local_errors(
-            "Optimizer services construction", group=error_group
-        ):
-            lr_scheduler = scheduler_factory(
-                cfg.lr_scheduler_config,
-                optimizers=list(optimizer),
-                training_steps=cfg.steps,
+    if factories.optimizer is not None:
+        # Injected factories own partial construction; transfer their returned
+        # service here. The built-in container transfers before construction.
+        on_service_acquired("optimizer", optimizer)
+    with synchronize_local_errors("Optimizer services construction", group=error_group):
+        lr_scheduler = scheduler_factory(
+            cfg.lr_scheduler_config,
+            optimizers=list(optimizer),
+            training_steps=cfg.steps,
+        )
+        on_service_acquired("lr_scheduler", lr_scheduler)
+        ema_config = cfg.training.ema
+        ema = (
+            ema_factory(
+                model_parts=model_parts,
+                runtime_layouts=layouts,
+                sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
+                sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
+                decay=ema_config.decay,
+                half_life_fraction=ema_config.half_life_fraction,
+                start_step=ema_config.start_step,
+                step_bias=ema_config.step_bias,
+                update_every_n_steps=ema_config.update_every_n_steps,
+                buffer_patterns=ema_config.buffer_patterns,
             )
-            ema_config = cfg.training.ema
-            ema = (
-                ema_factory(
-                    model_parts=model_parts,
-                    runtime_layouts=layouts,
-                    sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
-                    sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
-                    decay=ema_config.decay,
-                    half_life_fraction=ema_config.half_life_fraction,
-                    start_step=ema_config.start_step,
-                    step_bias=ema_config.step_bias,
-                    update_every_n_steps=ema_config.update_every_n_steps,
-                    buffer_patterns=ema_config.buffer_patterns,
-                )
-                if ema_config is not None
-                else None
-            )
-            # Container hooks run once per optimizer step, including multiple PP parts.
-            register_aux_loss_metrics_hook(optimizer, model_parts=model_parts)
-            register_moe_balancing_hook(
-                optimizer, model_parts=model_parts, parallel_dims=parallel_dims
-            )
-    except BaseException:
-        # Factories own partial objects until they return. Once returned, this
-        # builder owns cleanup until the complete stack is published.
-        for resource in (ema, lr_scheduler, optimizer):
-            close = getattr(resource, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except BaseException:
-                    try:
-                        logging_utils.get_logger(__name__).exception(
-                            "Optimizer service cleanup failed during construction"
-                        )
-                    except BaseException:
-                        pass
-        raise
+            if ema_config is not None
+            else None
+        )
+        on_service_acquired("ema", ema)
+        # Container hooks run once per optimizer step, including multiple PP parts.
+        register_aux_loss_metrics_hook(optimizer, model_parts=model_parts)
+        register_moe_balancing_hook(
+            optimizer, model_parts=model_parts, parallel_dims=parallel_dims
+        )
     return OptimizerStack(optimizer=optimizer, lr_scheduler=lr_scheduler, ema=ema)
 
 
@@ -677,46 +668,34 @@ def build_metrics_processor(
     num_trainable_parameters: int,
     error_group: ProcessGroup | None = None,
     builders: TrainingBuilders | None = None,
+    on_service_acquired: Callable[[str, Any], None],
 ) -> MetricsProcessor:
     """Build metrics with explicit construction-failure coordination.
 
     ``parallel_dims`` still defines metric reductions. ``error_group`` determines
-    which peers must accept construction before the logger is published.
+    which peers must accept construction. The caller takes ownership immediately
+    after the factory returns, before peer coordination or logging can fail.
+    The callback must retain the service without raising or performing device work.
     """
     factories = builders or TrainingBuilders()
     metrics_factory = (
         MetricsProcessor if factories.metrics is None else factories.metrics
     )
-    metrics = None
-    try:
-        with synchronize_local_errors("Metrics construction", group=error_group):
-            text_config = unwrap_text_config(model_config)
-            metrics = metrics_factory(
-                cfg.metrics,
-                parallel_dims=parallel_dims,
-                dump_folder=cfg.dump_folder,
-                num_parameters=num_parameters,
-                num_trainable_parameters=num_trainable_parameters,
-                pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
-                num_flops_per_token=flops_per_token(
-                    text_config, seq_len=cfg.max_seq_len
-                ),
-            )
-            note = flops_estimation_note(text_config, seq_len=cfg.max_seq_len)
-            if note is not None:
-                logging_utils.get_logger(__name__).info("%s", note)
-    except BaseException:
-        # The factory owns the logger until every rank accepts construction.
-        # A peer failure leaves no object on Trainer for its close() to release.
-        if metrics is not None:
-            try:
-                metrics.close()
-            except BaseException:
-                try:
-                    logging_utils.get_logger(__name__).exception(
-                        "Metrics cleanup failed after a construction error"
-                    )
-                except BaseException:
-                    pass
-        raise
+    with synchronize_local_errors("Metrics construction", group=error_group):
+        if not callable(on_service_acquired):
+            raise TypeError("Metrics construction requires a callable resource owner")
+        text_config = unwrap_text_config(model_config)
+        metrics = metrics_factory(
+            cfg.metrics,
+            parallel_dims=parallel_dims,
+            dump_folder=cfg.dump_folder,
+            num_parameters=num_parameters,
+            num_trainable_parameters=num_trainable_parameters,
+            pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
+            num_flops_per_token=flops_per_token(text_config, seq_len=cfg.max_seq_len),
+        )
+        on_service_acquired("metrics", metrics)
+        note = flops_estimation_note(text_config, seq_len=cfg.max_seq_len)
+        if note is not None:
+            logging_utils.get_logger(__name__).info("%s", note)
     return metrics

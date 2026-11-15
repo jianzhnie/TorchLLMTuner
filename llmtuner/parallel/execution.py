@@ -9,7 +9,6 @@ from torch.distributed import ProcessGroup
 from ..models.contracts import DecoderStructure
 from ..models.execution import ModelExecutionCapabilities, PipelineStageIO
 from .plan import ParallelPlan
-from .stages import STAGE_ORDER
 from .tensor_parallel.sharding import ShardingConfig
 
 
@@ -23,7 +22,6 @@ class ExecutionLayout:
     vocabulary_size: int | None
     capabilities: ModelExecutionCapabilities
     chunked_loss: bool
-    stages: tuple[str, ...]
     pipeline_io: PipelineStageIO | None = None
 
     def __post_init__(self) -> None:
@@ -59,6 +57,13 @@ class ExecutionLayout:
                 raise ValueError(
                     "Pipeline output layout disagrees with the last-stage role"
                 )
+            if (
+                self.capabilities.hidden_size is not None
+                and self.pipeline_io.hidden_size != self.capabilities.hidden_size
+            ):
+                raise ValueError(
+                    "Pipeline activation width disagrees with model hidden size"
+                )
         elif self.output == "pipeline_hidden":
             raise ValueError("Pipeline hidden output requires a stage I/O contract")
         if self.output == "logits" and not self.capabilities.logits:
@@ -67,6 +72,21 @@ class ExecutionLayout:
             self.pipeline_io is not None or not self.capabilities.hidden_states
         ):
             raise ValueError("Chunked loss requires hidden output without pipeline I/O")
+
+    def validate_model(self, model: nn.Module) -> None:
+        """Reject transforms that invalidate the resolved execution declaration."""
+        if getattr(model, "execution_capabilities", None) != self.capabilities:
+            raise ValueError("Transformed model execution capabilities changed")
+        if getattr(model, "pipeline_stage_io", None) != self.pipeline_io:
+            raise ValueError("Transformed model pipeline I/O changed")
+        if self.vocabulary_size is not None and (
+            getattr(model, "vocab_size", None) != self.vocabulary_size
+        ):
+            raise ValueError("Transformed model vocabulary size changed")
+        if self.pipeline_io is not None:
+            validate_pipeline_stage_io(
+                model, first=self.pipeline_io.first, last=self.pipeline_io.last
+            )
 
     @property
     def input_kind(self) -> Literal["tokens", "pipeline_hidden"]:
@@ -87,6 +107,40 @@ class ExecutionLayout:
         return {"tp_group": tp_group, "global_vocab_size": self.vocabulary_size}
 
 
+def _validate_pipeline_geometry(layouts: tuple[ExecutionLayout, ...]) -> None:
+    """Share boundary checks between local parts and the gathered global chain."""
+    if not layouts or any(layout.pipeline_io is None for layout in layouts):
+        raise ValueError("Pipeline execution layouts require stage I/O declarations")
+    if len({layout.pipeline_io.hidden_size for layout in layouts}) != 1:
+        raise ValueError("Pipeline stages disagree on hidden activation width")
+    if len({layout.pipeline_io.activation_dtype for layout in layouts}) != 1:
+        raise ValueError("Pipeline stages disagree on activation dtype")
+    if len({layout.sequence_shard_axes for layout in layouts}) != 1:
+        raise ValueError("Pipeline stages disagree on sequence shard axes")
+    vocabulary_sizes = {
+        layout.vocabulary_size
+        for layout in layouts
+        if layout.vocabulary_size is not None
+    }
+    if len(vocabulary_sizes) > 1:
+        raise ValueError("Pipeline stages disagree on declared vocabulary size")
+
+
+def validate_local_pipeline_layouts(
+    layouts: tuple[ExecutionLayout, ...], *, has_first_stage: bool, has_last_stage: bool
+) -> None:
+    """Validate local PP ownership without assuming adjacent global stage IDs.
+
+    Interleaved schedules can place nonadjacent parts on one rank. Global chain
+    validation checks adjacency; assembly and execution share these local checks.
+    """
+    _validate_pipeline_geometry(layouts)
+    if sum(layout.input_kind == "tokens" for layout in layouts) != has_first_stage:
+        raise ValueError("Pipeline token owner disagrees with stage I/O")
+    if sum(layout.output == "logits" for layout in layouts) != has_last_stage:
+        raise ValueError("Pipeline loss owner disagrees with output layout")
+
+
 def validate_execution_chain(layouts: tuple[ExecutionLayout, ...]) -> None:
     """Validate the complete chain in global stage order before construction.
 
@@ -96,8 +150,7 @@ def validate_execution_chain(layouts: tuple[ExecutionLayout, ...]) -> None:
     """
     if not layouts:
         raise ValueError("Pipeline execution chain must contain at least one stage")
-    if any(layout.pipeline_io is None for layout in layouts):
-        raise ValueError("Pipeline execution layouts require stage I/O declarations")
+    _validate_pipeline_geometry(layouts)
     if layouts[0].input_kind != "tokens" or layouts[-1].output != "logits":
         raise ValueError("Pipeline chain must consume tokens and produce logits")
     for index, (left, right) in enumerate(zip(layouts, layouts[1:], strict=False)):
@@ -106,13 +159,6 @@ def validate_execution_chain(layouts: tuple[ExecutionLayout, ...]) -> None:
                 f"Pipeline stages {index} and {index + 1} have incompatible "
                 "execution boundary"
             )
-        left_io, right_io = left.pipeline_io, right.pipeline_io
-        if left_io.hidden_size != right_io.hidden_size:
-            raise ValueError("Pipeline stages disagree on hidden activation width")
-        if left_io.activation_dtype != right_io.activation_dtype:
-            raise ValueError("Pipeline stages disagree on activation dtype")
-        if left.sequence_shard_axes != right.sequence_shard_axes:
-            raise ValueError("Pipeline stages disagree on sequence shard axes")
 
 
 def resolve_execution_layout(
@@ -145,7 +191,10 @@ def resolve_execution_layout(
     head_path = None
     if isinstance(structure, DecoderStructure):
         head_path = structure.head
-        owns_output = not isinstance(model.get_submodule(head_path), nn.Identity)
+        if owns_output and isinstance(model.get_submodule(head_path), nn.Identity):
+            raise ValueError(
+                "Declared logits output requires an owned output projection"
+            )
     # The pre-partition model is also resolved with pipeline=True. Its stage
     # roles do not exist until partitioning; configured parts declare them.
     if pipeline and stage_io is not None:
@@ -198,7 +247,6 @@ def resolve_execution_layout(
         vocabulary_size=vocabulary_size,
         capabilities=capabilities,
         chunked_loss=chunked_loss,
-        stages=tuple(STAGE_ORDER),
         pipeline_io=stage_io,
     )
 

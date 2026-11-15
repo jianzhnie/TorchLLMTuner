@@ -50,6 +50,7 @@ class DeepseekV4Indexer(reference.DeepseekV4Indexer):
         self.num_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.index_topk = config.index_topk
+        self.query_input_size = config.q_lora_rank
         self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
         self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
         self.position_bias = nn.Parameter(
@@ -57,10 +58,21 @@ class DeepseekV4Indexer(reference.DeepseekV4Indexer):
         )
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.q_b_proj = nn.Linear(
-            config.q_lora_rank, self.num_heads * self.head_dim, bias=False
+            self.query_input_size, self.num_heads * self.head_dim, bias=False
         )
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.scorer = DeepseekV4IndexerScorer(config)
+
+    def validate_indexer_inputs(
+        self, hidden_states: torch.Tensor, q_residual: torch.Tensor
+    ) -> None:
+        """Validate query geometry independently of the projection implementation."""
+        if hidden_states.ndim != 3:
+            raise ValueError("CSA indexer requires [batch, sequence, hidden] input")
+        if q_residual.shape != (*hidden_states.shape[:2], self.query_input_size):
+            raise ValueError("CSA indexer q_residual shape does not match local input")
+        if q_residual.device != hidden_states.device:
+            raise ValueError("CSA indexer query and hidden input must share a device")
 
     def compress_context_parallel(
         self, hidden_states, *, exchange_windows, exchange_previous_window
@@ -81,7 +93,8 @@ class DeepseekV4Indexer(reference.DeepseekV4Indexer):
         past_key_values: Cache | None,
         layer_idx: int,
     ) -> torch.Tensor:
-        batch, sequence, _ = hidden_states.shape
+        self.validate_indexer_inputs(hidden_states, q_residual)
+        batch = hidden_states.shape[0]
         cache = (
             past_key_values.layers[layer_idx] if past_key_values is not None else None
         )
@@ -130,47 +143,21 @@ class DeepseekV4Indexer(reference.DeepseekV4Indexer):
             if cache is None
             else cache.update_compressor_states("indexer", compressed)
         )
-        cosine, sine = self.rotary_emb(
-            hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type
+        return self.select_compressed_windows(
+            hidden_states, q_residual, position_ids, compressed_kv
         )
-        query = self.q_b_proj(q_residual).view(batch, sequence, -1, self.head_dim)
-        query = apply_rotary_pos_emb(query.transpose(1, 2), cosine, sine).transpose(
-            1, 2
-        )
-        scores = self.scorer(query, compressed_kv, hidden_states)
-        entries = compressed_kv.shape[1]
-        top_k = min(self.index_topk, entries)
-        if entries > 0:
-            threshold = (position_ids + 1) // ratio
-            entry_ids = torch.arange(entries, device=scores.device)
-            future = entry_ids.view(1, 1, -1) >= threshold.unsqueeze(-1)
-            scores = scores.masked_fill(future, float("-inf"))
-            selected = scores.topk(top_k, dim=-1).indices
-            # Early queries may have fewer valid blocks than the requested k.
-            return torch.where(
-                selected >= threshold.unsqueeze(-1),
-                torch.full_like(selected, -1),
-                selected,
-            )
-        return scores.topk(top_k, dim=-1).indices
 
     @torch.no_grad()
-    def select_context_parallel_windows(
-        self, hidden_states, q_residual, position_ids, keys
-    ):
-        """Score global compressed keys using local queries and causal top-k."""
+    def select_compressed_windows(self, hidden_states, q_residual, position_ids, keys):
+        """Select causal compressed keys for full-sequence or CP-local queries."""
+        self.validate_indexer_inputs(hidden_states, q_residual)
         batch, length, _ = hidden_states.shape
         cos, sin = self.rotary_emb(
             hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type
         )
         query = self.q_b_proj(q_residual).view(batch, length, -1, self.head_dim)
         query = apply_rotary_pos_emb(query.transpose(1, 2), cos, sin).transpose(1, 2)
-        scores = torch.matmul(
-            query.float(), keys.transpose(-1, -2).float().unsqueeze(1)
-        )
-        scores = scores.relu() * self.softmax_scale
-        weights = self.weights_proj(hidden_states).float() * self.weights_scaling
-        scores = (scores * weights.unsqueeze(-1)).sum(dim=2)
+        scores = self.scorer(query, keys, hidden_states)
         total = keys.shape[1]
         threshold = (position_ids + 1) // self.compress_rate
         indices = torch.arange(total, device=scores.device)

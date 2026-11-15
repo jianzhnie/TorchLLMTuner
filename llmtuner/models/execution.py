@@ -49,6 +49,8 @@ def validate_prepared_model_inputs(
     Models own padding, document boundaries, multimodal fields and sequence
     sharding. This boundary only requires one aligned target per local token;
     kwargs may describe a gathered sequence and need not share token geometry.
+    Flat and batched token representations may interoperate, but when both
+    retain batch/sequence axes those axes must agree before model execution.
     """
     if not isinstance(prepared, tuple) or len(prepared) != 3:
         raise TypeError("prepare_inputs must return (tokens, labels, forward_kwargs)")
@@ -62,6 +64,8 @@ def validate_prepared_model_inputs(
             raise TypeError(f"Prepared {name} must contain integer indices")
     if tokens.numel() != labels.numel():
         raise ValueError("Prepared tokens and labels must have equal token counts")
+    if tokens.ndim == labels.ndim == 2 and tokens.shape != labels.shape:
+        raise ValueError("Prepared tokens and labels disagree on token axis order")
     if tokens.device != labels.device:
         raise ValueError("Prepared tokens and labels must be on the same device")
     if not isinstance(kwargs, dict) or any(not isinstance(key, str) for key in kwargs):
@@ -75,10 +79,16 @@ class ModelExecutionCapabilities:
 
     logits: bool = True
     hidden_states: bool = False
+    hidden_size: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.logits) is not bool or type(self.hidden_states) is not bool:
             raise TypeError("Model execution capabilities must be boolean")
+        if self.hidden_size is not None:
+            if type(self.hidden_size) is not int or self.hidden_size <= 0:
+                raise ValueError("Declared hidden size must be a positive integer")
+            if not self.hidden_states:
+                raise ValueError("Declared hidden size requires hidden output support")
 
     def output_tensor(
         self, output: Any, *, hidden_states: bool = False

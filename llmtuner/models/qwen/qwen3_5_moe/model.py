@@ -34,7 +34,7 @@ from ...common.gradient_norm import (
     packed_expert_reference_norm_group,
     qkv_reference_norm_group,
 )
-from ...common.input_preparation import prepare_text_inputs
+from ...common.input_preparation import prepare_text_inputs, restore_text_batch_rows
 from ...common.validation import temporary_attention_mask
 from ...configuration import (
     configure_reference_experts,
@@ -43,6 +43,7 @@ from ...configuration import (
 )
 from ...contracts import DecoderStructure, GatedMLPStructure, MoEBlockContract
 from ...execution import ModelExecutionCapabilities
+from ..checkpoint import qwen35_text_configuration
 from ..routing import (
     Qwen3_5MoeFP32TopKRouter,
     Qwen3_5MoeTopKRouter,
@@ -619,7 +620,15 @@ class Qwen3_5MoeTextModel(reference.Qwen3_5MoeTextModel):
 class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
     """Model-owned text LM; vision-language execution is a separate contract."""
 
-    execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
+    @property
+    def execution_capabilities(self) -> ModelExecutionCapabilities:
+        return ModelExecutionCapabilities(
+            hidden_states=True, hidden_size=self.config.hidden_size
+        )
+
+    @property
+    def checkpoint_configuration(self) -> dict[str, object]:
+        return qwen35_text_configuration(self.config)
 
     decoder_structure = DecoderStructure(
         decoder="model",
@@ -908,7 +917,6 @@ class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
         batch: Any,
         *,
         parallel_dims: Any,
-        max_context_length: int | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Any]]:
         """Expose Qwen3.5 text input preparation to the Trainer."""
         validate_recurrent_mask(self.config)
@@ -916,7 +924,6 @@ class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
             self,
             batch,
             parallel_dims=parallel_dims,
-            max_context_length=max_context_length,
             preserve_batch_rows=True,
         )
         return inputs, labels, extra
@@ -950,16 +957,9 @@ class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
             else kwargs.get("attention_mask"),
             is_causal=kwargs.get("is_causal"),
         )
-        flat_input = input_ids is not None and input_ids.ndim == 1
-        if input_batch_shape is not None:
-            if not flat_input:
-                raise ValueError("input_batch_shape requires flat Trainer tokens")
-            input_ids = input_ids.reshape(input_batch_shape)
-            if labels is not None and labels.ndim == 1:
-                # The causal loss shifts within each row, never across samples.
-                labels = labels.reshape(input_batch_shape)
-        elif flat_input:
-            input_ids = input_ids.unsqueeze(0)
+        input_ids, labels, flat_input = restore_text_batch_rows(
+            input_ids, labels, batch_shape=input_batch_shape
+        )
         if positions is not None:
             if positions.ndim == 1:
                 # A sequence-length vector remains broadcastable across rows;

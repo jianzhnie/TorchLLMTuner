@@ -190,6 +190,39 @@ class DeepseekV4Attention(reference.DeepseekV4Attention):
         grouped = self.o_a_proj(grouped).flatten(2)
         return self.o_b_proj(grouped), weights
 
+    def validate_compressor_context_parallel(self, *, degree: int) -> None:
+        """Validate model-owned attention and indexer interfaces before CP install."""
+        if type(degree) is not int or degree < 1:
+            raise ValueError("Compressor CP degree must be a positive integer")
+        if self.layer_type not in (
+            "heavily_compressed_attention",
+            "compressed_sparse_attention",
+            "sliding_attention",
+        ):
+            raise ValueError("Compressor CP encountered an unsupported attention layer")
+        if self.num_heads % degree:
+            raise ValueError(
+                "Compressor CP requires query heads divisible by the CP degree"
+            )
+        if self.attention_dropout != 0:
+            raise ValueError(
+                "Compressor CP dropout random-stream equivalence is not implemented"
+            )
+        if self.layer_type == "sliding_attention":
+            return
+        compressor = self.compressor
+        if not callable(getattr(compressor, "compress_context_parallel", None)):
+            raise TypeError("Compressor CP requires model-owned compression")
+        if self.layer_type == "compressed_sparse_attention":
+            indexer = getattr(compressor, "indexer", None)
+            for name in (
+                "compress_context_parallel",
+                "validate_indexer_inputs",
+                "select_compressed_windows",
+            ):
+                if not callable(getattr(indexer, name, None)):
+                    raise TypeError(f"Compressor CP requires indexer interface {name}")
+
     def forward_compressor_context_parallel(
         self,
         hidden_states: torch.Tensor,

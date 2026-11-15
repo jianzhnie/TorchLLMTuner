@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from contextlib import AbstractContextManager
 from typing import Any
 
@@ -45,7 +44,7 @@ from ...common.gradient_norm import (
     ReferenceNormGroup,
     packed_expert_reference_norm_group,
 )
-from ...common.input_preparation import prepare_text_inputs
+from ...common.input_preparation import prepare_text_inputs, restore_text_batch_rows
 from ...common.validation import temporary_attention_mask
 from ...configuration import (
     configure_reference_experts,
@@ -56,7 +55,6 @@ from ...contracts import DecoderStructure
 from ...execution import ModelExecutionCapabilities
 from .attention import DeepseekV4Attention, validate_output_geometry
 from .compression import DeepseekV4CSACompressor, DeepseekV4HCACompressor
-from .context_parallel import deepseek_v4_cp_attention_forward
 from .hyperconnection import DeepseekV4HyperConnection, DeepseekV4HyperHead
 from .indexer import DeepseekV4Indexer
 from .normalization import DeepseekV4RMSNorm, DeepseekV4UnweightedRMSNorm
@@ -289,7 +287,12 @@ class DeepseekV4DecoderLayer(HFDeepseekV4DecoderLayer):
 class DeepseekV4Model(HFDeepseekV4Model):
     """Native DeepSeek V4 model with explicit layer and CP entry points."""
 
-    context_parallel_attention_class = DeepseekV4Attention
+    def validate_compressor_context_parallel(self, *, degree: int) -> None:
+        """Declare the stateless decoder's supported mask policy for CP."""
+        if type(degree) is not int or degree < 1:
+            raise ValueError("Compressor CP degree must be a positive integer")
+        if getattr(self.config, "attn_mask_type", "causal") != "causal":
+            raise ValueError("Compressor CP does not support packed document attention")
 
     def forward_compressor_context_parallel(
         self,
@@ -438,33 +441,61 @@ class DeepseekV4Model(HFDeepseekV4Model):
             last_hidden_state=hidden_states, past_key_values=return_cache
         )
 
-    def context_parallel_attention_forward(
-        self,
-        attention_module: nn.Module,
-        hidden_states: torch.Tensor,
-        position_embeddings: object,
-        query_indices: torch.Tensor,
-        cp_state: dict[str, object],
-        group: object,
-        gather_tensor: Callable[[torch.Tensor, object, int], torch.Tensor],
-        kwargs: dict[str, object],
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return deepseek_v4_cp_attention_forward(
-            attention_module,
-            hidden_states,
-            position_embeddings,
-            query_indices,
-            cp_state,
-            group,
-            gather_tensor,
-            kwargs,
-        )
-
 
 class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
     """Explicit DeepSeek V4 model chain with the native causal-LM contract."""
 
-    execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
+    @property
+    def execution_capabilities(self) -> ModelExecutionCapabilities:
+        return ModelExecutionCapabilities(
+            hidden_states=True, hidden_size=self.config.hidden_size
+        )
+
+    @property
+    def checkpoint_configuration(self) -> dict[str, object]:
+        """Declare V4 compression, routing and hyper-connection semantics."""
+        return {
+            name: getattr(self.config, name, None)
+            for name in (
+                "vocab_size",
+                "hidden_size",
+                "intermediate_size",
+                "num_hidden_layers",
+                "num_attention_heads",
+                "head_dim",
+                "q_lora_rank",
+                "o_lora_rank",
+                "o_groups",
+                "qk_rope_head_dim",
+                "hidden_act",
+                "mlp_bias",
+                "swiglu_limit",
+                "rms_norm_eps",
+                "attention_dropout",
+                "attn_mask_type",
+                "is_causal",
+                "sliding_window",
+                "max_position_embeddings",
+                "rope_parameters",
+                "layer_types",
+                "mlp_layer_types",
+                "compress_rates",
+                "index_head_dim",
+                "index_n_heads",
+                "index_topk",
+                "hc_mult",
+                "hc_eps",
+                "hc_sinkhorn_iters",
+                "num_local_experts",
+                "num_experts_per_tok",
+                "n_shared_experts",
+                "scoring_func",
+                "routed_scaling_factor",
+                "router_aux_loss_coef",
+                "tie_word_embeddings",
+                "pad_token_id",
+            )
+        }
 
     decoder_structure = DecoderStructure(
         decoder="model",
@@ -614,14 +645,10 @@ class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
         mesh: Any,
         *,
         load_balancer: str | None = None,
-        strategy: str = "kv_allgather",
-        mask_mesh: Any = None,
     ) -> None:
         """Record the mesh used by the model-owned DeepSeek CP attention path."""
         self.cp_mesh = mesh
         self._cp_load_balancer = load_balancer
-        self._cp_mask_mesh = mesh if mask_mesh is None else mask_mesh
-        self._cp_strategy = strategy
 
     def validation_context(
         self, *, mask_type: str | None
@@ -634,14 +661,12 @@ class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
         batch: Any,
         *,
         parallel_dims: Any,
-        max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Expose DeepSeek's text input contract to the Trainer."""
         return prepare_text_inputs(
             self,
             batch,
             parallel_dims=parallel_dims,
-            max_context_length=max_context_length,
             preserve_batch_rows=True,
         )
 
@@ -665,16 +690,9 @@ class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
             raise ValueError("Specify only one of positions and position_ids")
         if attention_masks is not None and kwargs.get("attention_mask") is not None:
             raise ValueError("Specify only one of attention_masks and attention_mask")
-        flat_input = input_ids is not None and input_ids.ndim == 1
-        if input_batch_shape is not None:
-            if not flat_input:
-                raise ValueError("input_batch_shape requires flat Trainer tokens")
-            input_ids = input_ids.reshape(input_batch_shape)
-            if labels is not None and labels.ndim == 1:
-                # Causal shifting must stop at each independent sample boundary.
-                labels = labels.reshape(input_batch_shape)
-        elif flat_input:
-            input_ids = input_ids.unsqueeze(0)
+        input_ids, labels, flat_input = restore_text_batch_rows(
+            input_ids, labels, batch_shape=input_batch_shape
+        )
         if positions is not None:
             if (
                 positions.ndim == 1

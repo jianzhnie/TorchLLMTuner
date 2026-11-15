@@ -11,6 +11,7 @@ index name: it writes that file, the DCP checkpointer probes for it, and one
 spelling means the two cannot drift apart.
 """
 
+CHECKPOINT_FORMAT = "checkpoint_format"
 MODEL = "model"
 OPTIMIZER = "optimizer"
 LR_SCHEDULER = "lr_scheduler"
@@ -24,6 +25,7 @@ RNG_STATE = "rng_state"
 SAFETENSORS_INDEX = "model.safetensors.index.json"
 
 __all__ = [
+    "CHECKPOINT_FORMAT",
     "DATALOADER",
     "EMA",
     "LR_SCHEDULER",

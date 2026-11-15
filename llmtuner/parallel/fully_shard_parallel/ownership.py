@@ -1,7 +1,7 @@
 """Track FSDP override ownership across module and parameter replacements.
 
-Only references and configuration metadata are retained. This mutable mapping
-belongs to one assembly operation; it does not shard tensors or own resources.
+Only references and configuration metadata are retained. Replacement history is
+borrowed from the local assembly layout; this consumer owns no separate mapping.
 """
 
 from __future__ import annotations
@@ -35,13 +35,18 @@ class FSDPPatternReferences:
     immediately before FSDP. Objects retained under renamed paths remain valid.
     Layout conversions that remove every alias require an explicit mapping;
     rejecting them prevents silently losing an exclusion or hook override.
+    Explicit mappings take precedence over reused source paths. Every mapped
+    target must still be registered, and wrapped module targets bind to their
+    outer execution boundary.
     """
 
-    def __init__(self, model: nn.Module, cfg: ParallelConfig) -> None:
+    def __init__(
+        self, model: nn.Module, cfg: ParallelConfig, *, replacements: ReplacementMap
+    ) -> None:
         self.cfg = cfg
         self.module_paths: dict[nn.Module, list[str]] = {}
         self.parameter_paths: dict[nn.Parameter, list[str]] = {}
-        self.replacements = ReplacementMap()
+        self.replacements = replacements
         for name, module in model.named_modules(remove_duplicate=False):
             self.module_paths.setdefault(module, []).append(canonical_fqn(name))
         for name, parameter in model.named_parameters(remove_duplicate=False):
@@ -87,7 +92,7 @@ class FSDPPatternReferences:
         modules: dict[nn.Module, nn.Module],
         parameters: dict[nn.Parameter, tuple[nn.Parameter, ...]],
     ) -> None:
-        """Compose replacement mappings across successive layout conversions.
+        """Validate exclusions, then publish to the shared replacement map.
 
         Overrides still refer to the original objects. Keep their targets at
         the latest conversion, including when one parameter splits into several.
@@ -123,36 +128,55 @@ class FSDPPatternReferences:
 
     def bind(self, model: nn.Module) -> ParallelConfig:
         modules = {}
+        first_module_paths: dict[int, str] = {}
         for name, module in model.named_modules(remove_duplicate=False):
             # The outer transparent wrapper owns the logical boundary.
-            modules.setdefault(canonical_fqn(name), module)
+            path = canonical_fqn(name)
+            modules.setdefault(path, module)
+            # Include wrapped inner modules so explicit replacements resolve
+            # to their outer execution boundary without losing identity.
+            first_module_paths.setdefault(id(module), path)
         parameters = {
             canonical_fqn(name): parameter
             for name, parameter in model.named_parameters(remove_duplicate=False)
         }
-        current_modules = set(modules.values())
         current_parameters = set(parameters.values())
-        first_module_paths: dict[int, str] = {}
-        for path, module in modules.items():
-            first_module_paths.setdefault(id(module), path)
+
+        def mapped_module_path(source: nn.Module | None, context: str) -> str | None:
+            if source not in self.replacements.module_targets:
+                return None
+            target = self.replacements.module_targets[source]
+            path = first_module_paths.get(id(target))
+            if path is None:
+                raise ValueError(
+                    f"{context}: module replacement target is no longer registered; "
+                    "refresh the assembly mapping"
+                )
+            return path
 
         def bind_parameters(
             exclusions: set[nn.Parameter], context: str
         ) -> set[nn.Parameter]:
             rebound = set()
             for parameter in exclusions:
-                targets = {
-                    parameters[path]
-                    for path in self.parameter_paths.get(parameter, ())
-                    if path in parameters
-                }
-                targets.update(
-                    target
-                    for target in self.replacements.parameter_targets.get(parameter, ())
-                    if target in current_parameters
-                )
-                if parameter in current_parameters:
-                    targets.add(parameter)
+                if parameter in self.replacements.parameter_targets:
+                    # An explicit conversion owns this identity. Its former
+                    # paths may now belong to unrelated parameters; never union
+                    # those registrations into a split/merged target set.
+                    targets = set(self.replacements.parameter_targets[parameter])
+                    if not targets <= current_parameters:
+                        raise ValueError(
+                            f"{context}: ignored_params replacement target is no "
+                            "longer registered; refresh the assembly mapping"
+                        )
+                else:
+                    targets = {
+                        parameters[path]
+                        for path in self.parameter_paths.get(parameter, ())
+                        if path in parameters
+                    }
+                    if parameter in current_parameters:
+                        targets.add(parameter)
                 if not targets:
                     raise ValueError(
                         f"{context}: ignored_params lost its registered paths "
@@ -165,24 +189,27 @@ class FSDPPatternReferences:
         overrides = {}
         for name, source in self.unit_options.items():
             pattern = canonical_fqn(name)
-            if pattern not in modules:
-                target = self.replacements.module_targets.get(
-                    self.unit_modules.get(name)
-                )
-                pattern = first_module_paths.get(id(target), pattern)
+            mapped = mapped_module_path(
+                self.unit_modules.get(name), f"FSDP pattern {pattern!r}"
+            )
+            if mapped is not None:
+                pattern = mapped
             options = source.copy()
             hook = options.get("hook_module")
             if isinstance(hook, nn.Module):
+                mapped = mapped_module_path(hook, f"FSDP hook for {pattern!r}")
                 targets = [
                     modules[path]
                     for path in self.module_paths.get(hook, ())
                     if path in modules
                 ]
-                if targets:
+                if mapped is not None:
+                    options["hook_module"] = modules[mapped]
+                elif targets:
                     options["hook_module"] = targets[0]
-                elif self.replacements.module_targets.get(hook) in current_modules:
-                    options["hook_module"] = self.replacements.module_targets[hook]
-                elif hook not in current_modules:
+                elif id(hook) in first_module_paths:
+                    options["hook_module"] = modules[first_module_paths[id(hook)]]
+                else:
                     raise ValueError(
                         f"FSDP pattern {pattern!r}: hook_module lost its registered "
                         "paths during model transformation; configure the "
@@ -202,11 +229,11 @@ class FSDPPatternReferences:
         ignored_names = []
         for name, source_module in self.ignored_modules.items():
             name = canonical_fqn(name)
-            if name not in modules and source_module is not None:
-                target = self.replacements.module_targets.get(
-                    source_module, source_module
-                )
-                name = first_module_paths.get(id(target), name)
+            mapped = mapped_module_path(source_module, f"FSDP ignored module {name!r}")
+            if mapped is not None:
+                name = mapped
+            elif name not in modules and source_module is not None:
+                name = first_module_paths.get(id(source_module), name)
             ignored_names.append(name)
         # A source subtree can split across owners (Kimi gate weight and
         # correction bias). Preserve moved parameters without excluding the

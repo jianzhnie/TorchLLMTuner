@@ -1,4 +1,4 @@
-"""Plan strict DCP loads, including supported legacy checkpoint formats."""
+"""Plan strict DCP loads with canonical compiled names and optimizer moments."""
 
 from __future__ import annotations
 
@@ -9,34 +9,26 @@ from torch.distributed.checkpoint._nested_dict import set_element
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.planner import ReadItem
 
-from ....utils.logging import get_logger
 from ....utils.module_names import canonical_fqn
-from ..core.checkpoint_keys import DATALOADER, OPTIMIZER, RNG_STATE
-
-logger = get_logger(__name__)
+from ..core.checkpoint_keys import CHECKPOINT_FORMAT, OPTIMIZER, RNG_STATE
 
 
 class CheckpointLoadPlanner(DefaultLoadPlanner):
-    """Load legacy layout/RNG metadata and compiled names with strict state keys."""
+    """Load requested state keys strictly, adapting compiled names and AMSGrad."""
 
     def create_local_plan(self):
         assert self.metadata is not None
         saved_keys = self.metadata.state_dict_metadata
+        format_keys = {f"{CHECKPOINT_FORMAT}.name", f"{CHECKPOINT_FORMAT}.version"}
+        versioned = bool(format_keys & self.state_dict.keys())
+        if versioned and not format_keys <= saved_keys.keys():
+            raise ValueError(
+                "Native training checkpoint has no complete format record; "
+                "use an explicit model-only import for unversioned weights"
+            )
         # A flat planner otherwise shares this dictionary with its caller.
         self.state_dict = dict(self.state_dict)
         self.compiled_destinations: dict[str, str] = {}
-        # Older synthetic loaders stored one shared cursor. Map that scalar to
-        # this rank's destination; new rank-qualified checkpoints remain strict.
-        steps_key = f"{DATALOADER}.steps"
-        if steps_key in saved_keys and self.flatten_state_dict:
-            for key in list(self.state_dict):
-                if key.startswith(steps_key + "."):
-                    self.state_dict[steps_key] = self.state_dict.pop(key)
-                    self.mappings[steps_key] = self.mappings.pop(key)
-                    logger.warning(
-                        "Legacy synthetic checkpoint has one shared cursor; "
-                        "rank-local positions cannot be recovered."
-                    )
         saved_names: dict[str, str] = {}
         for saved_key in saved_keys:
             name = canonical_fqn(saved_key, wrapper_segments=("_orig_mod",))
@@ -99,35 +91,7 @@ class CheckpointLoadPlanner(DefaultLoadPlanner):
                 self.original_state_dict[key] = destination
         rng_prefix = f"{RNG_STATE}."
         self.has_rng_state = any(key.startswith(rng_prefix) for key in saved_keys)
-        if not self.has_rng_state:
-            self._drop_legacy_keys(
-                rng_prefix,
-                "Legacy checkpoint has no RNG state; random training "
-                "cannot resume with exact stream continuity.",
-            )
-        prefix = f"{DATALOADER}.batch_layout."
-        # Multi-DP synthetic cursors flatten to steps.<rank>, so no bare
-        # steps key remains in DCP metadata. They are still the same supported
-        # pre-layout format as the historical scalar cursor.
-        has_saved_steps = steps_key in saved_keys or any(
-            key.startswith(steps_key + ".") for key in saved_keys
-        )
-        if (f"{DATALOADER}.version" in saved_keys or has_saved_steps) and not any(
-            key.startswith(prefix) for key in saved_keys
-        ):
-            self._drop_legacy_keys(
-                prefix,
-                "Legacy dataloader checkpoint has no batch layout metadata; "
-                "its saved layout cannot be validated.",
-            )
         return super().create_local_plan()
-
-    def _drop_legacy_keys(self, prefix: str, warning: str) -> None:
-        keys = [key for key in self.state_dict if key.startswith(prefix)]
-        if keys:
-            logger.warning(warning)
-            for key in keys:
-                del self.state_dict[key]
 
     def load_bytes(self, read_item: ReadItem, value: io.BytesIO) -> None:
         if not self.flatten_state_dict:

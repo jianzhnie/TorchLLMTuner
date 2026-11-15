@@ -46,6 +46,16 @@ def _kcp_runtime():
     return causal_conv1d, chunk_kda, build_cp_context
 
 
+def _kda_execution(module: nn.Module) -> tuple[Callable, Callable]:
+    validator = getattr(module, "validate_context_parallel_inputs", None)
+    executor = getattr(module, "forward_context_parallel", None)
+    if not callable(validator) or not callable(executor):
+        raise TypeError(
+            "KCP KDA requires model-owned validation and forward interfaces"
+        )
+    return validator, executor
+
+
 def kcp_kda_forward(
     original_forward: Callable[..., torch.Tensor], group: dist.ProcessGroup
 ) -> Callable[..., torch.Tensor]:
@@ -60,12 +70,7 @@ def kcp_kda_forward(
         **kwargs: Any,
     ) -> torch.Tensor:
         with synchronize_local_errors("KCP KDA input validation", group=group):
-            validator = getattr(module, "validate_context_parallel_inputs", None)
-            executor = getattr(module, "forward_context_parallel", None)
-            if not callable(validator) or not callable(executor):
-                raise TypeError(
-                    "KCP KDA requires model-owned validation and forward interfaces"
-                )
+            validator, executor = _kda_execution(module)
             kernel_size = validator(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -209,6 +214,12 @@ def kcp_mla_attention(group):
     return forward
 
 
+def _validate_kcp_mask(model: nn.Module) -> None:
+    model_config = getattr(model, "config", None)
+    if getattr(model_config, "attn_mask_type", "causal") == "block_causal":
+        raise ValueError("KCP does not support packed document attention")
+
+
 def resolve_kcp_plan(
     model: nn.Module, *, degree: int, bindings: FullPlanBindings | None = None
 ) -> ParallelPlan:
@@ -218,6 +229,7 @@ def resolve_kcp_plan(
     """
     if type(degree) is not int or degree < 1:
         raise ValueError("KCP degree must be a positive integer")
+    _validate_kcp_mask(model)
     structure = getattr(model, "decoder_structure", None)
     if not isinstance(structure, DecoderStructure):
         raise TypeError("KCP requires a model-owned DecoderStructure")
@@ -232,8 +244,10 @@ def resolve_kcp_plan(
         raise ValueError("KCP requires declared Kimi KDA/MLA attention modules")
     modules = [m for m in attentions if layouts[m] == "kda_state"]
     mla_modules = [m for m in attentions if layouts[m] == "mla_ulysses"]
-    if not modules and not (structure is not None and mla_modules):
+    if not modules and not mla_modules:
         raise ValueError("KCP selected but no Kimi Delta Attention module was found")
+    for module in modules:
+        _kda_execution(module)
     for module in mla_modules:
         if module.num_heads % degree:
             raise ValueError("KCP MLA heads must be divisible by the CP degree")
@@ -260,18 +274,19 @@ def apply_kcp(
     model: nn.Module,
     cp_mesh: DeviceMesh,
     *,
-    resolved_plan: ParallelPlan | None = None,
+    resolved_plan: ParallelPlan,
 ) -> int:
     """Prepare all KCP wrappers, then install them without stacking wrappers.
 
     Runtime/group resources remain explicit. A pre-resolved plan belongs to the
     current local instance and must be rebound after PP or parameter conversion.
     """
-    degree = cp_mesh.size() if cp_mesh is not None else 1
-    plan = resolved_plan or resolve_kcp_plan(model, degree=degree)
+    degree = cp_mesh.size()
+    plan = resolved_plan
     if plan.stage != "cp" or plan.implementation != "kcp" or plan.degree != degree:
         raise ValueError("KCP plan does not match the requested execution")
     plan.validate_binding(model)
+    _validate_kcp_mask(model)
     structure = plan.decoder_structure
     if structure is None:
         raise ValueError("KCP execution requires a declared DecoderStructure")
@@ -292,15 +307,17 @@ def apply_kcp(
             if module.num_heads % degree:
                 raise ValueError("KCP MLA heads must be divisible by the CP degree")
         elif target.layout == "kda_state":
+            _kda_execution(module)
             kda_count += 1
         else:
             raise ValueError(f"Unsupported KCP target layout: {target.layout}")
     expected = {id(module) for module in structure.bind_attentions(model)}
     if seen != expected:
         raise ValueError("KCP plan must cover all declared attention slots")
-    if not kda_count and not seen:
-        raise ValueError("KCP plan requires at least one KDA target")
-    _kcp_runtime()
+    if not seen:
+        raise ValueError("KCP plan requires at least one attention target")
+    if kda_count:
+        _kcp_runtime()
     group = cp_mesh.get_group()
     pending = []
     for target in plan.targets:

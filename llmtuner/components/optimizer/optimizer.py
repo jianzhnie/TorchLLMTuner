@@ -19,47 +19,23 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
-from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
 
 from ...accelerator.collectives import all_reduce, synchronize_local_errors
 from ...accelerator.device import device_type, get_current_device
 from ...accelerator.distributed import get_comm_device
-from ...parallel.assembly import (
-    ModelPartLayout,
-    capture_model_part_layouts,
-    validate_model_part_layouts,
-)
-from ...parallel.expert_parallel.checkpointing import (
-    expert_shard_map,
-    gather_expert_state,
-    load_expert_state,
-    restore_sharded_expert_state,
-    shard_expert_state,
-)
-from ...parallel.tensor_parallel.checkpointing import (
-    gather_tensor_parallel_state,
-    load_tensor_parallel_state,
-    restore_disjoint_tp_ep_state,
-    restore_sharded_tensor_parallel_state,
-    shard_disjoint_tp_ep_state,
-    shard_tensor_parallel_state,
-)
+from ...parallel.assembly import ModelPartLayout
 from ...utils.logging import get_logger
-from ..checkpointer.core.chunked_tensor import ChunkedCheckpointTensor
 from .adamw_swap import AdamWSwap
+from .checkpoint_state import OptimizerCheckpointState
 from .flex_shard.dist_muon import DistMuon
-from .state_dict import (
-    collect_local_optimizer_state,
-    unflatten_optim_state_dict,
-)
 from .state_residency import (
     install_state_residency,
     validate_virtual_optimizer_groups,
@@ -129,7 +105,7 @@ def disable_unsupported_fused_npu_updates(
             group["fused"] = False
 
 
-class OptimizersContainer(Optimizer, Stateful):
+class OptimizersContainer(OptimizerCheckpointState, Optimizer):
     """One optimizer per (model part, optimizer name), driven as a single one.
 
     The training loop should not know how many optimizers exist, so this is
@@ -174,6 +150,9 @@ class OptimizersContainer(Optimizer, Stateful):
             construction errors; defaults to the PP group. Trainer supplies world
             so failures also reach other data replicas. All members must construct
             together, while rule matching continues to use the PP group.
+        on_acquired: optional owner callback, invoked before inner resources are
+            created. It must retain this container without raising or device work;
+            the owner can retry close if construction and cleanup both fail.
     """
 
     optimizers: list[Optimizer]
@@ -191,14 +170,17 @@ class OptimizersContainer(Optimizer, Stateful):
         sharded_tensor_parallel: bool = False,
         sharded_expert_parallel: bool = False,
         runtime_layouts: tuple[ModelPartLayout, ...] = (),
+        on_acquired: Callable[[OptimizersContainer], None] | None = None,
     ) -> None:
         self.optimizers = []
         self.model_parts = list(model_parts)
         self.sharded_tensor_parallel = sharded_tensor_parallel
         self.sharded_expert_parallel = sharded_expert_parallel
         self.state_residency = config.state_residency
-        self.runtime_layouts = tuple(runtime_layouts)
-        self._bound_layout_parameters: tuple[dict[str, nn.Parameter], ...] | None = None
+        # close() is usable once the inner-owner list exists. Hand off before
+        # planning or constructors can fail, so failed cleanup remains reachable.
+        if on_acquired is not None:
+            on_acquired(self)
 
         pipeline_group = (
             pipeline_mesh.get_group()
@@ -213,11 +195,8 @@ class OptimizersContainer(Optimizer, Stateful):
             if error_group is not None
             else nullcontext()
         ):
-            if not self.runtime_layouts:
-                self.runtime_layouts = capture_model_part_layouts(self.model_parts)
-            self._validate_runtime_layouts()
-            self._bound_layout_parameters = tuple(
-                dict(layout.parameter_bindings) for layout in self.runtime_layouts
+            self._bind_runtime_layouts(
+                runtime_layouts, validate_restore_groups=self._validate_restore_policy
             )
             impl_kwargs = self._build_impl_kwargs(config)
             model_group_plans = [
@@ -291,6 +270,11 @@ class OptimizersContainer(Optimizer, Stateful):
                 for name in groups_by_opt_name:
                     if name not in optimizer_factories:
                         raise NotImplementedError(f"Optimizer {name} not added.")
+                    if name == "DistMuon" and config.state_residency != "device":
+                        raise ValueError(
+                            "DistMuon requires optimizer.state_residency='device'; "
+                            "npu_virtual currently supports Adam/AdamW moments only."
+                        )
 
             for part_idx, groups_by_opt_name in enumerate(model_group_plans):
                 for opt_name, groups in groups_by_opt_name.items():
@@ -313,11 +297,6 @@ class OptimizersContainer(Optimizer, Stateful):
                                 f"{opt_name} optimizer_kwargs contain unknown options: "
                                 f"{sorted(unknown)}"
                             )
-                    if opt_name == "DistMuon" and config.state_residency != "device":
-                        raise ValueError(
-                            "DistMuon requires optimizer.state_residency='device'; "
-                            "npu_virtual currently supports Adam/AdamW moments only."
-                        )
                     install_state_residency(optimizer, config.state_residency)
                     self._log_optimizer(optimizer, part_idx, groups.patterns)
 
@@ -328,14 +307,15 @@ class OptimizersContainer(Optimizer, Stateful):
         """Release returned inner optimizers on local or coordinated failure."""
         try:
             yield
-        except BaseException:
+        except BaseException as construction_error:
             try:
                 self.close()
-            except BaseException:
+            except BaseException as cleanup_error:
                 try:
                     logger.exception("Optimizer cleanup failed during construction")
                 except BaseException:
                     pass
+                raise construction_error from cleanup_error
             raise
 
     @staticmethod
@@ -376,8 +356,8 @@ class OptimizersContainer(Optimizer, Stateful):
         """Partition a model's parameters into per-optimizer param groups.
 
         Each parameter is claimed by the first ``ParamGroupConfig`` whose pattern
-        any of its registered names matches, so order matters and a catch-all
-        belongs last. Shared parameters are assigned once by identity.
+        any of its canonical registered aliases matches, so order matters and
+        a catch-all belongs last. Shared parameters are assigned once by identity.
 
         Returns groups keyed by optimizer name, paired with diagnostic patterns.
         The patterns stay out of the group dict on purpose -- they are for the
@@ -389,13 +369,14 @@ class OptimizersContainer(Optimizer, Stateful):
         """
         groups: dict[str, _OptimizerGroups] = defaultdict(_OptimizerGroups)
         claimed: set[int] = set()
+        state_names = layout.state_parameter_names
         trainable_parameters = [
-            (name, param)
-            for name, param in layout.parameter_bindings.items()
+            (state_names[path], param)
+            for path, param in layout.parameter_bindings.items()
             if param.requires_grad
         ]
 
-        layout_names = layout.canonical_parameter_names
+        layout_names = layout.parameter_state_names
 
         for config_index, param_group_config in enumerate(param_group_configs):
             reserved = {
@@ -415,7 +396,7 @@ class OptimizersContainer(Optimizer, Stateful):
                     # Match any alias, but checkpoint under the first registered
                     # name so group pattern changes do not rename optimizer state.
                     params.append(param)
-                    param_names.append(layout_names[name])
+                    param_names.append(layout_names[param])
                     claimed.add(id(param))
 
             if not params:
@@ -568,18 +549,6 @@ class OptimizersContainer(Optimizer, Stateful):
     def __iter__(self) -> Iterator[Optimizer]:
         return iter(self.optimizers)
 
-    def _validate_runtime_layouts(self) -> None:
-        """Check the same final ownership before grouping, save, and restore."""
-        bound = self._bound_layout_parameters
-        if bound is not None and len(bound) != len(self.runtime_layouts):
-            raise ValueError("Optimizer runtime layouts changed after construction")
-        if len(self.runtime_layouts) != len(self.model_parts):
-            raise ValueError("Optimizer layouts must match model parts")
-        validate_model_part_layouts(self.model_parts, self.runtime_layouts)
-        if bound is not None:
-            for layout, parameters in zip(self.runtime_layouts, bound, strict=True):
-                layout.validate_parameter_snapshot(parameters, consumer="Optimizer")
-
     def __len__(self) -> int:
         return len(self.optimizers)
 
@@ -604,6 +573,20 @@ class OptimizersContainer(Optimizer, Stateful):
         for optimizer in self.optimizers:
             optimizer.zero_grad(set_to_none=set_to_none)
 
+    @property
+    def observation_metrics(self) -> dict[str, float]:
+        """Sum additive local counters declared by inner optimizer services.
+
+        Inner services own names, units and counter lifetimes. Equal metric
+        names must represent additive values across model parts; this property
+        neither synchronizes ranks nor resets the underlying counters.
+        """
+        metrics: dict[str, float] = {}
+        for optimizer in self.optimizers:
+            for name, value in getattr(optimizer, "observation_metrics", {}).items():
+                metrics[name] = metrics.get(name, 0.0) + float(value)
+        return metrics
+
     def close(self) -> None:
         """Close owned optimizer resources, retaining failed owners for retry."""
         first_error: BaseException | None = None
@@ -623,175 +606,10 @@ class OptimizersContainer(Optimizer, Stateful):
         if first_error is not None:
             raise first_error
 
-    def state_dict(self) -> dict[str, Any]:
-        """A flat, FQN-keyed state dict covering every inner optimizer.
-
-        Side effect: if an inner optimizer has not stepped yet,
-        ``init_optim_state`` materializes its state first (a zero-gradient,
-        zero-lr step) so DCP has tensors to read, and to write into on load. It
-        leaves parameters alone, and is a no-op once state exists. All
-        distributed ranks must participate: local serialization errors are
-        coordinated before any TP/EP checkpoint gathering. State-dict and
-        initialization hooks must not communicate inside this local phase.
-        """
-        with synchronize_local_errors("Optimizer checkpoint construction"):
-            self._validate_runtime_layouts()
-            result = collect_local_optimizer_state(self.optimizers)
-        # Expert optimizer states are rank-heterogeneous like the expert
-        # weights themselves; gather them to the full tensors the checkpoint
-        # stores (parallel/expert_parallel/checkpointing.py).
-        if self.sharded_tensor_parallel and self.sharded_expert_parallel:
-            return shard_disjoint_tp_ep_state(result, model_parts=self.model_parts)
-        transform = (
-            shard_tensor_parallel_state
-            if self.sharded_tensor_parallel
-            else gather_tensor_parallel_state
-        )
-        expert_transform = (
-            shard_expert_state if self.sharded_expert_parallel else gather_expert_state
-        )
-        return transform(
-            expert_transform(
-                result,
-                shard_map=expert_shard_map(self.model_parts),
-                model_parts=self.model_parts,
-            ),
-            model_parts=self.model_parts,
-        )
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Restore checkpoint values after all ranks validate local state.
-
-        All distributed ranks must participate. Validation failure prevents
-        applying checkpoint values; lazy optimizer state may be initialized.
-        Local load and DistMuon plan-rebuild errors are coordinated across the
-        world before any rank validates a rebuilt plan over its optimizer mesh.
-        Other load hooks must be collective-free. Plan validation errors retain
-        their mesh-local collective contract.
-        Exceptions from load hooks or tensor copies are not atomic and require
-        restoring the complete training checkpoint before continuing.
-        """
-        with synchronize_local_errors("Optimizer restore layout validation"):
-            self._validate_runtime_layouts()
-        # init_optim_state must run first: the unflattening step reads each
-        # optimizer's live state to learn which state tensors to expect, so a
-        # fresh optimizer would find nothing to write into.
-        local_state_validated = False
-        if self.sharded_tensor_parallel and self.sharded_expert_parallel:
-            with synchronize_local_errors(
-                "Optimizer joint chunk destination construction"
-            ):
-                local_state = collect_local_optimizer_state(self.optimizers)
-            local_state_validated = True
-            state_dict = restore_disjoint_tp_ep_state(
-                state_dict, local_state=local_state, model_parts=self.model_parts
-            )
-        elif self.sharded_expert_parallel:
-            with synchronize_local_errors("Optimizer EP destination construction"):
-                local_state = collect_local_optimizer_state(self.optimizers)
-            local_state_validated = True
-            state_dict = restore_sharded_expert_state(
-                state_dict,
-                local_state=local_state,
-                shard_map=expert_shard_map(self.model_parts),
-                model_parts=self.model_parts,
-                coordinate_errors=True,
-            )
-            state_dict = load_tensor_parallel_state(
-                state_dict, model_parts=self.model_parts
-            )
-        elif self.sharded_tensor_parallel and any(
-            isinstance(value, ChunkedCheckpointTensor) for value in state_dict.values()
-        ):
-            with synchronize_local_errors("Optimizer chunk destination construction"):
-                local_state = collect_local_optimizer_state(self.optimizers)
-            local_state_validated = True
-            local_state = gather_expert_state(
-                local_state,
-                shard_map=expert_shard_map(self.model_parts),
-                model_parts=self.model_parts,
-            )
-            state_dict = restore_sharded_tensor_parallel_state(
-                state_dict, local_state=local_state, model_parts=self.model_parts
-            )
-        else:
-            state_dict = load_tensor_parallel_state(
-                state_dict, model_parts=self.model_parts
-            )
-        if not self.sharded_expert_parallel:
-            state_dict = load_expert_state(
-                state_dict,
-                shard_map=expert_shard_map(self.model_parts),
-                model_parts=self.model_parts,
-            )
-        # TP/EP layout communication above stays outside this local boundary.
-        # Every rank must validate before peers apply state and enter the next
-        # checkpoint component's collectives. State initialization hooks must
-        # be local; communication inside hooks cannot be coordinated here.
-        with synchronize_local_errors("Optimizer checkpoint validation"):
-            # Dense restore has not built local destinations yet. Sharded paths
-            # already collected them before layout collectives; flattening them
-            # again here only duplicates work over every optimizer moment.
-            if not local_state_validated:
-                collect_local_optimizer_state(self.optimizers)
-            optimizer_states = [
-                unflatten_optim_state_dict(optimizer, flat_state=state_dict)
-                for optimizer in self.optimizers
-            ]
-            for optimizer, optimizer_state in zip(
-                self.optimizers, optimizer_states, strict=True
-            ):
-                if isinstance(optimizer, DistMuon | AdamWSwap):
-                    optimizer.validate_param_groups(optimizer_state["param_groups"])
-            if getattr(self, "state_residency", "device") == "npu_virtual":
-                # Check every optimizer before any load hook applies values.
-                # Keep policy failures inside the rank-coordinated boundary.
-                for optimizer_state in optimizer_states:
-                    validate_virtual_optimizer_groups(optimizer_state["param_groups"])
-        # DistMuon plan construction and buffer allocation are local, but its
-        # final validation communicates over optimizer mesh groups. Defer that
-        # collective until every rank has completed local loading.
-        communicating_load = torch.tensor(
-            int(any(isinstance(optimizer, DistMuon) for optimizer in self.optimizers)),
-            device=get_comm_device(),
-            dtype=torch.int32,
-        )
-        all_reduce(communicating_load, op="max")
-        muon_optimizers = [
-            optimizer
-            for optimizer in self.optimizers
-            if isinstance(optimizer, DistMuon)
-        ]
-        for optimizer in muon_optimizers:
-            optimizer._defer_load_plan_validation = True
-        try:
-            # Ordinary hooks and deferred DistMuon rebuilds must not
-            # communicate here. Loading is not atomic on local failure.
-            with synchronize_local_errors("Optimizer checkpoint application"):
-                for optimizer, optimizer_state in zip(
-                    self.optimizers, optimizer_states, strict=True
-                ):
-                    optimizer.load_state_dict(optimizer_state)
-        finally:
-            for optimizer in muon_optimizers:
-                optimizer._defer_load_plan_validation = False
-
-        if communicating_load.item():
-            # PP stages without local experts skip these subgroup collectives.
-            # Mesh participants must expose matching optimizer plans/order.
-            plan_error: BaseException | None = None
-            for optimizer in muon_optimizers:
-                try:
-                    optimizer._validate_plan_across_ranks()
-                except BaseException as error:
-                    if plan_error is None:
-                        plan_error = error
-            # Subgroup validation may fail on only some pipeline/replica groups.
-            # Rejoin the world before any rank advances to the next checkpoint
-            # component. The failed load is not rolled back.
-            with synchronize_local_errors("Optimizer mesh plan validation"):
-                if plan_error is not None:
-                    raise plan_error
+    def _validate_restore_policy(self, groups: Iterable[Mapping[str, Any]]) -> None:
+        """Apply optimizer-owned residency constraints before checkpoint writes."""
+        if self.state_residency == "npu_virtual":
+            validate_virtual_optimizer_groups(groups)
 
     def _initialize_optimizer_interface(
         self, all_params: Sequence[torch.Tensor]

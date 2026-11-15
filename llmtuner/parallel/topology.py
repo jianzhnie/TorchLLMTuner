@@ -10,7 +10,7 @@ reduces over.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
@@ -27,9 +27,35 @@ logger = get_logger(__name__)
 __all__ = [
     "MESH_AXES",
     "ParallelTopology",
+    "ParallelTopologySnapshot",
     "build_device_mesh",
     "resolve_parallel_topology",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class ParallelTopologySnapshot:
+    """Resolved degrees without process-group ownership or mutable mesh caches."""
+
+    dp_replicate: int = 1
+    dp_shard: int = 1
+    cp: int = 1
+    tp: int = 1
+    pp: int = 1
+    ep: int = 1
+    world_size: int = 1
+    cp_kv: int = 1
+    cp_ulysses: int = 1
+
+    def __post_init__(self) -> None:
+        if self.dp_shard < 1:
+            raise ValueError("Topology snapshot requires a resolved dp_shard degree")
+        # Share degree invariants; this creates no process groups or meshes.
+        ParallelTopology(**asdict(self))
+
+    @classmethod
+    def capture(cls, topology: ParallelTopology) -> ParallelTopologySnapshot:
+        return cls(**{item.name: getattr(topology, item.name) for item in fields(cls)})
 
 
 @dataclass

@@ -473,22 +473,19 @@ def resolve_tp_targets(
     fully replicated while the run reported a healthy TP setup -- both are
     loud errors here, raised before any process-group access.
     """
-    # A PP-local part may have no ownership of an otherwise valid override.
-    configured_plan = tp_sharding.resolve_tp_overrides(
-        model, cfg=cfg, allow_unmatched=cfg.pp_size > 1
-    )
-    raw_plan = tp_sharding.model_tp_config(model) if plan is None else plan
-    if configured_plan:
-        # Matching uses the first pattern; explicit overrides must come first.
-        raw_plan = {
-            **configured_plan,
-            **{
-                key: value
-                for key, value in raw_plan.items()
-                if key not in configured_plan
-            },
-        }
+    effective_plan = tp_sharding.resolve_effective_tp_plan(model, cfg=cfg, plan=plan)
+    return _resolve_tp_targets(model, cfg=cfg, raw_plan=effective_plan)
 
+
+def _resolve_tp_targets(
+    model: nn.Module,
+    *,
+    cfg: ParallelConfig,
+    raw_plan: Mapping[str, str | tp_sharding.ShardingConfig],
+) -> tuple[
+    list[tuple[str, nn.Linear, tp_sharding.ShardingConfig]], list[tuple[str, nn.Module]]
+]:
+    """Bind dense and expert targets from the already merged effective plan."""
     sharding_plan = tp_sharding.resolve_tp_sharding_plan(model, plan=raw_plan)
     if not sharding_plan:
         raise ValueError(
@@ -723,14 +720,12 @@ def realize_moe_blocks_tp(
 
 def validate_tp_model_options(model: nn.Module) -> None:
     """Reject incompatible model policies even before mesh availability checks."""
-    if any(
-        getattr(getattr(module, "config", None), "attention_backend", "auto")
-        == "eager_flex"
-        for module in model.modules()
-    ):
-        compatibility.eager_flex_parallel("TP")
-    if any(getattr(module, "_llmtuner_fused_qkv", False) for module in model.modules()):
-        compatibility.fused_qkv_tp()
+    for module in model.modules():
+        validate = getattr(module, "validate_tensor_parallel", None)
+        if validate is not None:
+            if not callable(validate):
+                raise TypeError("validate_tensor_parallel must be callable")
+            validate()
 
 
 def resolve_tp_plan(
@@ -760,17 +755,8 @@ def resolve_tp_plan(
     ):
         validate(tp_degree=cfg.tp_size, ep_degree=cfg.ep_size)
     # Resolve targets once before accessing process groups or changing weights.
-    raw_plan = tp_sharding.model_tp_config(model) if plan is None else plan
-    if (
-        plan is None
-        and getattr(model, "decoder_structure", None) is not None
-        and not raw_plan
-    ):
-        raise UnsupportedCombinationError(
-            f"{type(model).__name__} must declare tp_config or receive an explicit "
-            "TP plan; an empty plan would silently leave the model replicated"
-        )
-    targets, moe_blocks = resolve_tp_targets(model, cfg=cfg, plan=raw_plan)
+    raw_plan = tp_sharding.resolve_effective_tp_plan(model, cfg=cfg, plan=plan)
+    targets, moe_blocks = _resolve_tp_targets(model, cfg=cfg, raw_plan=raw_plan)
     vocab_targets = tp_sharding.resolve_vocab_parallel_targets(model, raw_plan)
 
     # A head count that does not divide ``tp`` has no valid local head split,
@@ -1119,6 +1105,36 @@ def apply_tp(
             group=group,
             use_symm_mem=use_symm_mem,
         )
+        weight = wrapped._parameters.get("weight")
+        if not isinstance(weight, nn.Parameter):
+            raise TypeError(
+                f"TP replacement {module_path!r} must register a weight parameter"
+            )
+        parameter_paths = tuple(
+            name for name, _ in wrapped.named_parameters(remove_duplicate=False)
+        )
+        if parameter_paths != ("weight",):
+            raise ValueError(
+                f"TP replacement {module_path!r} must expose only its weight "
+                f"parameter; found registrations {parameter_paths!r}. "
+                "Additional parameters require an explicit transformation contract"
+            )
+        expected_shape = list(inner.weight.shape)
+        expected_shape[0 if spec.kind == "colwise" else 1] //= tp_size
+        if tuple(weight.shape) != tuple(expected_shape):
+            raise ValueError(
+                f"TP replacement {module_path!r} weight shape {tuple(weight.shape)} "
+                f"does not match declared shard {tuple(expected_shape)}"
+            )
+        if (
+            weight.dtype != inner.weight.dtype
+            or weight.device != inner.weight.device
+            or weight.requires_grad != inner.weight.requires_grad
+        ):
+            raise ValueError(
+                f"TP replacement {module_path!r} must preserve weight dtype, "
+                "device and requires_grad"
+            )
         wrapped.train(inner.training)
         wrapped._tp_init_specs = {
             "weight": tp_linear.TPInitializationSpec(

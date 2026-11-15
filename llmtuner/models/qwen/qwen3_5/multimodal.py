@@ -15,6 +15,7 @@
 """Qwen3.5 model with portable core operators and the Turbo forward and loss."""
 
 from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +31,7 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import (
 )
 
 from ...execution import ModelExecutionCapabilities
+from ..checkpoint import qwen35_multimodal_configuration
 from ..ops import (
     causal_conv1d,
     causal_conv1d_update,
@@ -79,15 +81,9 @@ class Qwen3_5GatedDeltaNet(hf.Qwen3_5GatedDeltaNet):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-        self.gdn_implementation = getattr(
-            config,
-            "gdn_implementation",
-            "auto" if getattr(config, "use_fused_gdn", False) else "eager",
-        )
+        self.gdn_implementation = getattr(config, "gdn_implementation", "eager")
         self.causal_conv1d_implementation = getattr(
-            config,
-            "causal_conv1d_implementation",
-            "auto" if getattr(config, "use_fused_causal_conv1d", False) else "eager",
+            config, "causal_conv1d_implementation", "eager"
         )
 
     def forward(
@@ -474,9 +470,19 @@ class Qwen3_5Model(hf.Qwen3_5Model):
 
 
 class Qwen3_5ForConditionalGeneration(hf.Qwen3_5ForConditionalGeneration):
-    execution_capabilities = ModelExecutionCapabilities(
-        logits=True, hidden_states=False
-    )
+    @property
+    def checkpoint_configuration(self) -> dict[str, object]:
+        return qwen35_multimodal_configuration(self.config)
+
+    @property
+    def execution_capabilities(self) -> ModelExecutionCapabilities:
+        return ModelExecutionCapabilities(
+            hidden_states=True, hidden_size=self.config.text_config.hidden_size
+        )
+
+    @property
+    def vocab_size(self) -> int:
+        return self.config.text_config.vocab_size
 
     def __init__(self, config: Qwen3_5Config) -> None:
         hf.Qwen3_5PreTrainedModel.__init__(self, config)
@@ -485,6 +491,32 @@ class Qwen3_5ForConditionalGeneration(hf.Qwen3_5ForConditionalGeneration):
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
         self.post_init()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        *args: Any,
+        skip_lm_head: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Keep HF logits behavior and expose uncached full hidden states."""
+        if not skip_lm_head:
+            return super().forward(input_ids, *args, **kwargs)
+        if args:
+            raise TypeError("Hidden-state output requires keyword model arguments")
+        if (
+            kwargs.get("past_key_values") is not None
+            or kwargs.get("cache_position") is not None
+            or kwargs.get("use_cache", False)
+        ):
+            raise ValueError("Hidden-state training output does not support KV cache")
+        # These options belong to the LM head; hidden output keeps every row
+        # and always returns a tensor, independently of the public output format.
+        for name in ("labels", "logits_to_keep", "return_dict"):
+            kwargs.pop(name, None)
+        kwargs["use_cache"] = False
+        outputs = self.model(input_ids=input_ids, return_dict=True, **kwargs)
+        return outputs.last_hidden_state
 
 
 __all__ = ["Qwen3_5ForConditionalGeneration"]

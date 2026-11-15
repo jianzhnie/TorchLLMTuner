@@ -179,7 +179,19 @@ class Qwen3MoeAttention(HFQwen3MoeAttention):
             self.head_dim, config.rms_norm_eps, backend=backend
         )
         self.sliding_window = getattr(config, "sliding_window", None)
-        self._llmtuner_fused_qkv = projection == "fused"
+        self.qkv_projection = projection
+
+    def validate_tensor_parallel(self) -> None:
+        """Reject fused execution before TP installs projection collectives.
+
+        This local policy check must not mutate the module or communicate.
+        """
+        if self.qkv_projection == "fused":
+            raise UnsupportedCombinationError(
+                "model.qkv_projection='fused' does not yet support tensor parallelism; "
+                "use separate projections until fused collective boundaries "
+                "are adapted."
+            )
 
     def forward(
         self,
@@ -197,7 +209,7 @@ class Qwen3MoeAttention(HFQwen3MoeAttention):
         fp32_rotary = getattr(self.config, "rotary_compute_dtype", None) == "float32"
         shape = (*hidden_states.shape[:-1], -1, self.head_dim)
         projections = (self.q_proj, self.k_proj, self.v_proj)
-        if self._llmtuner_fused_qkv:
+        if self.qkv_projection == "fused":
             if (
                 module_hooks._global_forward_pre_hooks
                 or module_hooks._global_forward_hooks
@@ -603,7 +615,51 @@ class Qwen3MoeModel(HFQwen3MoeModel):
 class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
     """Explicit causal model tree, preserving reference state and loss APIs."""
 
-    execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
+    @property
+    def execution_capabilities(self) -> ModelExecutionCapabilities:
+        return ModelExecutionCapabilities(
+            hidden_states=True, hidden_size=self.config.hidden_size
+        )
+
+    @property
+    def checkpoint_configuration(self) -> dict[str, object]:
+        """Model-owned semantics that tensor shape checks cannot establish.
+
+        Optional RoPE fields span supported Transformers config versions. Runtime
+        kernel selection and cache/output presentation flags are not model math.
+        """
+        return {
+            name: getattr(self.config, name, None)
+            for name in (
+                "vocab_size",
+                "hidden_size",
+                "intermediate_size",
+                "num_hidden_layers",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "head_dim",
+                "hidden_act",
+                "attention_bias",
+                "attention_dropout",
+                "attn_mask_type",
+                "is_causal",
+                "rms_norm_eps",
+                "sliding_window",
+                "max_position_embeddings",
+                "rope_theta",
+                "rope_scaling",
+                "rope_parameters",
+                "num_experts",
+                "num_experts_per_tok",
+                "moe_intermediate_size",
+                "decoder_sparse_step",
+                "mlp_only_layers",
+                "norm_topk_prob",
+                "router_aux_loss_coef",
+                "tie_word_embeddings",
+                "pad_token_id",
+            )
+        }
 
     decoder_structure = DecoderStructure(
         decoder="model",
@@ -688,7 +744,6 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         positions: Tensor | None,
         attention_mask: Tensor | None,
         padding_mask: Tensor | None,
-        skip_lm_head: bool,
     ) -> Tensor:
         """Run tokens on the first stage and hidden states on later stages."""
         first, last = self.pipeline_stage_io.first, self.pipeline_stage_io.last
@@ -712,7 +767,7 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
             output_router_logits=False,
             padding_mask=padding_mask,
         ).last_hidden_state
-        if last and not skip_lm_head:
+        if last:
             output = self.lm_head(output)
         # Stage sends must own storage, including an Identity-only stage.
         output = (output.squeeze(0) if flat else output).clone()
@@ -720,9 +775,7 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
             output,
             token_shape=token_shape,
             output_width=(
-                self.lm_head.weight.shape[0]
-                if last and not skip_lm_head
-                else self.pipeline_stage_io.hidden_size
+                self.vocab_size if last else self.pipeline_stage_io.hidden_size
             ),
         )
         return output
@@ -831,14 +884,10 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         mesh: Any,
         *,
         load_balancer: str | None = None,
-        strategy: str = "kv_allgather",
-        mask_mesh: Any = None,
     ) -> None:
         """Record the CP execution contract for input preparation and kernels."""
         self.cp_mesh = mesh
         self._cp_load_balancer = load_balancer
-        self._cp_mask_mesh = mesh if mask_mesh is None else mask_mesh
-        self._cp_strategy = strategy
 
     def validation_context(
         self, *, mask_type: str | None
@@ -851,7 +900,6 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         batch: Any,
         *,
         parallel_dims: Any,
-        max_context_length: int | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Any]]:
         """Keep independent batch rows isolated when adapting to flat tokens."""
         tokens = batch.input_ids if isinstance(batch, Batch) else batch["input"]
@@ -872,7 +920,6 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
             self,
             batch,
             parallel_dims=parallel_dims,
-            max_context_length=max_context_length,
         )
         if multirow:
             rows, width = tokens.shape
@@ -926,6 +973,19 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         if attention_masks is not None and attention_mask is not None:
             raise ValueError("Specify only one of attention_masks and attention_mask")
         if hasattr(self, "pipeline_stage_io"):
+            if not isinstance(logits_to_keep, int) or logits_to_keep != 0:
+                raise UnsupportedCombinationError(
+                    "Qwen3 PP must preserve every token row; logits_to_keep must be 0"
+                )
+            if kwargs:
+                raise UnsupportedCombinationError(
+                    f"Qwen3 PP does not support extra forward options: {sorted(kwargs)}"
+                )
+            if skip_lm_head:
+                raise UnsupportedCombinationError(
+                    "Qwen3 PP requires its declared stage output; "
+                    "hidden-only requests are unsupported"
+                )
             if input_ids is None or inputs_embeds is not None or labels is not None:
                 raise ValueError("Qwen3 PP requires a stage tensor and external loss")
             if past_key_values is not None or use_cache or output_router_logits:
@@ -939,7 +999,6 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
                 if attention_masks is not None
                 else attention_mask,
                 padding_mask=padding_mask,
-                skip_lm_head=skip_lm_head,
             )
         flat_input = input_ids is not None and input_ids.ndim == 1
         if flat_input:

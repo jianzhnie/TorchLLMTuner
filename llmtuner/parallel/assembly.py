@@ -13,6 +13,7 @@ from ..utils.module_names import canonical_fqn
 from .execution import ExecutionLayout
 from .pipeline_parallel.ownership import PipelineParameterOwnership
 from .replacements import ReplacementMap
+from .topology import ParallelTopologySnapshot
 
 if TYPE_CHECKING:
     from .pipeline_parallel.pipeline_parallel import PipelineParallelSetup
@@ -28,6 +29,7 @@ class ModelPartLayout:
     """
 
     execution: ExecutionLayout | None = None
+    topology: ParallelTopologySnapshot | None = None
     pipeline_ownership: PipelineParameterOwnership | None = None
     replacements: ReplacementMap = field(default_factory=ReplacementMap)
     parameter_bindings: dict[str, nn.Parameter] = field(default_factory=dict)
@@ -80,19 +82,32 @@ class ModelPartLayout:
         return MappingProxyType(names)
 
     @property
-    def canonical_parameter_names(self) -> Mapping[str, str]:
-        """Optimizer-state names choose one registration per parameter."""
-        names: dict[str, str] = {}
+    def parameter_state_names(self) -> Mapping[nn.Parameter, str]:
+        """One checkpoint name per parameter, chosen by registration order."""
         state_names = self.state_parameter_names
-        for paths in self.parameter_aliases.values():
-            primary = state_names[paths[0]]
-            for path in paths:
-                names[path] = primary
-                names[state_names[path]] = primary
+        names: dict[nn.Parameter, str] = {}
+        for path, parameter in self.parameter_bindings.items():
+            names.setdefault(parameter, state_names[path])
         return MappingProxyType(names)
 
     def validate(self, model: nn.Module) -> None:
-        """Reject stale identities and alias order before creating state views."""
+        """Reject stale execution declarations, identities and alias ordering."""
+        if self.topology is not None and not isinstance(
+            self.topology, ParallelTopologySnapshot
+        ):
+            raise TypeError("Model layout requires a resolved topology snapshot")
+        if self.execution is not None:
+            if not isinstance(self.execution, ExecutionLayout):
+                raise TypeError("Model layout execution must be an ExecutionLayout")
+            self.execution.validate_model(model)
+            if self.topology is not None:
+                axes = tuple(
+                    name for name in ("cp", "tp") if getattr(self.topology, name) > 1
+                )
+                if self.execution.sequence_shard_axes != axes:
+                    raise ValueError(
+                        "Execution sequence layout disagrees with topology"
+                    )
         current = dict(model.named_parameters(remove_duplicate=False))
         # The first registration names optimizer and EMA state for a shared
         # parameter. Set equality would miss a reorder that changes that name.
@@ -162,6 +177,8 @@ def validate_model_part_layouts(
     """Validate local ownership, including frozen parameters and state names."""
     if len(model_parts) != len(layouts):
         raise ValueError("Model layouts must match local model parts")
+    if len({layout.topology for layout in layouts}) > 1:
+        raise ValueError("Model parts must share the same declared topology snapshot")
     parameter_owners: dict[nn.Parameter, int] = {}
     name_owners: dict[str, int] = {}
     for index, (model, layout) in enumerate(zip(model_parts, layouts, strict=True)):

@@ -14,7 +14,7 @@ from torch import nn
 
 from ...config.parallel_config import ParallelConfig
 from ..module_patterns import module_name_matches, resolve_module_patterns
-from .linear import ColumnParallelLinear, RowParallelLinear
+from .linear import ColumnParallelLinear, RowParallelLinear, ShardedLinear
 
 ShardKind = Literal["colwise", "rowwise"]
 MOE_PLAN_SPECS = frozenset({"packed_colwise", "packed_rowwise", "moe_tp_experts"})
@@ -29,7 +29,8 @@ class ShardingConfig:
         implementation: the module class that realizes this declaration. Paired
             here rather than looked up from ``kind`` so a caller can swap in a
             different realizer (e.g. a fused-QKV variant) without touching the
-            engine.
+            engine. The realizer must register exactly one parameter, weight,
+            with the declared shard shape and unchanged dtype/device/trainability.
         sequence_transform: whether the projection gathers, scatters or retains
             its input token rows. Weight shard direction alone does not specify
             the activation layout, especially for attention-local projections.
@@ -48,6 +49,20 @@ class ShardingConfig:
             self.implementation, nn.Module
         ):
             raise TypeError("TP projection implementation must be an nn.Module class")
+        if issubclass(self.implementation, ShardedLinear):
+            if getattr(self.implementation, "shard_dim", None) != (
+                0 if self.kind == "colwise" else 1
+            ):
+                raise ValueError(
+                    "TP shard kind disagrees with projection implementation"
+                )
+            if (
+                getattr(self.implementation, "sequence_transform", None)
+                != self.sequence_transform
+            ):
+                raise ValueError(
+                    "TP sequence transform disagrees with projection implementation"
+                )
 
 
 def colwise() -> ShardingConfig:
@@ -68,9 +83,21 @@ def rowwise() -> ShardingConfig:
     )
 
 
+def _require_tp_plan(plan: object) -> Mapping[str, str | ShardingConfig]:
+    """Reject malformed declarations instead of treating false values as absent."""
+    if not isinstance(plan, Mapping):
+        raise TypeError(
+            "TP plan must be a mapping of module patterns to sharding specs"
+        )
+    if any(not isinstance(pattern, str) for pattern in plan):
+        raise TypeError("TP plan module patterns must be strings")
+    return plan
+
+
 def model_tp_config(model: nn.Module) -> Mapping[str, str | ShardingConfig]:
-    """Return the model-owned ``tp_config`` declaration, or an empty plan."""
-    return getattr(model, "tp_config", None) or {}
+    """Read the optional model-owned declaration without truth-value fallback."""
+    plan = getattr(model, "tp_config", None)
+    return {} if plan is None else _require_tp_plan(plan)
 
 
 def resolve_tp_sharding_plan(
@@ -87,8 +114,7 @@ def resolve_tp_sharding_plan(
     structural MoE path. EP specs and unsupported replicated-activation layouts
     raise instead of silently applying sequence-parallel realizers.
     """
-    if plan is None:
-        plan = model_tp_config(model)
+    plan = model_tp_config(model) if plan is None else _require_tp_plan(plan)
     resolved: dict[str, ShardingConfig | None] = {}
     for pattern, spec in plan.items():
         if isinstance(spec, ShardingConfig):
@@ -182,7 +208,8 @@ def resolve_tp_overrides(
             "parallel engine; normalization modules already consume the "
             "sequence shard without a separate transformation"
         )
-    names = [name for name, _ in model.named_modules()]
+    modules = dict(model.named_modules())
+    names = list(modules)
     # Model defaults may be overridden; explicit overrides must agree.
     for name in names:
         matches = [
@@ -199,4 +226,36 @@ def resolve_tp_overrides(
         resolve_module_patterns(
             names, patterns=list(configured_plan), plan_name="TP override"
         )
+    for pattern in configured_plan:
+        matches = [
+            module
+            for name, module in modules.items()
+            if module_name_matches(name, pattern=pattern)
+            and not (allow_unmatched and isinstance(module, nn.Identity))
+        ]
+        # PP pruning leaves Identity placeholders for non-owned roles.
+        # Absent targets can belong to another PP stage. An existing but
+        # unsupported target is still a configuration error on this stage.
+        if matches and not any(isinstance(module, nn.Linear) for module in matches):
+            raise ValueError(
+                f"TP override {pattern!r} matches no nn.Linear projection; "
+                "colwise/rowwise overrides require dense projection targets"
+            )
     return configured_plan
+
+
+def resolve_effective_tp_plan(
+    model: nn.Module,
+    *,
+    cfg: ParallelConfig,
+    plan: Mapping[str, str | ShardingConfig] | None = None,
+) -> dict[str, str | ShardingConfig]:
+    """Merge overrides once for dense, expert and vocabulary target resolution."""
+    # A PP-local part may not own a globally validated override target.
+    overrides = resolve_tp_overrides(model, cfg=cfg, allow_unmatched=cfg.pp_size > 1)
+    declared = model_tp_config(model) if plan is None else _require_tp_plan(plan)
+    # First matching pattern wins, so configuration overrides precede defaults.
+    return {
+        **overrides,
+        **{path: spec for path, spec in declared.items() if path not in overrides},
+    }

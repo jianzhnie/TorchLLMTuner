@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import copy
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import torch
 import torch.nn as nn
@@ -46,6 +46,7 @@ from torch.distributed.pipelining.schedules import (
 
 from ...errors import UnsupportedCombinationError
 from ...models.contracts import DecoderStructure
+from ...models.registered_state import registered_state_paths
 from ...utils.logging import get_logger
 from ..execution import validate_pipeline_stage_io
 
@@ -244,15 +245,15 @@ def generate_llm_fqn_per_model_part(
 
 def prune_declared_stage(model: nn.Module, targets: set[str]) -> None:
     """Keep exact registered FQNs and their ancestors, preserving block IDs."""
+    ancestors = {parent for target in targets for parent in _ancestor_paths(target)}
 
     def prune(parent: nn.Module, prefix: str) -> None:
         for name, child in list(parent._modules.items()):
             path = f"{prefix}.{name}" if prefix else name
             if path in targets:
                 continue
-            descendants = any(target.startswith(path + ".") for target in targets)
             if child is not None and (
-                descendants or isinstance(child, nn.ModuleList | nn.ModuleDict)
+                path in ancestors or isinstance(child, nn.ModuleList | nn.ModuleDict)
             ):
                 # Containers keep their registered type even when no entries
                 # belong here; models may still iterate an empty block set.
@@ -299,6 +300,14 @@ def build_stage_from_modules(
     return stage, model
 
 
+def _ancestor_paths(path: str) -> Iterator[str]:
+    """Yield registration ancestors, excluding the path itself and model root."""
+    parent, _, _ = path.rpartition(".")
+    while parent:
+        yield parent
+        parent, _, _ = parent.rpartition(".")
+
+
 def validate_pipeline_ownership(
     whole_model: nn.Module,
     module_names_per_stage: list[list[str]],
@@ -316,13 +325,18 @@ def validate_pipeline_ownership(
     structure = getattr(whole_model, "decoder_structure", None)
     if structure is not None and not isinstance(structure, DecoderStructure):
         raise TypeError("Pipeline decoder_structure must be DecoderStructure")
+    validate = getattr(whole_model, "validate_pipeline_partition", None)
+    configure = getattr(whole_model, "configure_pipeline_stage", None)
     if structure is not None:
-        validate = getattr(whole_model, "validate_pipeline_partition", None)
-        configure = getattr(whole_model, "configure_pipeline_stage", None)
         if not callable(validate) or not callable(configure):
             raise UnsupportedCombinationError(
                 "Explicit PP requires model-owned partition validation and stage I/O"
             )
+    if not callable(configure):
+        raise UnsupportedCombinationError("PP requires model-owned stage I/O")
+    if validate is not None:
+        if not callable(validate):
+            raise TypeError("validate_pipeline_partition must be callable")
         validate(module_names_per_stage)
 
     # Independent copies of stages cannot preserve a Parameter shared across
@@ -334,7 +348,7 @@ def validate_pipeline_ownership(
     replicated = set(replicated_module_names)
     for path in replicated:
         module = whole_model.get_submodule(path)
-        if next(module.parameters(), None) is not None or module.state_dict():
+        if registered_state_paths(module):
             raise ValueError(
                 f"PP replicated runtime module {path!r} must have no parameters "
                 "or persistent state"
@@ -344,42 +358,36 @@ def validate_pipeline_ownership(
         for module_name in module_names:
             if not isinstance(module_name, str) or not module_name:
                 raise ValueError("PP module targets must be non-empty paths")
-            for previous, owner in target_owners.items():
-                if (
-                    module_name == previous
-                    and module_name in replicated
-                    and owner != stage_idx
-                ):
-                    continue
-                if (
-                    module_name == previous
-                    or module_name.startswith(previous + ".")
-                    or previous.startswith(module_name + ".")
-                ):
-                    raise ValueError(
-                        f"PP module targets {previous!r} (stage {owner}) and "
-                        f"{module_name!r} (stage {stage_idx}) overlap"
-                    )
+            owner = target_owners.get(module_name)
+            if owner is not None and (
+                module_name not in replicated or owner == stage_idx
+            ):
+                raise ValueError(
+                    f"PP module targets {module_name!r} (stage {owner}) and "
+                    f"{module_name!r} (stage {stage_idx}) overlap"
+                )
             target_owners[module_name] = stage_idx
 
-    if isinstance(getattr(whole_model, "decoder_structure", None), DecoderStructure):
-        # Explicit ownership must cover every checkpoint path, including aliases
-        # and root-level state. Otherwise pruning can silently discard state or
-        # leave root tensors duplicated in independently copied stages.
-        state_paths = [
-            name for name, _ in whole_model.named_parameters(remove_duplicate=False)
-        ]
-        for prefix, module in whole_model.named_modules(remove_duplicate=False):
-            for name, _ in module.named_buffers(recurse=False, remove_duplicate=False):
-                if name not in module._non_persistent_buffers_set:
-                    state_paths.append(f"{prefix}.{name}" if prefix else name)
-        unowned = [
-            path
-            for path in state_paths
-            if not any(path.startswith(target + ".") for target in target_owners)
-        ]
-        if unowned:
-            raise ValueError(f"Explicit PP has unassigned state paths: {unowned!r}")
+    # All targets are known now, so ancestor lookup catches overlaps regardless
+    # of declaration order without comparing every pair of module names.
+    for module_name, stage_idx in target_owners.items():
+        for parent in _ancestor_paths(module_name):
+            if parent in target_owners:
+                raise ValueError(
+                    f"PP module targets {parent!r} (stage {target_owners[parent]}) "
+                    f"and {module_name!r} (stage {stage_idx}) overlap"
+                )
+
+    # Stage ownership must cover every checkpoint path, including aliases
+    # and root-level state. Otherwise pruning can silently discard state or
+    # leave root tensors duplicated in independently copied stages.
+    unowned = [
+        path
+        for path in registered_state_paths(whole_model)
+        if not any(parent in target_owners for parent in _ancestor_paths(path))
+    ]
+    if unowned:
+        raise ValueError(f"PP has unassigned state paths: {unowned!r}")
 
     module_owners: dict[int, tuple[int, str]] = {}
     # A Parameter can also be registered as a buffer on another module. Use a
@@ -541,9 +549,6 @@ def split_model_into_stages(
         module_names_per_stage,
         replicated_module_names=replicated_module_names,
     )
-    if not callable(getattr(whole_model, "configure_pipeline_stage", None)):
-        raise UnsupportedCombinationError("PP requires model-owned stage I/O")
-
     for stage_idx in stage_indices:
         module_names = module_names_per_stage[stage_idx]
         stage, model_chunk = build_stage_from_modules(

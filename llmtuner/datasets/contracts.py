@@ -34,6 +34,8 @@ __all__ = [
     "require_same_dp_degree",
     "validate_dp_coordinates",
     "validate_loader_iteration",
+    "validate_token_alignment",
+    "validated_token_fields",
 ]
 
 # Model inputs, aligned labels, and num_valid_tokens metadata. Collators count
@@ -225,3 +227,42 @@ class SampleProcessorFactory(Protocol):
     """
 
     def __call__(self, *, context: DatasetBuildContext) -> SampleProcessor: ...
+
+
+def validate_token_alignment(
+    tokens: torch.Tensor, value: torch.Tensor, *, name: str
+) -> None:
+    """Validate one value per token before flattening or counting metadata."""
+    if not isinstance(tokens, torch.Tensor) or not isinstance(value, torch.Tensor):
+        raise TypeError(f"Input tokens and {name} must be tensors")
+    if tokens.ndim not in (1, 2):
+        raise ValueError("Text input must have shape [tokens] or [batch, sequence]")
+    if value.ndim not in (1, 2):
+        raise ValueError(f"{name} must have shape [tokens] or [batch, sequence]")
+    if value.ndim == tokens.ndim == 2 and value.shape != tokens.shape:
+        raise ValueError(f"{name} must match input batch and sequence dimensions")
+    if value.numel() != tokens.numel():
+        raise ValueError(
+            f"{name} has {value.numel()} tokens, but input has {tokens.numel()}"
+        )
+    if value.device != tokens.device:
+        raise ValueError(
+            f"{name} is on {value.device}, but input is on {tokens.device}"
+        )
+
+
+def validated_token_fields(
+    batch: Batch | TrainerBatch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read aligned integer token/target fields without copying or shifting."""
+    tokens = batch.input_ids if isinstance(batch, Batch) else batch["input"]
+    labels = batch.labels if isinstance(batch, Batch) else batch["labels"]
+    validate_token_alignment(tokens, labels, name="labels")
+    if tokens.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Text input must contain int32 or int64 token indices")
+    if labels.dtype not in (torch.int32, torch.int64):
+        raise TypeError("labels must contain int32 or int64 target indices")
+    # Unshifted synthetic labels must retain row boundaries for target shifting.
+    if isinstance(batch, Batch) and tokens.shape != labels.shape:
+        raise ValueError("Synthetic labels must have the same shape as input_ids")
+    return tokens, labels
