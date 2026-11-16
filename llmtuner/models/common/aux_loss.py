@@ -3,7 +3,7 @@
 ``AuxLoss`` scales gradients by the configured coefficient and the step's
 global routed-token count, including masked prompts and excluding padding.
 Forward calls accumulate local metrics; an optimizer pre-hook snapshots these
-on each instance. Collection sums over each group's mesh and PP stages,
+on each instance. Collection sums over each group's reduction mesh,
 then divides by the current runtime's instance count to report the mean over layers.
 
 Full/selective activation checkpoint replay suppresses metric writes. Region
@@ -109,7 +109,7 @@ class AuxLoss(nn.Module):
     """
 
     # Standalone calls without model_parts use this construction registry.
-    # The trainer counts and collects its actual instances across PP stages.
+    # The trainer counts and collects its current local instances.
     _group_counts: ClassVar[dict[tuple[str, str], int]] = defaultdict(int)
 
     # Global routed-token count of the current step, set before the first
@@ -237,9 +237,8 @@ class AuxLoss(nn.Module):
 def rollup_aux_loss_metrics(model_parts: Sequence[nn.Module]) -> None:
     """Snapshot per-instance metrics, populate standalone groups, and clear scratch.
 
-    Optimizer step pre-hook. Each metric group is summed once per model part
-    that holds an instance, so a group spread across pipeline stages ends up
-    with one register holding the step's total.
+    Optimizer step pre-hook. Each distinct local instance contributes once
+    to its metric group's step total.
     """
     AuxLoss.group_acc.clear()
     seen = set()
@@ -264,8 +263,7 @@ def collect_aux_loss_metrics(
 
     Returns ``{metric_name}/mean`` per group, or ``{}`` when no auxiliary loss
     is configured. All ranks call this at log time. When model_parts are
-    supplied, use only their snapshots and agree on metric keys across PP stages,
-    including stages with no local loss. Standalone calls without parts retain
+    supplied, use only their snapshots. Standalone calls without parts retain
     the constructor registry; the trainer always supplies its current parts.
     """
     counts = dict(AuxLoss._group_counts)
@@ -298,26 +296,11 @@ def collect_aux_loss_metrics(
             else AuxLoss.group_acc.get(key)
         )
         if total is None:
-            # A stage with no local instance still joins every collective.
+            # Missing snapshots contribute zero to the reduction.
             total = torch.zeros((), dtype=torch.float32, device=device_type)
         reduce_mesh = parallel_dims.get_optional_mesh(mesh_name)
-        for mesh in (reduce_mesh,):
-            if mesh is None:
-                continue
-            # Sum: each coordinate contributes its own data, and every layer
-            # lives on exactly one pipeline stage, so summing over the reduce
-            # mesh and the stages counts every layer once. Dividing by the
-            # current runtime instance count below then
-            # gives the mean over all layers.
-            total = all_reduce(total, reduceOp="sum", group=mesh)
-        if model_parts is not None:
-            # Constructor counts include previously built models in the same
-            # process. Count the current runtime's distinct local instances,
-            # then combine pipeline stages (data peers replicate each layer).
-            layer_count = torch.tensor(count, dtype=torch.int64, device=total.device)
-            count = int(layer_count.item())
-            if count == 0:
-                continue
+        if reduce_mesh is not None:
+            total = all_reduce(total, reduceOp="sum", group=reduce_mesh)
         metrics[f"{tag}/mean"] = float(total.item()) / count
     return metrics
 

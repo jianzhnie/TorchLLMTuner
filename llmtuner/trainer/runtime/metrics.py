@@ -104,8 +104,8 @@ def collect_update_metrics(
 ) -> UpdateResult:
     """Attach post-hook auxiliary snapshots at the existing logging boundary.
 
-    Every reporting rank participates in the same reductions, including PP
-    stages without local losses. Non-reporting steps do not call this function.
+    Every reporting rank participates in the same reductions.
+    Non-reporting steps do not call this function.
     """
     metrics = dict(result.auxiliary_metrics)
     if parallel_dims is not None:

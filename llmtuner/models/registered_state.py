@@ -20,16 +20,3 @@ def named_extra_state_owners(model: nn.Module) -> Iterator[tuple[str, nn.Module]
     for path, module in model.named_modules(remove_duplicate=False):
         if type(module).get_extra_state is not nn.Module.get_extra_state:
             yield f"{path}._extra_state" if path else "_extra_state", module
-
-
-def registered_state_paths(model: nn.Module) -> tuple[str, ...]:
-    """State registrations that require ownership before pipeline partitioning."""
-    return tuple(
-        name
-        for registrations in (
-            model.named_parameters(remove_duplicate=False),
-            named_persistent_buffers(model),
-            named_extra_state_owners(model),
-        )
-        for name, _ in registrations
-    )

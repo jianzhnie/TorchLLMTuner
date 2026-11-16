@@ -188,7 +188,7 @@ class TrainingObserver:
         group: dist.ProcessGroup | None = None,
     ) -> None:
         # This group must span all ranks represented by the global token
-        # counters and peak-FLOPs denominator, including PP/TP replicas.
+        # counters and peak-FLOPs denominator, including TP/CP replicas.
         self.group = group
         self.metrics = metrics
         self.device = device

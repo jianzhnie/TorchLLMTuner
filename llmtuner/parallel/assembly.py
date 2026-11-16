@@ -27,19 +27,24 @@ class ModelPartLayout:
     topology: ParallelTopologySnapshot | None = None
     replacements: ReplacementMap = field(default_factory=ReplacementMap)
     parameter_bindings: dict[str, nn.Parameter] = field(default_factory=dict)
+    _bindings_captured: bool = field(default=False, init=False, repr=False)
 
     def refresh(self, model: nn.Module) -> None:
-        """Rebind materialized parameters without changing their alias relation.
+        """Rebind parameters while preserving registration order and aliases.
 
         Structural split/merge transformations belong to explicit replacement
         events before this snapshot, not to materialization inferred from FQNs.
         """
         current = dict(model.named_parameters(remove_duplicate=False))
+        if (self._bindings_captured or self.parameter_bindings) and tuple(
+            current
+        ) != tuple(self.parameter_bindings):
+            raise ValueError(
+                "Layout refresh changed parameter registration paths or order"
+            )
         targets: dict[nn.Parameter, nn.Parameter] = {}
         sources: dict[nn.Parameter, nn.Parameter] = {}
         for path, source in self.parameter_bindings.items():
-            if path not in current:
-                raise ValueError(f"Layout refresh lost parameter registration {path!r}")
             target = current[path]
             # Unchanged registrations also constrain alias identity: replacing
             # only one path of a shared parameter must not silently split it.
@@ -58,6 +63,7 @@ class ModelPartLayout:
         }
         self.replacements.record_replacements({}, replacements)
         self.parameter_bindings = current
+        self._bindings_captured = True
 
     @property
     def parameter_aliases(self) -> Mapping[nn.Parameter, tuple[str, ...]]:

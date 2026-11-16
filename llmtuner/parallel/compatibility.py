@@ -136,7 +136,7 @@ def chunked_loss_fsdp(
         "storage alone does not guarantee correct tied embedding/head gradients. "
         "Run with chunked_loss_num_chunks=1. Enabling this combination requires "
         "native decoder FSDP with root-owned boundaries, no module patterns, "
-        "CPU offload, TP/CP/EP/PP or compilation. Other layouts require "
+        "CPU offload, TP/CP/EP or compilation. Other layouts require "
         "a validated head ownership and forward/backward lifecycle, including "
         "shared-parameter gradient reduction and checkpoint restore; an unshard "
         "context-manager API alone is not sufficient."

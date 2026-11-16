@@ -25,7 +25,7 @@ def initialize_dtensor_rng(mesh: DeviceMesh | None) -> None:
     """Initialize DTensor random-op tracking without a global seed broadcast.
 
     PyTorch 2.14 uses the device's default RNG directly. Disable first-use
-    synchronization so PP stage seeds and checkpoint-restored streams survive.
+    synchronization so rank-local and checkpoint-restored streams survive.
     Constructing the tracker does not reseed or consume random numbers.
     """
     if mesh is None or mesh.device_type == "cpu":

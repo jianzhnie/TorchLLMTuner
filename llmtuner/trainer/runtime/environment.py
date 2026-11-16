@@ -75,9 +75,7 @@ def build_runtime_environment(
         rank = get_rank()
         world_size = get_world_size()
 
-    # Resolve the degrees first: the PP seed offset below needs this rank's
-    # stage coordinate, and degree resolution draws no random numbers, so
-    # seeding after it leaves every non-PP run bit-identical.
+    # Degree resolution validates the live topology before seeding.
     parallel_dims = resolve_parallel_topology(cfg, world_size=world_size)
 
     # Validation's infeasible combinations are rejected here, before the

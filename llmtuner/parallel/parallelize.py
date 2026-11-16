@@ -121,12 +121,9 @@ def parallelize_model(
             "Decoder transformation target validation", group=error_group
         ):
             structure = getattr(model, "decoder_structure", None)
-            if structure is not None:
-                if not isinstance(structure, DecoderStructure):
-                    raise TypeError(
-                        "Decoder transformations require a DecoderStructure"
-                    )
-                structure.bind_blocks(model)
+            if not isinstance(structure, DecoderStructure):
+                raise TypeError("Decoder transformations require a DecoderStructure")
+            structure.bind_blocks(model)
     validate_fsdp_environment(cfg, parallel_dims, error_group=error_group)
     # Backend registration and optional codegen imports are rank-local. Stop
     # every peer before any model transform if one environment is unavailable.
@@ -146,7 +143,6 @@ def parallelize_model(
             if parallel_dims is not None
             else ParallelTopologySnapshot()
         )
-    layouts: list[ModelPartLayout] = []
 
     def apply_stages(
         part: nn.Module,
@@ -156,21 +152,19 @@ def parallelize_model(
         ep_group: ProcessGroup | None,
         ep_error_group: ProcessGroup | None,
         execution_layout: ExecutionLayout,
-        part_cfg: ParallelConfig | None = None,
         resolved_tp_plan: ParallelPlan | None = None,
-    ) -> nn.Module:
+    ) -> ParallelAssembly:
         """Bind stage options once, then transform the model in declared order."""
-        fsdp_cfg = cfg if part_cfg is None else part_cfg
         layout = ModelPartLayout(
             execution=execution_layout,
             topology=topology_snapshot,
         )
         references = (
-            FSDPPatternReferences(part, fsdp_cfg, replacements=layout.replacements)
-            if fsdp_cfg.fsdp_config.fsdp_ignored_modules
+            FSDPPatternReferences(part, cfg, replacements=layout.replacements)
+            if cfg.fsdp_config.fsdp_ignored_modules
             or any(
                 options.get("hook_module") is not None or options.get("ignored_params")
-                for options in fsdp_cfg.fsdp_config.fsdp_apply_modules.values()
+                for options in cfg.fsdp_config.fsdp_apply_modules.values()
             )
             else None
         )
@@ -235,7 +229,7 @@ def parallelize_model(
                 )
                 part = apply_fsdp(
                     part,
-                    cfg=fsdp_cfg if references is None else references.bind(part),
+                    cfg=cfg if references is None else references.bind(part),
                     parallel_dims=parallel_dims,
                     chunked_loss_num_chunks=chunked_loss_num_chunks,
                 )
@@ -248,8 +242,7 @@ def parallelize_model(
         ):
             execution_layout.validate_model(part)
             layout.refresh(part)
-        layouts.append(layout)
-        return part
+        return ParallelAssembly(part, (layout,))
 
     # EP groups come from the sparse mesh.
     ep_group = None
@@ -333,7 +326,7 @@ def parallelize_model(
             compile_enabled=compile,
             activation_swap=activation_swap and activation_checkpoint != "full",
         )
-    execution = apply_stages(
+    return apply_stages(
         model,
         dense_mesh=mesh,
         resolved_tp_plan=resolved_tp_plan,
@@ -342,4 +335,3 @@ def parallelize_model(
         ep_error_group=ep_error_group,
         execution_layout=execution_layout,
     )
-    return ParallelAssembly(execution, tuple(layouts))

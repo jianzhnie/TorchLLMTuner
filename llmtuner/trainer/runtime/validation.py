@@ -1,6 +1,6 @@
 """Validation passes, token/loss reductions, and temporary loader lifecycle.
 
-Trainer delegates evaluation here. Pipeline input preparation is shared with
+Trainer delegates evaluation here. Model input preparation is shared with
 training; this module owns validation scheduling, reporting, and mode restore.
 """
 
@@ -158,8 +158,7 @@ def finalize_validation(
     that read zero batches (the source is empty or processing and filtering
     leave no usable samples on this rank),
     and a pass over zero valid tokens (every label masked), which has no
-    average to report. Under PP only the last stage holds losses; other stages
-    run the identical loop and coordinate reporting errors without emitting metrics.
+    average to report.
     """
     # Preflight and reporting are local phases. Loss reduction remains outside
     # those boundaries, since a collective failure cannot be coordinated here.
@@ -183,8 +182,7 @@ def finalize_validation(
         )
     if global_loss_sum is not None and loss_mesh is not None:
         all_reduce(global_loss_sum, group=loss_mesh.get_group())
-    # Non-final PP stages must participate even though only the final stage
-    # checks and logs the loss; otherwise a sink failure strands their next step.
+    # Coordinate reporting errors before any rank proceeds to the next step.
     with synchronize_local_errors("Validation result reporting", group=error_group):
         if global_loss_sum is not None:
             global_avg_loss = float(global_loss_sum) / num_global_valid_tokens
@@ -243,8 +241,8 @@ def validate(
     """Evaluate without gradients, restoring modes, gradients and mask policy.
 
     Report summed next-token cross-entropy divided by the global valid-token
-    count, using the same DP token and loss-mesh reductions as training. Only
-    the last PP stage reports. Optimizer, scheduler, and training token counters
+    count, using the same DP token and loss-mesh reductions as training.
+    Optimizer, scheduler, and training token counters
     are unchanged; the temporary loader is closed after each pass.
 
     ``steps=-1`` reads a finite corpus once; positive steps use a repeating
@@ -353,7 +351,7 @@ def run_validation_loop(
     loader_resources: ValidationDataLoaderResources,
     step: int,
 ) -> None:
-    """Read, score, and finalize one validation pass for dense or PP models."""
+    """Read, score, and finalize one validation pass for the local model."""
     parallel_dims = engine.parallel_dims
     dp_mesh, loss_mesh = resolve_loss_reduction_meshes(parallel_dims)
     validation_dataloader: BaseDataLoader | None = None

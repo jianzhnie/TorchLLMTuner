@@ -188,12 +188,10 @@ def build_dataloader(
 
     Args:
         config: dataset, tokenization, packing, and run geometry.
-        dp_rank: rank within the data-parallel group; PP stages in one pipeline
-            use the same coordinates so they read the same batch.
+        dp_rank: rank within the data-parallel group.
         dp_world_size: number of independent data shards.
-        num_tokens_per_batch: token budget per rank. Text PP divides this budget
-            among independently packed microbatch rows before runtime splitting.
-            Random data derives its row count from config.global_batch_size.
+        num_tokens_per_batch: token budget per rank. Random data derives its
+            row count from config.global_batch_size.
         repeat: repeat corpus data indefinitely when true. False builds a finite
             corpus loader only with dp_world_size=1; distributed exhaustion is
             not coordinated. Random data remains infinite regardless of repeat.
@@ -203,7 +201,7 @@ def build_dataloader(
     Synthetic data bypasses tokenizer and packing setup. Corpus loaders resolve
     a text or multimodal recipe, construct its tokenizer and packing graph, then
     bind the corresponding collator. Multimodal packing uses whole documents
-    and does not use the text packing selector or PP row grouping.
+    and does not use the text packing selector.
     """
     validate_dp_coordinates(dp_rank=dp_rank, dp_world_size=dp_world_size)
     dataloader_config = config.dataloader

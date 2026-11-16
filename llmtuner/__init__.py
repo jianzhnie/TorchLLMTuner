@@ -1,7 +1,7 @@
 """llmtuner -- Hybrid Parallel training over a Torch DeviceMesh.
 
 A minimal, learning-oriented framework for understanding the core modules of
-distributed training (FSDP / TP / PP / CP / EP) by building them from scratch.
+distributed training (FSDP / TP / CP / EP) by building them from scratch.
 
 Two abstractions only:
   * a grouped ``LLMTunerConfig``      (llmtuner.config)

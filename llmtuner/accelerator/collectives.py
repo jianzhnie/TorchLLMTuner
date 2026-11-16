@@ -304,8 +304,7 @@ def clip_grad_norm_(
 
     ``torch.nn.utils.clip_grad_norm_`` handles DTensor/FSDP sharding, but this
     project's TP weights are local tensors. Their squared norms must be summed
-    over TP, while TP-replicated parameters are counted only once. PP stages
-    hold disjoint parameters, so the assembled norm is reduced over PP too.
+    over TP, while TP-replicated parameters are counted only once.
 
     Args:
         parameters: an iterable of tensors (or one tensor) to normalize.
@@ -315,7 +314,6 @@ def clip_grad_norm_(
         norm_type: type of the used p-norm. ``'inf'`` for infinity norm.
         error_if_nonfinite: throw if the total norm is nan/inf.
         foreach: use the faster foreach implementation (``None`` lets torch pick).
-            stages before clipping.
         ep_mesh: expert-parallel mesh. When present, only the norm contribution
             from ``expert_parameters`` is reduced over this mesh.
         expert_parameters: parameters physically partitioned across EP ranks.

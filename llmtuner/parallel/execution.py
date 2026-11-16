@@ -6,7 +6,7 @@ from typing import Literal
 from torch import nn
 from torch.distributed import ProcessGroup
 
-from ..models.contracts import DecoderStructure
+from ..models.contracts import DecoderStructure, registered_submodule
 from ..models.execution import ModelExecutionCapabilities
 from .plan import ParallelPlan
 from .tensor_parallel.sharding import ShardingConfig
@@ -62,7 +62,7 @@ class ExecutionLayout:
     def loss_kwargs(self, tp_group: ProcessGroup | None) -> dict[str, object]:
         """Bind the declared output vocabulary to its reduction group."""
         if self.output != "logits":
-            raise ValueError("Pipeline hidden output cannot be consumed by LM loss")
+            raise ValueError("LM loss requires logits output")
         if not self.vocabulary_sharded:
             return {}
         if tp_group is None or self.vocabulary_size is None:
@@ -92,10 +92,12 @@ def resolve_execution_layout(
             "Model must declare execution_capabilities as ModelExecutionCapabilities"
         )
     structure = getattr(model, "decoder_structure", None)
+    if structure is not None and not isinstance(structure, DecoderStructure):
+        raise TypeError("Execution layout requires a DecoderStructure declaration")
     head_path = None
     if isinstance(structure, DecoderStructure):
         head_path = structure.head
-        if isinstance(model.get_submodule(head_path), nn.Identity):
+        if isinstance(registered_submodule(model, head_path), nn.Identity):
             raise ValueError(
                 "Declared logits output requires an owned output projection"
             )

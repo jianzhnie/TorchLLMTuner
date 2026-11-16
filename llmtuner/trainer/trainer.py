@@ -8,8 +8,8 @@ Step order matters: read every accumulation batch, reduce the whole-batch
 valid-token count over DP, run forward/backward with that denominator, clip
 and check gradients, update the optimizer and scheduler, then report metrics.
 CP and TP partition tokens within a DP batch, so their loss sums are reduced
-across the sequence axes before reporting. PP stage losses are synchronized to
-all stages. The process group belongs to the entry point, not ``Trainer.close``.
+across the sequence axes before reporting. The process group belongs to the
+entry point, not ``Trainer.close``.
 """
 
 from __future__ import annotations
@@ -206,8 +206,7 @@ class Trainer:
         model_assembly = prepared_model.assembly
         self.model = model_assembly.model
         self.model_parts = model_assembly.model_parts
-        # Successful handoff retains only final local parts. In particular,
-        # do not keep the unsplit full PP model alive throughout training.
+        # Successful handoff retains only final local model parts.
         self.fsdp_communication_resources = FSDPCommunicationResources(
             tuple(self.model_parts)
         )
@@ -283,7 +282,6 @@ class Trainer:
                 )
         if cfg.activation_swap:
             self.activation_swap_resources.reset_metrics()
-        # The trainer synchronizes PP loss metrics to every stage before logging.
         set_log_ranks(cfg.metrics.log_ranks)
         if environment.device.type == "npu":
             logger.info(
@@ -350,7 +348,7 @@ class Trainer:
         """Run diagnostics after gradient reduction and before clipping."""
 
     def param_context(self):
-        """Context shared by dense/PP forward-backward and validation.
+        """Context shared by forward-backward and validation.
 
         The default is empty. Diagnostic integrations wrap this hook to control
         output capture across all execution paths. Activation checkpointing is
@@ -397,14 +395,13 @@ class Trainer:
 
         # Count replicated loader tokens over DP only; sum sequence-sharded
         # losses over DP/CP/TP. runtime/reductions.py owns these mesh choices.
-        # PP stages report independently; only the final stage's loss is logged.
         parallel_dims = self.parallel_dims
         reduction_meshes = resolve_training_reduction_meshes(parallel_dims)
         dp_mesh = reduction_meshes.dp_mesh
 
         # Read the entire accumulation window on the host before the first
         # forward: every group's gradient uses the same global token denominator.
-        # Counting must precede CP/TP sequence sharding and PP microbatch splits.
+        # Counting must precede CP/TP sequence sharding.
         microbatches: deque[batch_runtime.AccumulationBatch] = deque()
         local_valid_tokens = 0
         local_routing_tokens = 0

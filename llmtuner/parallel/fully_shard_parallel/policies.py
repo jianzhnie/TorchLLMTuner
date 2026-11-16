@@ -144,8 +144,6 @@ def get_fsdp_reshard_after_forward_policy(reshard_after_forward_policy: str) -> 
         case "never":
             return False
         case "default":
-            # For PP, by default do not reshard after forward to avoid per-microbatch
-            # all-gathers, which can be expensive and non-overlapped
             return True
         case _:
             raise ValueError(

@@ -73,10 +73,7 @@ class TrainingConfig:
 
     global_batch_size: int = field(
         default=8,
-        metadata={
-            "help": "Sequences per step across DP ranks. PP splits each rank batch "
-            "into num_pp_microbatches."
-        },
+        metadata={"help": "Sequences per step across DP ranks."},
     )
     max_seq_len: int = field(default=64, metadata={"help": "Sequence length"})
     steps: int = field(default=20, metadata={"help": "Number of optimizer steps"})
@@ -183,16 +180,15 @@ class TrainingConfig:
     gradient_accumulation_steps: int = field(
         default=1,
         metadata={
-            "help": "Full forward/backward microbatches per optimizer update. PP "
-            "microbatches instead split each batch; loss uses the global "
-            "valid-token count."
+            "help": "Full forward/backward microbatches per optimizer update; "
+            "loss uses the global valid-token count."
         },
     )
     chunked_loss_num_chunks: int = field(
         default=1,
         metadata={
             "help": "Sequence chunks for lm_head and cross-entropy; reduces peak "
-            "logits memory. 1 disables chunking; unsupported with PP."
+            "logits memory. 1 disables chunking."
         },
     )
     dump_folder: str = field(

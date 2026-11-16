@@ -61,9 +61,9 @@ __all__ = [
 def token_throughput(
     num_tokens: int, elapsed_seconds: float, *, replication_degree: int = 1
 ) -> float:
-    """Normalize counted tokens by time and duplicated TP/CP/PP token streams.
+    """Normalize counted tokens by time and duplicated TP/CP token streams.
 
-    For rank-local loader counts, replication_degree=TP*CP*PP yields average
+    For rank-local loader counts, replication_degree=TP*CP yields average
     per-device throughput. For unique global tokens use replication_degree=1.
     EP overlays the dense mesh and is never another multiplier or divisor.
     """
@@ -73,8 +73,8 @@ def token_throughput(
 def configured_tokens_per_step(config: TrainingConfig) -> int:
     """Global padded tokens consumed by one complete optimizer update.
 
-    Each accumulation group reads a full global batch; PP microbatches only
-    split that batch and TP/CP/EP do not introduce independent input tokens.
+    Each accumulation group reads a full global batch. TP/CP/EP do not
+    introduce independent input tokens.
     """
     return (
         config.global_batch_size
@@ -324,7 +324,7 @@ class MetricsProcessor:
 
     @property
     def _non_data_parallel_size(self) -> int:
-        """Number of CP/TP/PP ranks sharing one data-parallel token stream.
+        """Number of CP/TP ranks sharing one data-parallel token stream.
 
         Fetch accounting records the full local batch before CP/TP partitioning.
         Divide by this degree to report per-device throughput. EP overlays the

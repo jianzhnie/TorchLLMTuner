@@ -28,6 +28,9 @@ class CheckpointFormatState:
         topology: ParallelTopologySnapshot | None = None,
     ) -> None:
         self._model_contracts = model_contracts
+        self._topology_type = (
+            ParallelTopologySnapshot if topology is None else type(topology)
+        )
         self._topology = json.dumps(
             None if topology is None else asdict(topology), sort_keys=True
         )
@@ -133,10 +136,10 @@ class CheckpointFormatState:
         try:
             topology = json.loads(state_dict["topology"])
             if topology is not None:
-                expected = {item.name for item in fields(ParallelTopologySnapshot)}
+                expected = {item.name for item in fields(self._topology_type)}
                 if not isinstance(topology, dict) or topology.keys() != expected:
                     raise ValueError("Incomplete topology snapshot")
-                ParallelTopologySnapshot(**topology)
+                self._topology_type(**topology)
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("Checkpoint source topology record is invalid") from error
 

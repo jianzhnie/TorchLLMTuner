@@ -348,8 +348,11 @@ def _apply_parallelism(
             ):
                 if initialization_error is not None:
                     raise initialization_error
-    for part, layout in zip(assembled.model_parts, assembled.layouts, strict=True):
-        layout.refresh(part)
+    with synchronize_local_errors(
+        "Materialized model layout validation", group=error_group
+    ):
+        for part, layout in zip(assembled.model_parts, assembled.layouts, strict=True):
+            layout.refresh(part)
     return assembled
 
 

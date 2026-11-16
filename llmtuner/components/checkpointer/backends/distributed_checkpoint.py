@@ -127,33 +127,15 @@ def _state_on_cpu(value: Any) -> Any:
 class DistributedCheckpointManager(BaseCheckpointManager):
     """Checkpoint manager backed by ``torch.distributed.checkpoint``.
 
-    Note on Pipeline Parallelism and Virtual Stages:
-
-    1. Even for simple PP schedules there is a separate optimizer per PP rank.
-       Rank 0's optimizer has a ``param_group[0]`` referring to ``layers.0`` of
-       the original model; rank 1's *also* has a ``param_group[0]``, since the
-       index is positional, but referring to ``layers.1``. When saving, these
-       collide and one of them is lost. Then on reload only one stage can restore
-       its optimizer state and the others error.
-
-       The solution is keying optimizer state by FQN instead of position. The
-       ``OptimizersContainer`` does this unconditionally -- it has to, since one
-       container already spans every model part, so there is no positional
-       format for it to fall back to. torchtitan's container does the same.
-
-    2. With complex PP schedules there are multiple model chunks per PP rank,
-       which compounds (1) by also requiring us to reason about multiple local
-       ``optim`` objects. ``ModelCheckpointState`` flattens the state dicts from each
-       chunk into one before saving or loading, relying on the individual
-       state dicts not to collide -- guaranteed for the model by correct
-       pipeline splitting, and for the optimizer by the FQN keying in (1).
-
-    3. LR schedulers index model state like optimizers do, so they are flattened
-       the same way, under the assumption that all of them share a state dict.
+    Model and optimizer state use canonical FQN keys across local modules.
+    Positional optimizer indices are not a stable checkpoint identity when
+    groups or local module ownership differ. Model state is flattened before
+    DCP planning; conflicting names are rejected by the state adapters.
+    Scheduler state stores one shared update counter.
 
     Args:
         config: how checkpointing is configured for this run.
-        model_parts: the model chunks to checkpoint (one entry per PP stage).
+        model_parts: the local model modules to checkpoint.
         optimizer: the optimizer to checkpoint, as an ``OptimizersContainer``.
             Its state dict is flat and FQN-keyed, and it materializes a fresh
             optimizer's state before DCP plans the load.

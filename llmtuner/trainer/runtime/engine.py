@@ -34,6 +34,7 @@ from ...models.common.moe.bias_update import (
 from ...models.contracts import DecoderStructure
 from ...models.execution import ModelExecutionCapabilities, validate_training_output
 from ...parallel.execution import ExecutionLayout
+from ...parallel.fully_shard_parallel.policies import iter_fsdp_modules
 from ...parallel.topology import ParallelTopology
 from . import gradients
 from .batch import prepare_model_inputs
@@ -78,12 +79,6 @@ class TrainingEngine:
     grad_norm_precision: str = "float32"
     expert_reduce_layout: str = "storage"
 
-    _run_forward_backward: Callable[..., torch.Tensor] = field(
-        init=False, repr=False, compare=False
-    )
-    _run_evaluation: Callable[[Batch | TrainerBatch], torch.Tensor | None] = field(
-        init=False, repr=False, compare=False
-    )
     _dense_backward: Callable[..., torch.Tensor] = field(
         init=False, repr=False, compare=False
     )
@@ -159,8 +154,6 @@ class TrainingEngine:
             self.parallel_dims,
             layout=self.execution_layouts[0] if self.execution_layouts else None,
         )
-        self._run_forward_backward = self._forward_backward_batch
-        self._run_evaluation = self._evaluate_dense
         self._dense_backward = (
             self._backward_chunked
             if self.chunked_loss_num_chunks > 1
@@ -266,8 +259,12 @@ class TrainingEngine:
         valid_tokens: int,
     ) -> StepResult:
         """Return detached loss and the caller-owned token accounting context."""
-        loss_sum = self._run_forward_backward(
-            batch, global_valid_tokens=global_valid_tokens
+        inputs, labels, extra_kwargs = self.preprocess(batch)
+        loss_sum = self.forward_backward_dense(
+            inputs,
+            labels,
+            extra_kwargs=extra_kwargs,
+            global_valid_tokens=global_valid_tokens,
         )
         with synchronize_local_errors(
             "Training step result validation", group=self.error_group
@@ -278,34 +275,30 @@ class TrainingEngine:
                 normalization_tokens=global_valid_tokens.detach(),
             )
 
-    def evaluate(self, batch: Batch | TrainerBatch) -> torch.Tensor | None:
+    def evaluate(self, batch: Batch | TrainerBatch) -> torch.Tensor:
         """Return raw validation loss.
 
         The caller owns eval/no-grad mode, RNG restoration and reporting.
         """
-        return self._run_evaluation(batch)
-
-    def _evaluate_dense(self, batch: Batch | TrainerBatch) -> torch.Tensor:
         inputs, labels, extra_kwargs = self.preprocess(batch)
-        with self.param_context(), spmd_context(self.parallel_dims):
-            logits = self._training_output(self.model(inputs, **extra_kwargs), labels)
-            loss = self.loss_sum(logits, labels.reshape(-1), **self._loss_kwargs)
-            with synchronize_local_errors(
-                "Validation loss result validation", group=self.error_group
-            ):
-                validate_loss_sum(loss, device=labels.device)
-            return loss
-
-    def _forward_backward_batch(
-        self, batch: Batch | TrainerBatch, *, global_valid_tokens: torch.Tensor
-    ) -> torch.Tensor:
-        inputs, labels, extra_kwargs = self.preprocess(batch)
-        return self.forward_backward_dense(
-            inputs,
-            labels,
-            extra_kwargs=extra_kwargs,
-            global_valid_tokens=global_valid_tokens,
-        )
+        try:
+            with self.param_context(), spmd_context(self.parallel_dims):
+                logits = self._training_output(
+                    self.model(inputs, **extra_kwargs), labels
+                )
+                loss = self.loss_sum(logits, labels.reshape(-1), **self._loss_kwargs)
+                with synchronize_local_errors(
+                    "Validation loss result validation", group=self.error_group
+                ):
+                    validate_loss_sum(loss, device=labels.device)
+                return loss
+        finally:
+            # Validation has no backward to restore units configured to retain
+            # full parameters after forward. Restore their original bindings
+            # before checkpointing, EMA or the next training update observes them.
+            for part in self.model_parts:
+                for module in iter_fsdp_modules(part):
+                    module.reshard()
 
     def forward_backward_dense(
         self,
@@ -315,7 +308,7 @@ class TrainingEngine:
         extra_kwargs: dict[str, Any],
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Run one non-PP accumulation group without selecting execution policy."""
+        """Run one accumulation group without selecting execution policy."""
         with synchronize_local_errors(
             "Training loss normalization validation", group=self.error_group
         ):
@@ -444,7 +437,7 @@ class TrainingEngine:
             self.lr_scheduler.step()
         with synchronize_local_errors("Training EMA update", group=self.error_group):
             if self.ema is not None:
-                # All ranks enter, including PP stages with no tracked tensors.
+                # All ranks enter, including ranks with no tracked tensors.
                 self.ema.step(step)
         return result
 

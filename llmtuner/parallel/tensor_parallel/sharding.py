@@ -215,9 +215,7 @@ def resolve_vocab_parallel_targets(
     ]
 
 
-def resolve_tp_overrides(
-    model: nn.Module, *, cfg: ParallelConfig, allow_unmatched: bool = False
-) -> dict[str, str]:
+def resolve_tp_overrides(model: nn.Module, *, cfg: ParallelConfig) -> dict[str, str]:
     """Validate explicit overrides before splitting or transforming the model."""
     configured_plan = dict.fromkeys(cfg.tp_config.tp_colwise_modules, "colwise")
     for pattern in cfg.tp_config.tp_rowwise_modules:
@@ -244,20 +242,15 @@ def resolve_tp_overrides(
                 f"TP override patterns have conflicting styles for module "
                 f"{name!r}: {matches}"
             )
-    if not allow_unmatched:
-        resolve_module_patterns(
-            names, patterns=list(configured_plan), plan_name="TP override"
-        )
+    resolve_module_patterns(
+        names, patterns=list(configured_plan), plan_name="TP override"
+    )
     for pattern in configured_plan:
         matches = [
             module
             for name, module in modules.items()
             if module_name_matches(name, pattern=pattern)
-            and not (allow_unmatched and isinstance(module, nn.Identity))
         ]
-        # PP pruning leaves Identity placeholders for non-owned roles.
-        # Absent targets can belong to another PP stage. An existing but
-        # unsupported target is still a configuration error on this stage.
         if matches and not any(isinstance(module, nn.Linear) for module in matches):
             raise ValueError(
                 f"TP override {pattern!r} matches no nn.Linear projection; "
@@ -273,8 +266,7 @@ def resolve_effective_tp_plan(
     plan: Mapping[str, str | ShardingConfig] | None = None,
 ) -> dict[str, str | ShardingConfig]:
     """Merge overrides once for dense, expert and vocabulary target resolution."""
-    # A PP-local part may not own a globally validated override target.
-    overrides = resolve_tp_overrides(model, cfg=cfg, allow_unmatched=False)
+    overrides = resolve_tp_overrides(model, cfg=cfg)
     declared = model_tp_config(model) if plan is None else _require_tp_plan(plan)
     # First matching pattern wins, so configuration overrides precede defaults.
     return {

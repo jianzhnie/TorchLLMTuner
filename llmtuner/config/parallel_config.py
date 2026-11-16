@@ -311,7 +311,7 @@ class ExpertParallelConfig:
 
 @dataclass(kw_only=True, slots=True)
 class ParallelConfig:
-    """Parallel degrees composed with TP/FSDP/EP/CP/PP execution plans."""
+    """Parallel degrees composed with TP/FSDP/EP/CP execution plans."""
 
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     tp_config: TensorParallelConfig = field(default_factory=TensorParallelConfig)

@@ -87,7 +87,7 @@ def fetch_batch(
         error = ex
         status = 0
 
-    # Every model axis participates: a PP stage or sequence peer that
+    # Every model axis participates: a sequence peer that
     # exits alone leaves the others entering unmatched model collectives.
     # Coordinate before yielding, also before token denominator reductions.
     if get_world_size(group) > 1:

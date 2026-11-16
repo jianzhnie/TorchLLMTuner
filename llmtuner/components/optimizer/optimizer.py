@@ -141,11 +141,10 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
         config: the run's optimizer configuration. ``param_groups`` is the list
             of ``ParamGroupConfig`` patterns; ``implementation`` selects
             ``fused`` / ``foreach`` / ``for-loop`` for every inner optimizer.
-        model_parts: the model chunks to optimize, one per pipeline stage.
+        model_parts: the local model modules to optimize.
         initialization_group: optional group coordinating local planning and
-            construction errors; defaults to the PP group. Trainer supplies world
-            so failures also reach other data replicas. All members must construct
-            together, while rule matching continues to use the PP group.
+            construction errors. Trainer supplies the world group so failures
+            reach other data replicas. All group members must construct together.
         on_acquired: optional owner callback, invoked before inner resources are
             created. It must retain this container without raising or device work;
             the owner can retry close if construction and cleanup both fail.

@@ -1,9 +1,7 @@
 """The assembly stage list: the order contract, as data.
 
 ``parallelize_model``'s correctness is its call order, and this
-table is the single source of it: both the unsplit model and each PP part run
-``STAGE_ORDER``, so the two paths cannot
-drift into different relative orders. Kept engine-free (a dataclass and
+table is the single source of ``STAGE_ORDER``. Kept engine-free (a dataclass and
 tuples, no ``apply_*`` imports) so the contract is importable anywhere --
 ``llmtuner/config``, tests, docs tooling -- without paying for the engine.
 """
@@ -45,18 +43,14 @@ STAGES: tuple[Stage, ...] = (
     ),
     Stage(
         "cp",
-        "With the other sharding wrappers. On the PP path too (upstream's "
-        "dense CP+PP runs in CI): every stage's layers run the CP attention "
-        "over this rank's sequence shard, and the p2p channel carries the "
-        "sharded activations between stages at the same CP coordinate.",
+        "With the other sharding wrappers: attention consumes this rank's "
+        "sequence shard before checkpointing and compilation.",
     ),
     Stage(
         "ac",
         "After the sharding wrappers (it must enclose the TP/CP-modified "
         "layer), before compile and FSDP -- torchtitan's order in "
-        "``parallelize_llama``. On the PP path too: upstream hands "
-        "``ac_config`` to each model part's own ``parallelize`` call, so each "
-        "stage's chunk is checkpointed on its own layers.",
+        "``parallelize_llama``.",
     ),
     Stage(
         "activation_swap",
