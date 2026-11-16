@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from experiment.pipeline_parallel.ownership import PipelineParameterOwnership
+from experiments.pipeline_parallel.ownership import PipelineParameterOwnership
 from llmtuner.parallel.assembly import ModelPartLayout as BaseModelPartLayout
 from llmtuner.parallel.assembly import ModelPartLayoutSnapshot as BaseSnapshot
 

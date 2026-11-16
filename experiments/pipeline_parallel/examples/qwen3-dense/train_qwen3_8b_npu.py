@@ -29,8 +29,8 @@ import os
 
 import torch
 
-from experiment.pipeline_parallel.config import LLMTunerConfig
-from experiment.pipeline_parallel.parallel_config import (
+from experiments.pipeline_parallel.config import LLMTunerConfig
+from experiments.pipeline_parallel.parallel_config import (
     ParallelConfig,
     PipelineParallelConfig,
 )

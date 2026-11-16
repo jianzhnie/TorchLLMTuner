@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 
-from experiment.pipeline_parallel.collectives import (
+from experiments.pipeline_parallel.collectives import (
     all_reduce,
     synchronize_local_errors,
 )

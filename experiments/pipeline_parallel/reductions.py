@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from torch.distributed.device_mesh import DeviceMesh
 
 if TYPE_CHECKING:
-    from experiment.pipeline_parallel.topology import ParallelTopology
+    from experiments.pipeline_parallel.topology import ParallelTopology
 
 
 @dataclass(frozen=True, slots=True)

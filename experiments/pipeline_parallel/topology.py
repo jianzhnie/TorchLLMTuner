@@ -562,7 +562,7 @@ class ParallelTopology:
 # These are the axes of the dense mesh the parallel layer is handed; ``pp`` is
 # not among them because pipeline stages live on disjoint rank sets -- the PP
 # path resolves its own views off ParallelTopology instead (see
-# experiment/pipeline_parallel/pipeline_parallel.py).
+# experiments/pipeline_parallel/pipeline_parallel.py).
 MESH_AXES = ("dp", "cp", "tp")
 
 

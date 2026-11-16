@@ -14,9 +14,9 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from torch.utils._pytree import tree_leaves, tree_map_only
 
-from experiment.pipeline_parallel import compatibility
-from experiment.pipeline_parallel.collectives import synchronize_local_errors
-from experiment.pipeline_parallel.microbatch_drivers import (
+from experiments.pipeline_parallel import compatibility
+from experiments.pipeline_parallel.collectives import synchronize_local_errors
+from experiments.pipeline_parallel.microbatch_drivers import (
     run_eval_microbatches,
     run_microbatches,
 )

@@ -8,7 +8,7 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-from experiment.pipeline_parallel.parallel_config import (
+from experiments.pipeline_parallel.parallel_config import (
     ContextParallelConfig,
     ExpertParallelConfig,
     FSDPConfig,

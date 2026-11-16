@@ -20,8 +20,8 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully
 from torch.distributed.tensor import Shard
 from torch.nn import ModuleDict
 
-from experiment.pipeline_parallel.collectives import synchronize_local_errors
-from experiment.pipeline_parallel.fsdp_policies import (
+from experiments.pipeline_parallel.collectives import synchronize_local_errors
+from experiments.pipeline_parallel.fsdp_policies import (
     build_fsdp_placement_fn,
     disable_fsdp_gradient_division,
     enable_fsdp_symm_mem,
@@ -29,7 +29,7 @@ from experiment.pipeline_parallel.fsdp_policies import (
     get_fsdp_reshard_after_forward_policy,
     iter_fsdp_modules,
 )
-from experiment.pipeline_parallel.topology import ParallelTopology
+from experiments.pipeline_parallel.topology import ParallelTopology
 from llmtuner.accelerator.capabilities import has as capability
 from llmtuner.accelerator.distributed import get_backend, is_distributed
 from llmtuner.config.parallel_config import ParallelConfig

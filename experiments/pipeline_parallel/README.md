@@ -17,28 +17,32 @@ PP 从生产 `llmtuner/parallel/pipeline_parallel` 迁到此目录。生产 Trai
 程序调用使用实验叶子模块：
 
 ```python
-from experiment.pipeline_parallel.config import LLMTunerConfig
-from experiment.pipeline_parallel.parallel_config import (
+from experiments.pipeline_parallel.config import LLMTunerConfig
+from experiments.pipeline_parallel.parallel_config import (
     ParallelConfig,
     PipelineParallelConfig,
 )
-from experiment.pipeline_parallel.trainer import Trainer
+from experiments.pipeline_parallel.trainer import Trainer
 ```
 
-命令行入口为 `python -m experiment.pipeline_parallel.cli`，分布式启动使用
-`torchrun --nproc_per_node=N -m experiment.pipeline_parallel.cli ...`。
+命令行入口为 `python -m experiments.pipeline_parallel.cli`，分布式启动使用
+`torchrun --nproc_per_node=N -m experiments.pipeline_parallel.cli ...`。
 配置中的 `--pipeline_parallel_size`、`--pipeline_parallel_schedule` 和
 `--num_pp_microbatches` 由此入口解析；生产 CLI 不再提供 schedule 配置。
 运行目录应为仓库根目录，并设置 `PYTHONPATH=.`。
 
 实验实现复用生产模型契约、TP/EP/CP 变换与 checkpoint 服务；PP 专用拓扑、
 模型阶段行为、集合通信及优化器协调保存在此目录。
-生产代码不导入 `experiment`。实验布局继承生产布局契约以复用状态适配器。
+生产代码不导入 `experiments`。实验布局继承生产布局契约以复用状态适配器。
 此目录不在 setuptools 的 `llmtuner*` 发布包中。
 
 `hccl_schedule.py` 保持删除，实验 PP 使用 PyTorch 原生 schedule。
 
 ## 本次迁移验证
+
+以下日志记录的是此前迁移批次。本次目录从 `experiment` 改为 `experiments`，
+并随公共模型模块合并更新了导入；按当前要求未运行测试或训练。
+历史日志不证明当前目录、导入、CLI 或训练行为已验证。
 
 迁移后在 `hyper-parallel-env` 中完成双进程 CPU/Gloo 的独立 write/resume，
 两次进程分别完成训练与恢复后的更新及生命周期检查：

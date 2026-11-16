@@ -71,7 +71,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
-from experiment.pipeline_parallel.model_execution import PipelineStageIO
+from experiments.pipeline_parallel.model_execution import PipelineStageIO
 from llmtuner.datasets.contracts import Batch
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.attention import (

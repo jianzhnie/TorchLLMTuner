@@ -24,39 +24,39 @@ import torch.nn as nn
 from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
 
-from experiment.pipeline_parallel.collectives import synchronize_local_errors
-from experiment.pipeline_parallel.execution import (
+from experiments.pipeline_parallel.collectives import synchronize_local_errors
+from experiments.pipeline_parallel.execution import (
     ExecutionLayout,
     resolve_execution_layout,
     validate_execution_chain,
 )
-from experiment.pipeline_parallel.fsdp_backend import (
+from experiments.pipeline_parallel.fsdp_backend import (
     apply_fsdp,
     validate_fsdp_environment,
 )
-from experiment.pipeline_parallel.fsdp_plan import (
+from experiments.pipeline_parallel.fsdp_plan import (
     resolve_pipeline_fsdp_configs,
 )
-from experiment.pipeline_parallel.layout import ModelPartLayout
-from experiment.pipeline_parallel.microbatch_drivers import (
+from experiments.pipeline_parallel.layout import ModelPartLayout
+from experiments.pipeline_parallel.microbatch_drivers import (
     validate_pipeline_schedule,
 )
-from experiment.pipeline_parallel.ownership import (
+from experiments.pipeline_parallel.ownership import (
     PipelineOwnership,
 )
-from experiment.pipeline_parallel.parallel_config import ParallelConfig
-from experiment.pipeline_parallel.pipeline_parallel import (
+from experiments.pipeline_parallel.parallel_config import ParallelConfig
+from experiments.pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
     apply_pp,
     build_pipeline_schedule,
     validate_microbatches,
 )
-from experiment.pipeline_parallel.plan import (
+from experiments.pipeline_parallel.plan import (
     validate_pipeline_cp_plan,
     validate_pipeline_ep_plan,
     validate_pipeline_tp_plan,
 )
-from experiment.pipeline_parallel.topology import (
+from experiments.pipeline_parallel.topology import (
     ParallelTopology,
     ParallelTopologySnapshot,
 )

@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     # Annotation-only. ``parallel_dims`` imports the training config, which
     # imports the checkpointer, so importing it for real here would close a
     # cycle back into the components package that only exists to name a type.
-    from experiment.pipeline_parallel.topology import ParallelTopology
+    from experiments.pipeline_parallel.topology import ParallelTopology
     from llmtuner.config.observability_config import MetricsConfig
     from llmtuner.config.training_config import TrainingConfig
 

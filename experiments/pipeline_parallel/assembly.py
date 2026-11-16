@@ -20,30 +20,30 @@ from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 
-from experiment.pipeline_parallel import compatibility
-from experiment.pipeline_parallel.aux_loss import register_aux_loss_metrics_hook
-from experiment.pipeline_parallel.builders import (
+from experiments.pipeline_parallel import compatibility
+from experiments.pipeline_parallel.aux_loss import register_aux_loss_metrics_hook
+from experiments.pipeline_parallel.builders import (
     PipelineScheduleFactory,
     TrainingBuilders,
 )
-from experiment.pipeline_parallel.collectives import synchronize_local_errors
-from experiment.pipeline_parallel.engine import (
+from experiments.pipeline_parallel.collectives import synchronize_local_errors
+from experiments.pipeline_parallel.engine import (
     ParamContext,
     TrainingEngine,
 )
-from experiment.pipeline_parallel.execution import (
+from experiments.pipeline_parallel.execution import (
     ExecutionLayout,
     validate_local_pipeline_layouts,
 )
-from experiment.pipeline_parallel.metrics import MetricsProcessor
-from experiment.pipeline_parallel.optimizer import OptimizersContainer
-from experiment.pipeline_parallel.parallelize import (
+from experiments.pipeline_parallel.metrics import MetricsProcessor
+from experiments.pipeline_parallel.optimizer import OptimizersContainer
+from experiments.pipeline_parallel.parallelize import (
     parallelize_model,
 )
-from experiment.pipeline_parallel.pipeline_parallel import (
+from experiments.pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
 )
-from experiment.pipeline_parallel.random_state import RNGCheckpointState
+from experiments.pipeline_parallel.random_state import RNGCheckpointState
 from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
@@ -84,14 +84,14 @@ if TYPE_CHECKING:
     from torch.distributed.checkpoint.stateful import Stateful
     from transformers import PretrainedConfig
 
-    from experiment.pipeline_parallel.builders import (
+    from experiments.pipeline_parallel.builders import (
         ProfilerOwner,
     )
-    from experiment.pipeline_parallel.config import (
+    from experiments.pipeline_parallel.config import (
         LLMTunerConfig,
     )
-    from experiment.pipeline_parallel.environment import RuntimeEnvironment
-    from experiment.pipeline_parallel.topology import ParallelTopology
+    from experiments.pipeline_parallel.environment import RuntimeEnvironment
+    from experiments.pipeline_parallel.topology import ParallelTopology
     from llmtuner.config.observability_config import ProfilerConfig
     from llmtuner.datasets.contracts import BaseDataLoader
 
@@ -719,7 +719,7 @@ def build_metrics_processor(
 
 def resolve_model_class(config):
     if config.model_type == "qwen3_moe":
-        from experiment.pipeline_parallel.model import Qwen3MoeForCausalLM
+        from experiments.pipeline_parallel.model import Qwen3MoeForCausalLM
 
         return Qwen3MoeForCausalLM
     return resolve_registered_model_class(config)

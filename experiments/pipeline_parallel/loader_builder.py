@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import grain.python as grain
 
-from experiment.pipeline_parallel.collators import PipelineTextCollator
+from experiments.pipeline_parallel.collators import PipelineTextCollator
 from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
 from llmtuner.components.tokenizer.kimi import KimiK3Tokenizer
 from llmtuner.components.tokenizer.multimodal import MultimodalTokenizer
@@ -57,7 +57,7 @@ except ImportError as error:
     MULTIMODAL_IMPORT_ERROR = error
 
 if TYPE_CHECKING:
-    from experiment.pipeline_parallel.config import (
+    from experiments.pipeline_parallel.config import (
         LLMTunerConfig,
     )
     from llmtuner.components.tokenizer.base import BaseTokenizer

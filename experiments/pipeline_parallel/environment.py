@@ -14,7 +14,7 @@ import torch
 from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
 
-from experiment.pipeline_parallel.topology import (
+from experiments.pipeline_parallel.topology import (
     ParallelTopology,
     build_device_mesh,
     resolve_parallel_topology,

@@ -44,8 +44,8 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 
-from experiment.pipeline_parallel.execution import validate_pipeline_stage_io
-from experiment.pipeline_parallel.registered_state import registered_state_paths
+from experiments.pipeline_parallel.execution import validate_pipeline_stage_io
+from experiments.pipeline_parallel.registered_state import registered_state_paths
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.contracts import DecoderStructure
 from llmtuner.utils.logging import get_logger

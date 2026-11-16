@@ -16,7 +16,7 @@ from weakref import WeakSet
 
 import torch
 
-from experiment.pipeline_parallel.capabilities import (
+from experiments.pipeline_parallel.capabilities import (
     has as capability,
 )
 from llmtuner.components.loss_contract import validate_normalization_tokens

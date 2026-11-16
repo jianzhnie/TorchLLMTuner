@@ -20,7 +20,7 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.tensor import Shard
 
-from experiment.pipeline_parallel.fsdp_policies import (
+from experiments.pipeline_parallel.fsdp_policies import (
     fsdp_shard_size,
     get_fsdp_reshard_after_forward_policy,
 )

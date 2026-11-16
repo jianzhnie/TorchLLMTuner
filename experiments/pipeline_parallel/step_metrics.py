@@ -8,13 +8,13 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from experiment.pipeline_parallel.aux_loss import collect_aux_loss_metrics
-from experiment.pipeline_parallel.collectives import all_reduce
-from experiment.pipeline_parallel.reductions import TrainingReductionMeshes
+from experiments.pipeline_parallel.aux_loss import collect_aux_loss_metrics
+from experiments.pipeline_parallel.collectives import all_reduce
+from experiments.pipeline_parallel.reductions import TrainingReductionMeshes
 from llmtuner.trainer.runtime.results import AccumulationResult, UpdateResult
 
 if TYPE_CHECKING:
-    from experiment.pipeline_parallel.topology import ParallelTopology
+    from experiments.pipeline_parallel.topology import ParallelTopology
     from llmtuner.trainer.runtime.training_observer import DispatchTimer
 
 

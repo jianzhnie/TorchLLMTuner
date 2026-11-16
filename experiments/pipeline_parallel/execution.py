@@ -6,7 +6,7 @@ from typing import Literal
 from torch import nn
 from torch.distributed import ProcessGroup
 
-from experiment.pipeline_parallel.model_execution import PipelineStageIO
+from experiments.pipeline_parallel.model_execution import PipelineStageIO
 from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.parallel.execution import ExecutionLayout as BaseExecutionLayout

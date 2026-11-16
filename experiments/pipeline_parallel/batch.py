@@ -10,11 +10,11 @@ import torch
 from torch.distributed import ProcessGroup
 from torch.utils._pytree import tree_map_only
 
-from experiment.pipeline_parallel.collectives import (
+from experiments.pipeline_parallel.collectives import (
     all_reduce,
     synchronize_local_errors,
 )
-from experiment.pipeline_parallel.loader_builder import (
+from experiments.pipeline_parallel.loader_builder import (
     build_dataloader as build_dataset_dataloader,
 )
 from llmtuner.accelerator.distributed import get_comm_device, get_world_size
@@ -31,7 +31,7 @@ from llmtuner.datasets.contracts import (
 from llmtuner.models.execution import validate_prepared_model_inputs
 
 if TYPE_CHECKING:
-    from experiment.pipeline_parallel.topology import ParallelTopology
+    from experiments.pipeline_parallel.topology import ParallelTopology
     from llmtuner.components.metrics import MetricsProcessor
     from llmtuner.config.llmtuner_config import LLMTunerConfig
 

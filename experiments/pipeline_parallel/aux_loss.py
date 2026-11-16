@@ -7,8 +7,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from experiment.pipeline_parallel.collectives import all_reduce
-from experiment.pipeline_parallel.topology import ParallelTopology
+from experiments.pipeline_parallel.collectives import all_reduce
+from experiments.pipeline_parallel.topology import ParallelTopology
 from llmtuner.accelerator.device import device_type
 from llmtuner.models.common.aux_loss import AuxLoss, rollup_aux_loss_metrics
 

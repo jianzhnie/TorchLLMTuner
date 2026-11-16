@@ -28,9 +28,9 @@ import torch.distributed as dist
 from transformers import HfArgumentParser
 
 import llmtuner
-from experiment.pipeline_parallel.cli_config import PARSER_GROUPS, cli_view
-from experiment.pipeline_parallel.config import LLMTunerConfig
-from experiment.pipeline_parallel.parallel_config import (
+from experiments.pipeline_parallel.cli_config import PARSER_GROUPS, cli_view
+from experiments.pipeline_parallel.config import LLMTunerConfig
+from experiments.pipeline_parallel.parallel_config import (
     ContextParallelConfig,
     ExpertParallelConfig,
     FSDPConfig,

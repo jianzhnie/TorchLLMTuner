@@ -25,25 +25,25 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
-from experiment.pipeline_parallel import assembly, engine
-from experiment.pipeline_parallel import batch as batch_runtime
-from experiment.pipeline_parallel import step_metrics as metrics_runtime
-from experiment.pipeline_parallel.builders import (
+from experiments.pipeline_parallel import assembly, engine
+from experiments.pipeline_parallel import batch as batch_runtime
+from experiments.pipeline_parallel import step_metrics as metrics_runtime
+from experiments.pipeline_parallel.builders import (
     TrainingBuilders,
 )
-from experiment.pipeline_parallel.collectives import (
+from experiments.pipeline_parallel.collectives import (
     all_reduce,
     set_pg_timeouts,
     synchronize_local_errors,
 )
-from experiment.pipeline_parallel.config import LLMTunerConfig
-from experiment.pipeline_parallel.environment import build_runtime_environment
-from experiment.pipeline_parallel.metrics import MetricsProcessor
-from experiment.pipeline_parallel.reductions import (
+from experiments.pipeline_parallel.config import LLMTunerConfig
+from experiments.pipeline_parallel.environment import build_runtime_environment
+from experiments.pipeline_parallel.metrics import MetricsProcessor
+from experiments.pipeline_parallel.reductions import (
     logical_tokens_per_rank,
     resolve_training_reduction_meshes,
 )
-from experiment.pipeline_parallel.topology import ParallelTopology
+from experiments.pipeline_parallel.topology import ParallelTopology
 from llmtuner.components.checkpointer.core.base import BaseCheckpointManager
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.lr_scheduler import LRSchedulersContainer

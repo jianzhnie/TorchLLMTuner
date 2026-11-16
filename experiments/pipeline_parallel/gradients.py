@@ -9,14 +9,14 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
-from experiment.pipeline_parallel.collectives import (
+from experiments.pipeline_parallel.collectives import (
     all_reduce,
     synchronize_local_errors,
 )
-from experiment.pipeline_parallel.collectives import (
+from experiments.pipeline_parallel.collectives import (
     clip_grad_norm_ as storage_clip_grad_norm_,
 )
-from experiment.pipeline_parallel.reductions import TrainingReductionMeshes
+from experiments.pipeline_parallel.reductions import TrainingReductionMeshes
 from llmtuner.accelerator.distributed import get_comm_device
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.gradient_norm import ReferenceNormGroup
@@ -25,7 +25,7 @@ from llmtuner.parallel.tensor_parallel.tensor_parallel import tp_sharded_param_i
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
-    from experiment.pipeline_parallel.topology import ParallelTopology
+    from experiments.pipeline_parallel.topology import ParallelTopology
 
 
 def unique_parameters(

@@ -17,18 +17,18 @@ import torch
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DTensor
 
-from experiment.pipeline_parallel import gradients
-from experiment.pipeline_parallel import runtime as pipeline
-from experiment.pipeline_parallel.collectives import (
+from experiments.pipeline_parallel import gradients
+from experiments.pipeline_parallel import runtime as pipeline
+from experiments.pipeline_parallel.collectives import (
     all_reduce,
     synchronize_local_errors,
 )
-from experiment.pipeline_parallel.execution import (
+from experiments.pipeline_parallel.execution import (
     ExecutionLayout,
     validate_local_pipeline_layouts,
 )
-from experiment.pipeline_parallel.reductions import TrainingReductionMeshes
-from experiment.pipeline_parallel.topology import ParallelTopology
+from experiments.pipeline_parallel.reductions import TrainingReductionMeshes
+from experiments.pipeline_parallel.topology import ParallelTopology
 from llmtuner.accelerator.spmd import spmd_context
 from llmtuner.components.loss import chunked_lm_head_cross_entropy, cross_entropy_loss
 from llmtuner.components.loss_contract import (

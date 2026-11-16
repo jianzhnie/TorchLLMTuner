@@ -6,7 +6,7 @@ import dataclasses
 import typing
 from copy import copy
 
-from experiment.pipeline_parallel.parallel_config import (
+from experiments.pipeline_parallel.parallel_config import (
     ContextParallelConfig,
     ExpertParallelConfig,
     FSDPConfig,

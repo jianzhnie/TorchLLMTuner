@@ -16,17 +16,17 @@ if TYPE_CHECKING:
     from torch.distributed.pipelining.schedules import _PipelineSchedule
     from torch.optim import Optimizer
 
-    from experiment.pipeline_parallel.config import (
+    from experiments.pipeline_parallel.config import (
         LLMTunerConfig,
     )
-    from experiment.pipeline_parallel.metrics import (
+    from experiments.pipeline_parallel.metrics import (
         MetricsProcessor,
     )
-    from experiment.pipeline_parallel.optimizer import OptimizersContainer
-    from experiment.pipeline_parallel.parallel_config import (
+    from experiments.pipeline_parallel.optimizer import OptimizersContainer
+    from experiments.pipeline_parallel.parallel_config import (
         ParallelConfig,
     )
-    from experiment.pipeline_parallel.topology import ParallelTopology
+    from experiments.pipeline_parallel.topology import ParallelTopology
     from llmtuner.components.checkpointer.core.base import BaseCheckpointManager
     from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
     from llmtuner.components.loss_contract import LossFunctions, LossSum

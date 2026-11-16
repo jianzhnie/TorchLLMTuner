@@ -37,17 +37,17 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 
-from experiment.pipeline_parallel.collectives import synchronize_local_errors
-from experiment.pipeline_parallel.microbatch_drivers import (
+from experiments.pipeline_parallel.collectives import synchronize_local_errors
+from experiments.pipeline_parallel.microbatch_drivers import (
     bind_stage_rng,
 )
-from experiment.pipeline_parallel.parallel_config import ParallelConfig
-from experiment.pipeline_parallel.partition import (
+from experiments.pipeline_parallel.parallel_config import ParallelConfig
+from experiments.pipeline_parallel.partition import (
     generate_llm_fqn_per_model_part,
     split_model_into_stages,
     validate_pipeline_ownership,
 )
-from experiment.pipeline_parallel.topology import ParallelTopology
+from experiments.pipeline_parallel.topology import ParallelTopology
 from llmtuner.components.loss import cross_entropy_loss
 from llmtuner.components.loss_contract import (
     LossSum,
