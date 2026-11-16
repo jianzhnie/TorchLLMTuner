@@ -43,6 +43,15 @@ def build_engine(model: nn.Module, *, num_chunks: int = 1) -> TrainingEngine:
     )
 
 
+def test_chunked_engine_rejects_unregistered_projection():
+    model = ToyCausalModel()
+    projection = model.lm_head
+    del model.lm_head
+    object.__setattr__(model, "lm_head", projection)
+    with pytest.raises(AttributeError, match="not registered"):
+        build_engine(model, num_chunks=2)
+
+
 @pytest.mark.parametrize("retain_loss", [False, True])
 @pytest.mark.parametrize("nonfinite", [None, float("nan"), float("inf")])
 def test_accumulation_preserves_group_losses_and_checks_every_group(

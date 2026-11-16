@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 
+from llmtuner.accelerator.collectives import synchronize_local_errors
 from llmtuner.config.data_config import DataloaderConfig
 from llmtuner.config.ema_config import EMAConfig
 from llmtuner.config.llmtuner_config import LLMTunerConfig
@@ -47,7 +48,7 @@ def main() -> None:
     parser.add_argument("--folder", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--save-step", type=int, default=50)
-    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument(
         "--dataset",
         default="/home/jianzhnie/llmtuner/hfhub/datasets/GAIR/LIMO/limo.jsonl",
@@ -96,6 +97,7 @@ def main() -> None:
                     tokenizer_path=args.tokenizer,
                     prompt_field="question",
                     response_field="solution",
+                    chat_template_kwargs={"enable_thinking": False},
                     packing="first_fit",
                     max_num_documents=1,
                 ),
@@ -110,6 +112,17 @@ def main() -> None:
         cfg.checkpoint.last_save_model_only = False
         cfg.checkpoint.load_step = args.save_step if args.phase == "resume" else 0
         trainer = Trainer(cfg)
+        boundary = args.folder / f"boundary-rank{rank}.pt"
+        save = trainer.checkpointer.save
+
+        def capture_boundary(*positional, **keywords):
+            saved = save(*positional, **keywords)
+            if args.phase == "write" and trainer.step == args.save_step:
+                assert saved
+                torch.save(on_cpu(snapshot(trainer)), boundary)
+            return saved
+
+        trainer.checkpointer.save = capture_boundary
         metrics = []
         step = trainer.train_step
 
@@ -129,11 +142,18 @@ def main() -> None:
             assert trainer.step == expected, (loaded, trainer.step, expected)
             if args.phase == "resume":
                 assert loaded
+                current = on_cpu(snapshot(trainer))
+                with synchronize_local_errors("LIMO loaded boundary comparison"):
+                    expected_state = torch.load(
+                        boundary, map_location="cpu", weights_only=False
+                    )
+                    assert_state_equal(current, expected_state)
             return loaded
 
         trainer.checkpointer.load = checked_load
         trainer.train()
         assert trainer.step == args.steps
+        assert len(metrics) == args.steps - args.save_step
         state = on_cpu(snapshot(trainer))
         batch = next(trainer.data_iterator())
         result = {
@@ -143,11 +163,12 @@ def main() -> None:
             "next_labels": on_cpu(batch.labels),
         }
         artifact = args.folder / f"continuous-rank{rank}.pt"
-        if args.phase == "write":
-            torch.save(result, artifact)
-        else:
-            expected = torch.load(artifact, map_location="cpu", weights_only=False)
-            assert_state_equal(result, expected)
+        with synchronize_local_errors("LIMO final continuation comparison"):
+            if args.phase == "write":
+                torch.save(result, artifact)
+            else:
+                expected = torch.load(artifact, map_location="cpu", weights_only=False)
+                assert_state_equal(result, expected)
         dist.barrier()
         print(f"PASS LIMO {args.phase} rank={rank} steps={args.steps}", flush=True)
     finally:

@@ -10,6 +10,51 @@ from llmtuner.parallel.execution import (
 )
 
 
+@pytest.mark.parametrize("chunked", [False, True])
+def test_hidden_capability_requires_structure_only_for_chunked_loss(chunked):
+    model = torch.nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
+    options = dict(
+        tp_size=1,
+        cp_size=1,
+        tp_plan=None,
+        chunked_loss=chunked,
+        compile_enabled=False,
+        activation_swap=False,
+    )
+    if chunked:
+        with pytest.raises(TypeError, match="Chunked loss.*DecoderStructure"):
+            resolve_execution_layout(model, **options)
+    else:
+        assert not resolve_execution_layout(model, **options).chunked_loss
+
+
+def test_chunked_assembly_rejects_missing_structure_before_stages(monkeypatch):
+    from llmtuner.config.parallel_config import ParallelConfig
+    from llmtuner.parallel.parallelize import parallelize_model
+
+    model = torch.nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities(hidden_states=True)
+    parameters = tuple(model.parameters())
+
+    def unexpected_transform(*args, **kwargs):
+        pytest.fail("Missing chunked declaration reached model transformation")
+
+    monkeypatch.setattr("llmtuner.parallel.parallelize.apply_tp", unexpected_transform)
+    with pytest.raises(TypeError, match="Chunked loss.*DecoderStructure"):
+        parallelize_model(
+            model,
+            cfg=ParallelConfig(),
+            mesh=None,
+            parallel_dims=None,
+            chunked_loss_num_chunks=2,
+        )
+    assert all(
+        actual is expected
+        for actual, expected in zip(model.parameters(), parameters, strict=True)
+    )
+
+
 @pytest.mark.parametrize("declaration", [{"head": "head"}, "head", 1])
 def test_execution_resolution_rejects_malformed_structure_declaration(declaration):
     model = torch.nn.Linear(2, 2)

@@ -1,65 +1,10 @@
-"""MoE scoring placement and BF16 backward arithmetic."""
-
-from types import SimpleNamespace
+"""Reject unavailable model-owned expert execution policies before allocation."""
 
 import pytest
 import torch
 
-from llmtuner.models.common.moe.packed_expert_execution import forward_packed_experts
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
-
-
-def test_packed_experts_score_before_down_projection(monkeypatch):
-    torch.manual_seed(37)
-    inputs = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)
-    gate_up = torch.randn(1, 12, 8, dtype=torch.bfloat16, requires_grad=True)
-    down = torch.randn(1, 8, 6, dtype=torch.bfloat16, requires_grad=True)
-    scores = torch.tensor([0.17, 0.53, 0.89], requires_grad=True)
-    indices = torch.arange(3)
-
-    def dispatch(hidden, routing_scores, expert_ids, counts):
-        return (
-            hidden,
-            counts,
-            SimpleNamespace(
-                topk_scores_experts_sorted_N=routing_scores,
-                token_indices_experts_sorted_N=indices,
-            ),
-        )
-
-    def grouped_mm(hidden, weight, *, offs):
-        assert offs.tolist() == [3]
-        return hidden @ weight[0]
-
-    monkeypatch.setattr(torch, "_grouped_mm", grouped_mm)
-    module = SimpleNamespace(
-        gate=lambda hidden: (None, scores, torch.zeros(3, 1, dtype=torch.long)),
-        experts=SimpleNamespace(
-            num_experts=1,
-            gate_up_proj=gate_up,
-            down_proj=down,
-            act_fn=torch.nn.functional.silu,
-        ),
-        local_dispatcher=SimpleNamespace(dispatch=dispatch),
-    )
-    actual = forward_packed_experts(module, inputs.unsqueeze(0))
-    gate_weight, up_weight = gate_up[0].chunk(2, dim=0)
-    gate, up = inputs @ gate_weight.T, inputs @ up_weight.T
-    hidden = torch.nn.functional.silu(gate) * up
-    weighted = (hidden.float() * scores[:, None]).bfloat16()
-    expected = weighted @ down[0].T
-    rounded_scores = (hidden * scores[:, None].bfloat16()) @ down[0].T
-    assert not torch.equal(expected, rounded_scores)
-    torch.testing.assert_close(actual[0], expected, atol=0, rtol=0)
-    after_down = ((hidden @ down[0].T).float() * scores[:, None]).bfloat16()
-    assert not torch.equal(expected, after_down)
-    parameters = (inputs, gate_up, down, scores)
-    probe = torch.randn_like(actual)
-    actual_gradients = torch.autograd.grad(actual, parameters, probe, retain_graph=True)
-    expected_gradients = torch.autograd.grad(expected, parameters, probe[0])
-    for observed, reference in zip(actual_gradients, expected_gradients, strict=True):
-        torch.testing.assert_close(observed, reference, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("activation", ["silu", "gelu"])

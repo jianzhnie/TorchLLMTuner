@@ -282,7 +282,6 @@ def validate_contract(contract, *, allow_legacy=False):
             "llmtuner/models/hf/padding_metadata.py",
             "llmtuner/models/qwen/qwen3_5/padding_metadata.py",
             "llmtuner/parallel/expert_parallel/token_dispatch.py",
-            "llmtuner/models/common/scatter_add.py",
         }
         require(
             required <= contract["numerical_sources_sha256"].keys(),

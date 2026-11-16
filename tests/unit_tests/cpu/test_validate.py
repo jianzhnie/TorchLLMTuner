@@ -22,7 +22,7 @@ import torch
 
 from llmtuner.components.loss import IGNORE_INDEX, cross_entropy_loss
 from llmtuner.config import LLMTunerConfig, TrainingConfig, ValidationConfig
-from llmtuner.models.common.validation import temporary_attention_mask
+from llmtuner.models.common.attention import temporary_attention_mask
 from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.trainer.runtime.engine import TrainingEngine
 from llmtuner.trainer.runtime.validation import (

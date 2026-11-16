@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.common.attention.masks import build_dense_attention_mask
+from llmtuner.models.common.attention import build_dense_attention_mask
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
 

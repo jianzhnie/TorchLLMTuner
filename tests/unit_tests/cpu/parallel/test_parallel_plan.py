@@ -11,6 +11,46 @@ from llmtuner.parallel import ParallelPlan, PlanTarget
 from llmtuner.parallel.plan import snapshot_model_bindings
 
 
+@pytest.mark.parametrize("change", ["install", "remove", "replace"])
+def test_plan_rejects_compiled_execution_change_without_forward_replacement(change):
+    model = nn.Sequential(nn.Linear(2, 2))
+    # The same slot is used by Module.compile; no compiler dependency is needed
+    # to exercise __call__ and the ownership validator.
+    if change != "install":
+        model[0]._compiled_call_impl = lambda inputs: model[0].forward(inputs) + 1
+    plan = ParallelPlan("tp", (), 2, "functional", **snapshot_model_bindings(model))
+    forward = model[0].forward.__func__
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+    plan.validate_binding(model)
+    model[0]._compiled_call_impl = (
+        None if change == "remove" else lambda inputs: model[0].forward(inputs) + 2
+    )
+    assert model[0].forward.__func__ is forward
+    with pytest.raises(ValueError, match="Stale plan compiled call binding: 0"):
+        plan.validate_binding(model)
+    assert all(
+        actual is expected
+        for actual, expected in zip(model.parameters(), parameters, strict=True)
+    )
+    assert torch.equal(rng, torch.get_rng_state())
+
+
+def test_plan_rebinds_after_real_module_compile():
+    model = nn.Sequential(nn.Linear(2, 2))
+    plan = ParallelPlan("tp", (), 2, "functional", **snapshot_model_bindings(model))
+    inputs = torch.ones(1, 2)
+    expected = model(inputs).detach()
+    model[0].compile(backend="eager")
+    with pytest.raises(ValueError, match="Stale plan compiled call binding: 0"):
+        plan.validate_binding(model)
+    refreshed = ParallelPlan(
+        "tp", (), 2, "functional", **snapshot_model_bindings(model)
+    )
+    torch.testing.assert_close(model(inputs), expected)
+    refreshed.validate_binding(model)
+
+
 def test_plan_counts_resolved_targets_without_tensor_payloads() -> None:
     plan = ParallelPlan(
         stage="tp",

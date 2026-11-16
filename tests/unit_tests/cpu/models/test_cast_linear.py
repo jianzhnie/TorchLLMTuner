@@ -25,9 +25,8 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
 )
 
-from llmtuner.models.common.cast_linear import (
+from llmtuner.models.common.linear import (
     CastLinear,
-    build_cast_linear,
     build_lm_head,
 )
 from llmtuner.models.configuration import build_model_config, resolve_model_class
@@ -65,15 +64,9 @@ def _tiny_qwen3_config(compute_dtype: str | None = None):
 
 @pytest.mark.parametrize("dtype", [torch.int64, torch.bool, torch.complex64, "float32"])
 def test_invalid_compute_dtype_preserves_rng_and_original_parameters(dtype):
-    linear = nn.Linear(4, 3)
-    weight, bias = linear.weight, linear.bias
     rng = torch.random.get_rng_state().clone()
     with pytest.raises(ValueError, match="compute_dtype"):
         CastLinear(4, 3, compute_dtype=dtype)
-    with pytest.raises(ValueError, match="compute_dtype"):
-        build_cast_linear(linear, compute_dtype=dtype)
-    assert linear.weight is weight
-    assert linear.bias is bias
     torch.testing.assert_close(torch.random.get_rng_state(), rng)
 
 
@@ -104,51 +97,6 @@ def test_parameters_keep_their_dtype_and_so_do_gradients() -> None:
     assert linear.weight.dtype == torch.bfloat16
     assert linear.weight.grad.dtype == torch.bfloat16
     assert x.grad.dtype == torch.bfloat16
-
-
-def test_compute_dtype_matching_the_model_is_bitwise_plain_linear() -> None:
-    torch.manual_seed(0)
-    plain = nn.Linear(16, 8).to(torch.bfloat16)
-    cast = build_cast_linear(plain, compute_dtype=torch.bfloat16)
-    x = torch.randn(4, 16, dtype=torch.bfloat16)
-
-    assert torch.equal(cast(x), plain(x))
-
-
-# -- the in-place swap ----------------------------------------------------------
-
-
-def test_swap_reuses_the_parameter_objects() -> None:
-    """A tied head shares one Parameter with the embedding; only reusing the
-    object keeps that tie (and the optimizer's parameter identity) intact."""
-    linear = nn.Linear(16, 8)
-    weight, bias = linear.weight, linear.bias
-
-    cast = build_cast_linear(linear, compute_dtype=torch.float32)
-
-    assert cast.weight is weight
-    assert cast.bias is bias
-
-
-def test_swap_leaves_the_state_dict_key_set_untouched() -> None:
-    """The checkpoint contract: subclassing nn.Linear, rather than wrapping
-    one, is what keeps ``lm_head.weight`` spelled exactly as before."""
-
-    class _CausalLM(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lm_head = nn.Linear(16, 8)
-
-    model = _CausalLM()
-    keys_before = set(model.state_dict())
-    model.lm_head = build_cast_linear(model.lm_head, compute_dtype=torch.float32)
-
-    assert set(model.state_dict()) == keys_before
-
-
-def test_swap_rejects_a_non_linear_head() -> None:
-    with pytest.raises(TypeError, match="nn.Linear"):
-        build_cast_linear(nn.Identity(), compute_dtype=torch.float32)
 
 
 def test_unknown_compute_dtype_name_fails_loudly() -> None:
@@ -191,17 +139,6 @@ def test_default_off_is_unchanged() -> None:
     ):
         assert name_a == name_b
         assert torch.equal(tensor_a, tensor_b)
-
-
-def test_cast_conversion_preserves_rng_and_module_mode():
-    linear = nn.Linear(4, 8).eval()
-    rng = torch.random.get_rng_state().clone()
-    cast = build_cast_linear(linear, compute_dtype=torch.float32)
-    assert not cast.training
-    assert cast.weight is linear.weight
-    assert cast.bias is linear.bias
-    assert cast.weight.device == linear.weight.device
-    torch.testing.assert_close(torch.random.get_rng_state(), rng)
 
 
 def test_cast_linear_preserves_compute_dtype_under_autocast():
