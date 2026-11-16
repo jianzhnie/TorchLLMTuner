@@ -1,4 +1,4 @@
-"""Shared FQN checkpoint state for training optimizers and EMA averages."""
+"""Shared parameter ownership and FQN checkpoint state for optimizers and EMA."""
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
@@ -26,7 +26,7 @@ from .state_dict import collect_local_optimizer_state, unflatten_optim_state_dic
 
 
 class OptimizerCheckpointState(Stateful):
-    """Serialize owned state groups without exposing optimizer mutation methods."""
+    """Validate and serialize state groups without optimizer mutation methods."""
 
     model_parts: list[nn.Module]
     optimizers: Sequence[Optimizer]
@@ -68,6 +68,44 @@ class OptimizerCheckpointState(Stateful):
         if bound is not None:
             for layout, snapshot in zip(self.runtime_layouts, bound, strict=True):
                 snapshot.validate(layout, consumer="Optimizer")
+
+    def _validate_params(self, all_params: list[nn.Parameter]) -> None:
+        """Validate trainable parameter ownership before allocating state groups."""
+        trainable = [
+            (paths[0], parameter)
+            for layout in self.runtime_layouts
+            for parameter, paths in layout.parameter_aliases.items()
+            if parameter.requires_grad
+        ]
+        registered = {id(param) for param in all_params}
+        missing = [
+            (name, param) for name, param in trainable if id(param) not in registered
+        ]
+        if missing:
+            names = ", ".join(
+                f"{name} ({tuple(param.shape)})" for name, param in missing
+            )
+            raise ValueError(
+                f"optimizer.param_groups left {len(missing)} trainable parameter(s) "
+                f"unassigned, so they would keep their initial values: {names}. "
+                "Add a catch-all ParamGroupConfig(pattern='.*') last."
+            )
+
+        foreign = registered - {id(parameter) for _, parameter in trainable}
+        if foreign:
+            raise ValueError(
+                f"optimizer.param_groups contains {len(foreign)} parameter(s) "
+                "outside the current trainable model ownership. Rebuild groups "
+                "from the final model parameters after assembly."
+            )
+
+        duplicates = len(all_params) - len(registered)
+        if duplicates:
+            raise ValueError(
+                f"optimizer.param_groups assigned {duplicates} parameter(s) to more "
+                f"than one group. Check for repeated model parts or parameters "
+                f"shared across local model parts."
+            )
 
     def state_dict(self) -> dict[str, Any]:
         """A flat, FQN-keyed state dict covering every inner optimizer.

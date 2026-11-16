@@ -529,58 +529,6 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
 
         return all_params
 
-    def _validate_params(self, all_params: list[nn.Parameter]) -> None:
-        """Every trainable parameter must land in exactly one group.
-
-        Upstream asserts equality of the id sets; this names *which* invariant
-        broke, because the two directions have different fixes and upstream's
-        count-only message leaves them indistinguishable. User-reachable both
-        ways, which is why this raises ``ValueError`` rather than asserting:
-
-        * missing -- explicit ``param_groups`` without a catch-all, so a
-          parameter would silently stay frozen at its initial value.
-        * assigned twice -- shared parameters or repeated modules across local
-          model parts. First-match-wins prevents duplicates within one part,
-          but each part constructs its own groups.
-        * foreign -- a group contains a tensor outside the current trainable
-          model ownership, including a parameter replaced during assembly.
-        """
-        trainable = [
-            (paths[0], parameter)
-            for layout in self.runtime_layouts
-            for parameter, paths in layout.parameter_aliases.items()
-            if parameter.requires_grad
-        ]
-        registered = {id(param) for param in all_params}
-        missing = [
-            (name, param) for name, param in trainable if id(param) not in registered
-        ]
-        if missing:
-            names = ", ".join(
-                f"{name} ({tuple(param.shape)})" for name, param in missing
-            )
-            raise ValueError(
-                f"optimizer.param_groups left {len(missing)} trainable parameter(s) "
-                f"unassigned, so they would keep their initial values: {names}. "
-                "Add a catch-all ParamGroupConfig(pattern='.*') last."
-            )
-
-        foreign = registered - {id(parameter) for _, parameter in trainable}
-        if foreign:
-            raise ValueError(
-                f"optimizer.param_groups contains {len(foreign)} parameter(s) "
-                "outside the current trainable model ownership. Rebuild groups "
-                "from the final model parameters after assembly."
-            )
-
-        duplicates = len(all_params) - len(registered)
-        if duplicates:
-            raise ValueError(
-                f"optimizer.param_groups assigned {duplicates} parameter(s) to more "
-                f"than one group. Check for repeated model parts or parameters "
-                f"shared across local model parts."
-            )
-
     def __iter__(self) -> Iterator[Optimizer]:
         return iter(self.optimizers)
 

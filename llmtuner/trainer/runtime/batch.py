@@ -43,10 +43,14 @@ def resolve_data_parallel_rank(
     return mesh.get_local_rank(), mesh.size()
 
 
-def build_training_dataloader(
-    cfg: LLMTunerConfig, *, parallel_dims: ParallelTopology | None
+def build_rank_dataloader(
+    cfg: LLMTunerConfig,
+    *,
+    parallel_dims: ParallelTopology | None,
+    repeat: bool = True,
+    dataset: str | None = None,
 ) -> BaseDataLoader:
-    """Build the recoverable loader for this rank's explicit data ownership."""
+    """Build a loader using shared DP ownership and per-rank token geometry."""
     dp_rank, dp_world_size = resolve_data_parallel_rank(parallel_dims)
     batch_size = resolve_batch_size_per_rank(cfg.global_batch_size, dp_world_size)
     return build_dataset_dataloader(
@@ -54,6 +58,8 @@ def build_training_dataloader(
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
         num_tokens_per_batch=batch_size * cfg.max_seq_len,
+        repeat=repeat,
+        dataset=dataset,
     )
 
 

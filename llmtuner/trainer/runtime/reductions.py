@@ -24,6 +24,16 @@ class TrainingReductionMeshes:
     sequence_mesh: DeviceMesh | None
 
 
+def logical_tokens_per_rank(
+    num_tokens: int, parallel_dims: ParallelTopology | None
+) -> int:
+    """Remove CP/TP replicas from loader token accounting."""
+    sequence_shards = (
+        1 if parallel_dims is None else parallel_dims.cp * parallel_dims.tp
+    )
+    return num_tokens // sequence_shards
+
+
 def resolve_loss_reduction_meshes(
     parallel_dims: ParallelTopology | None,
 ) -> tuple[DeviceMesh | None, DeviceMesh | None]:

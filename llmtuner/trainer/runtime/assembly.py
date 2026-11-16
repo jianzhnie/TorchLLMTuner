@@ -77,6 +77,12 @@ if TYPE_CHECKING:
     from .environment import RuntimeEnvironment
 
 
+def _resolve_factory(
+    factory: Callable[..., Any] | None, default: Callable[..., Any]
+) -> Callable[..., Any]:
+    return default if factory is None else factory
+
+
 def build_profiler(
     config: ProfilerConfig,
     *,
@@ -89,9 +95,9 @@ def build_profiler(
     The factory owns partial construction. Trainer retains the returned owner
     before entering it, so close retries remain available on failure.
     """
-    factory = None if builders is None else builders.profiler
-    if factory is None:
-        factory = Profiler
+    factory = _resolve_factory(
+        None if builders is None else builders.profiler, Profiler
+    )
     owner = factory(config, global_step=global_step, base_folder=base_folder)
     if not callable(getattr(owner, "close", None)):
         raise TypeError("Profiler factory must return an owner with close()")
@@ -207,6 +213,8 @@ def build_model(
         and cfg.checkpoint.initial_load_in_hf
         and cfg.checkpoint.initial_load_path
     )
+    build_on_meta = load_initial_weights or cfg.model.initialization_device == "meta"
+    initialize_from_meta = build_on_meta and not load_initial_weights
     if load_initial_weights and parallel_dims is not None and parallel_dims.ep_enabled:
         # The registered format owns expert key/layout support. Assembly must
         # not infer it from architecture names or duplicate packing rules.
@@ -220,28 +228,27 @@ def build_model(
             sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
         ):
             compatibility.ep_hf_initial_load(parallel_dims.ep)
-    if not load_initial_weights and cfg.model.initialization_device == "meta":
-        if any(
-            degree > 1
-            for degree in (
-                cfg.parallel.tp_size,
-                cfg.parallel.pp_size,
-                cfg.parallel.cp_size,
-                cfg.parallel.ep_size,
-            )
-        ):
-            raise UnsupportedCombinationError(
-                "Random meta initialization supports local/DP/FSDP; "
-                "TP/EP/PP/CP paths need an ownership-aware initializer."
-            )
+    if initialize_from_meta and any(
+        degree > 1
+        for degree in (
+            cfg.parallel.tp_size,
+            cfg.parallel.pp_size,
+            cfg.parallel.cp_size,
+            cfg.parallel.ep_size,
+        )
+    ):
+        raise UnsupportedCombinationError(
+            "Random meta initialization supports local/DP/FSDP; "
+            "TP/EP/PP/CP paths need an ownership-aware initializer."
+        )
     model_class = resolve_model_class(text_config)
-    if not load_initial_weights and cfg.model.initialization_device == "meta":
+    if initialize_from_meta:
         for method in ("initialize_parameters", "materialization_buffers"):
             if not callable(getattr(model_class, method, None)):
                 raise UnsupportedCombinationError(
                     f"Random meta initialization requires model-owned {method}()"
                 )
-    if load_initial_weights or cfg.model.initialization_device == "meta":
+    if build_on_meta:
         with torch.device("meta"):
             model = model_class(text_config)
     else:
@@ -341,24 +348,16 @@ def _apply_parallelism(
         materialization_error: BaseException | None = None
         try:
             for model_part in assembled.model_parts:
-                if cfg.parallel.fsdp_config.fsdp_cpu_offload:
-                    materialize_meta_model(
-                        model_part,
-                        device,
-                        parameter_device=torch.device("cpu"),
-                        offloaded_parameters=_fsdp_managed_parameters(model_part),
-                        runtime_buffers=_model_materialization_buffers(
-                            model_part, device
-                        ),
-                    )
-                else:
-                    materialize_meta_model(
-                        model_part,
-                        device,
-                        runtime_buffers=_model_materialization_buffers(
-                            model_part, device
-                        ),
-                    )
+                cpu_offload = cfg.parallel.fsdp_config.fsdp_cpu_offload
+                materialize_meta_model(
+                    model_part,
+                    device,
+                    parameter_device=torch.device("cpu") if cpu_offload else None,
+                    offloaded_parameters=(
+                        _fsdp_managed_parameters(model_part) if cpu_offload else None
+                    ),
+                    runtime_buffers=_model_materialization_buffers(model_part, device),
+                )
         except BaseException as error:
             materialization_error = error
         # FSDP _apply may manage communication state. Finish materialization
@@ -532,13 +531,9 @@ def build_optimizer_stack(
         if layouts:
             validate_model_part_layouts(model_parts, layouts)
     factories = builders or TrainingBuilders()
-    optimizer_factory = (
-        OptimizersContainer if factories.optimizer is None else factories.optimizer
-    )
-    scheduler_factory = (
-        build_lr_scheduler if factories.scheduler is None else factories.scheduler
-    )
-    ema_factory = EMA if factories.ema is None else factories.ema
+    optimizer_factory = _resolve_factory(factories.optimizer, OptimizersContainer)
+    scheduler_factory = _resolve_factory(factories.scheduler, build_lr_scheduler)
+    ema_factory = _resolve_factory(factories.ema, EMA)
     optimizer = optimizer_factory(
         cfg.optimizer,
         sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
@@ -568,8 +563,9 @@ def build_optimizer_stack(
         )
         on_service_acquired("lr_scheduler", lr_scheduler)
         ema_config = cfg.training.ema
-        ema = (
-            ema_factory(
+        ema = None
+        if ema_config is not None:
+            ema = ema_factory(
                 model_parts=model_parts,
                 runtime_layouts=layouts,
                 sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
@@ -581,9 +577,6 @@ def build_optimizer_stack(
                 update_every_n_steps=ema_config.update_every_n_steps,
                 buffer_patterns=ema_config.buffer_patterns,
             )
-            if ema_config is not None
-            else None
-        )
         on_service_acquired("ema", ema)
         # Container hooks run once per optimizer step, including multiple PP parts.
         register_aux_loss_metrics_hook(optimizer, model_parts=model_parts)
@@ -648,9 +641,7 @@ def build_checkpointer(
         else DistributedCheckpointManager
     )
     factories = builders or TrainingBuilders()
-    manager_factory = (
-        manager_cls if factories.checkpoint is None else factories.checkpoint
-    )
+    manager_factory = _resolve_factory(factories.checkpoint, manager_cls)
     return manager_factory(
         cfg.checkpoint,
         model_parts=model_assembly.model_parts,
@@ -683,9 +674,7 @@ def build_metrics_processor(
     The callback must retain the service without raising or performing device work.
     """
     factories = builders or TrainingBuilders()
-    metrics_factory = (
-        MetricsProcessor if factories.metrics is None else factories.metrics
-    )
+    metrics_factory = _resolve_factory(factories.metrics, MetricsProcessor)
     with synchronize_local_errors("Metrics construction", group=error_group):
         if not callable(on_service_acquired):
             raise TypeError("Metrics construction requires a callable resource owner")

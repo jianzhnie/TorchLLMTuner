@@ -13,12 +13,12 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 
 def validate_routing_config(config: DeepseekV4Config) -> None:
     """Reject invalid expert selection before router state is allocated."""
-    for name in ("num_local_experts", "num_experts_per_tok"):
+    for name in ("n_routed_experts", "num_experts_per_tok"):
         value = getattr(config, name)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"DeepSeek V4 {name} must be a positive integer")
-    if config.num_experts_per_tok > config.num_local_experts:
-        raise ValueError("DeepSeek V4 top-k cannot exceed num_local_experts")
+    if config.num_experts_per_tok > config.n_routed_experts:
+        raise ValueError("DeepSeek V4 top-k cannot exceed n_routed_experts")
     if config.scoring_func not in ACT2FN:
         raise ValueError(
             f"DeepSeek V4 unsupported scoring_func: {config.scoring_func!r}"
@@ -32,7 +32,7 @@ class DeepseekV4TopKRouter(reference.DeepseekV4TopKRouter):
         validate_routing_config(config)
         nn.Module.__init__(self)
         self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
+        self.num_experts = config.n_routed_experts
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
         self.score_fn = ACT2FN[config.scoring_func]
@@ -62,7 +62,7 @@ class DeepseekV4HashRouter(reference.DeepseekV4HashRouter):
         validate_routing_config(config)
         nn.Module.__init__(self)
         self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
+        self.num_experts = config.n_routed_experts
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
         self.score_fn = ACT2FN[config.scoring_func]

@@ -17,7 +17,7 @@ def assert_equal(left, right):
         assert left.keys() == right.keys()
         for key in left:
             assert_equal(left[key], right[key])
-    elif isinstance(left, (list, tuple)):
+    elif isinstance(left, list | tuple):
         assert len(left) == len(right)
         for x, y in zip(left, right, strict=True):
             assert_equal(x, y)

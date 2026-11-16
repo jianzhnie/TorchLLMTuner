@@ -269,6 +269,7 @@ def apply_fsdp_to_decoder(
         if not isinstance(structure, DecoderStructure):
             raise TypeError("Decoder FSDP requires a model-owned DecoderStructure")
         decoder = structure.bind(model)
+        all_modules = tuple(model.modules())
         if root_owned_boundaries and (
             fsdp_implementation != "native"
             or cpu_offload
@@ -299,7 +300,7 @@ def apply_fsdp_to_decoder(
         # Models declare parameters that need a separate storage-dtype group. Wrap
         # their children first and those direct parameters last, preserving FQNs.
         separate_units = []
-        for attention in model.modules():
+        for attention in all_modules:
             names = getattr(attention, "fsdp_separate_parameter_names", ())
             if not names:
                 continue
@@ -330,7 +331,7 @@ def apply_fsdp_to_decoder(
             separate_units.append((attention, next(iter(separate_dtypes))))
         if separate_units:
             parameter_owners_by_module: dict[nn.Parameter, set[nn.Module]] = {}
-            for module in model.modules():
+            for module in all_modules:
                 for parameter in module.parameters(recurse=False):
                     parameter_owners_by_module.setdefault(parameter, set()).add(module)
             for module, _ in separate_units:

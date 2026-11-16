@@ -187,12 +187,21 @@ def match_tp_sharding_spec(
 
 
 def resolve_vocab_parallel_targets(
-    model: nn.Module, plan: Mapping[str, str | ShardingConfig]
+    model: nn.Module,
+    plan: Mapping[str, str | ShardingConfig],
+    *,
+    module_bindings: tuple[tuple[str, nn.Module], ...] | None = None,
 ) -> list[tuple[str, nn.Embedding]]:
     """Resolve HF ``embedding_rowwise`` entries in first-match plan order."""
+    modules = (
+        module_bindings if module_bindings is not None else tuple(model.named_modules())
+    )
+    unique_modules: dict[int, tuple[str, nn.Module]] = {}
+    for path, module in modules:
+        unique_modules.setdefault(id(module), (path, module))
     return [
         (path, module)
-        for path, module in model.named_modules()
+        for path, module in unique_modules.values()
         if isinstance(module, nn.Embedding)
         and next(
             (

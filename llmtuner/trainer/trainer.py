@@ -57,9 +57,11 @@ from .runtime import metrics as metrics_runtime
 from .runtime import validation as validation_runtime
 from .runtime.builders import TrainingBuilders
 from .runtime.environment import build_runtime_environment
-from .runtime.progress import TrainingProgress
-from .runtime.reductions import resolve_training_reduction_meshes
-from .runtime.results import StepResult
+from .runtime.reductions import (
+    logical_tokens_per_rank,
+    resolve_training_reduction_meshes,
+)
+from .runtime.results import StepResult, TrainingProgress
 from .runtime.training_observer import (
     DispatchTimerResources,
     TrainingObserver,
@@ -82,6 +84,7 @@ class Trainer:
     # process group) sees the same "not built yet" state an attribute would
     # give, rather than an AttributeError.
     cfg: LLMTunerConfig
+    _builders: TrainingBuilders | None
     rank: int
     local_rank: int
     world_size: int
@@ -189,7 +192,7 @@ class Trainer:
         error_group = environment.error_group
         self.error_group = error_group
 
-        factories = getattr(self, "_builders", None) or TrainingBuilders()
+        factories = self._builders or TrainingBuilders()
         loss_functions = assembly.build_loss_functions(
             cfg, factory=factories.loss, error_group=error_group
         )
@@ -215,7 +218,7 @@ class Trainer:
             cfg,
             model_parts=model_assembly.model_parts,
             layouts=model_assembly.layouts,
-            builders=getattr(self, "_builders", None),
+            builders=factories,
             parallel_dims=environment.parallel_dims,
             error_group=error_group,
             on_service_acquired=lambda name, service: setattr(self, name, service),
@@ -233,7 +236,7 @@ class Trainer:
 
         # The checkpointer captures the loader cursor alongside model state.
         with synchronize_local_errors("Dataloader construction", group=error_group):
-            self.dataloader = batch_runtime.build_training_dataloader(
+            self.dataloader = batch_runtime.build_rank_dataloader(
                 cfg, parallel_dims=environment.parallel_dims
             )
 
@@ -250,7 +253,7 @@ class Trainer:
             train_state=self.progress,
             device=environment.device,
             error_group=error_group,
-            builders=getattr(self, "_builders", None),
+            builders=factories,
         )
 
         assembly.build_metrics_processor(
@@ -260,7 +263,7 @@ class Trainer:
             num_parameters=prepared_model.num_parameters,
             num_trainable_parameters=prepared_model.num_trainable_parameters,
             error_group=error_group,
-            builders=getattr(self, "_builders", None),
+            builders=factories,
             on_service_acquired=lambda name, service: setattr(self, name, service),
         )
         self.training_observer = TrainingObserver(
@@ -306,10 +309,7 @@ class Trainer:
 
     @staticmethod
     def count_valid_tokens(batch: Batch | TrainerBatch) -> int:
-        """The number of labels that contribute to the loss, pre-shard.
-
-        Body in ``batch.py``.
-        """
+        """Count loss-bearing labels before sequence sharding."""
         return batch_runtime.count_valid_tokens(batch)
 
     # -- the step, one function per level --------------------------------------
@@ -328,11 +328,9 @@ class Trainer:
         )
         # The loader batch is replicated across CP/TP. Commit this rank's
         # share only after every local counter has passed group validation.
-        parallel_dims = getattr(self, "parallel_dims", None)
-        sequence_shards = (
-            1 if parallel_dims is None else parallel_dims.cp * parallel_dims.tp
+        self.ntokens_seen += logical_tokens_per_rank(
+            num_tokens, getattr(self, "parallel_dims", None)
         )
-        self.ntokens_seen += num_tokens // sequence_shards
         return prepared
 
     def forward_backward_step(
@@ -341,7 +339,7 @@ class Trainer:
         *,
         global_valid_tokens: torch.Tensor,
     ) -> StepResult:
-        """Delegate one accumulation group and return its structured result."""
+        """Execute one accumulation group through the assembled engine."""
         return self.training_engine.forward_backward(
             microbatch["batch"],
             global_valid_tokens=global_valid_tokens,
@@ -417,17 +415,16 @@ class Trainer:
             microbatches.append(microbatch)
             local_valid_tokens += microbatch["num_valid_tokens"]
             local_routing_tokens += microbatch["num_routing_tokens"]
+            # The queue owns pending batches; release the loop's extra reference
+            # so popping a consumed batch also releases its host tensors.
+            del microbatch
 
         # Keep the count on device so normalizing the loss adds no device sync
         # to the training path.
-        local_valid_tokens_tensor = torch.tensor(
+        global_valid_tokens = torch.tensor(
             local_valid_tokens, dtype=torch.int64, device=self.device
         )
-        global_valid_tokens = local_valid_tokens_tensor
         if dp_mesh is not None:
-            # Clone before the in-place collective: the local count is read
-            # again below for this rank's own per-rank average.
-            global_valid_tokens = global_valid_tokens.clone()
             all_reduce(global_valid_tokens, group=dp_mesh.get_group())
 
         # A fully masked accumulation window has no average loss. Assert the
@@ -516,7 +513,6 @@ class Trainer:
             accumulation=accumulation,
             global_valid_tokens=global_valid_tokens,
             local_valid_tokens=local_valid_tokens,
-            local_valid_tokens_tensor=local_valid_tokens_tensor,
             reduction_meshes=reduction_meshes,
             update=update_result,
             lr_metrics=lr_metrics,
@@ -597,165 +593,7 @@ class Trainer:
                 if loaded:
                     logger.info(f"Resuming from step {self.step}")
 
-            # The step this process's *first* train step lands on. Startup work --
-            # process groups, the model build, the first collective, compile --
-            # runs under the long process-group timeout those groups were created
-            # with, because that is what genuinely takes minutes. Once one step
-            # has completed, that work is behind this process, so the timeout can
-            # be lowered to the one a real stall should be measured against (see
-            # ``set_pg_timeouts``). Relative to the loaded step rather than
-            # absolute ``1`` so a resumed run lowers it too.
-            first_step_of_this_process = self.step + 1
-
-            # ``batch_generator`` wraps the bare source so every fetch carries
-            # its token and loading-time accounting; the loop below sees only
-            # batches. One exception type crosses that boundary.
-            with synchronize_local_errors(
-                "Training input initialization", group=self.error_group
-            ):
-                data_iterator = self.batch_generator(self.data_iterator())
-            # Entered around the loop rather than around a single step: the
-            # torch profiler's schedule counts iterations across the whole run
-            # and only dumps a trace at the end of a cycle, so a per-step
-            # context would never reach one. Left open when profiling is off --
-            # the Profiler holds no handles in that case.
-            with ExitStack() as stack:
-                # Local tracing setup can fail after peers acquired handles.
-                # ExitStack closes those handles if the shared boundary raises.
-                with synchronize_local_errors(
-                    "Training profiler initialization", group=self.error_group
-                ):
-                    profiler_context = assembly.build_profiler(
-                        self.cfg.profiler,
-                        global_step=self.step,
-                        base_folder=self.cfg.dump_folder,
-                        builders=getattr(self, "_builders", None),
-                    )
-                    # Own cleanup before entry, including partially started traces.
-                    self.profiler_resource = profiler_context
-                    profiler = stack.enter_context(profiler_context)
-                    if not callable(getattr(profiler, "step", None)):
-                        raise TypeError("Entered profiler must provide step()")
-                # Takes the cyclic collector over from CPython for the duration
-                # of training: the default schedule fires at unpredictable
-                # times, often inside a forward, and walking a multi-gigabyte
-                # object graph there is pure stall. Built here rather than in
-                # ``__init__`` because that is when the model and optimizer
-                # exist, so the first collection already covers the real graph.
-                with synchronize_local_errors(
-                    "Training GC initialization", group=self.error_group
-                ):
-                    self.gc_handler = GarbageCollection(gc_freq=self.cfg.gc_freq)
-                while self.should_continue_training():
-                    self.step += 1
-                    with synchronize_local_errors(
-                        "Training GC step", group=self.error_group
-                    ):
-                        self.gc_handler.run(self.step)
-
-                    try:
-                        observer = getattr(self, "training_observer", None)
-                        if observer is not None:
-                            observer.begin()
-                        step_metrics = self.train_step(data_iterator)
-                        if observer is not None:
-                            observations = observer.end()
-                            if step_metrics is not None:
-                                step_metrics.update(observations)
-                    except DataloaderExhaustedError:
-                        # The step is abandoned rather than trained on a
-                        # partial batch: a batch's worth of tokens either all
-                        # contribute to a gradient or none of them do.
-                        # ``self.step`` counts *completed* optimizer steps, so
-                        # the abandoned one is given back. torchtitan's
-                        # ``num_completed_steps`` only advances at the end of a
-                        # successful update, and a counter that kept this step
-                        # would make ``state_dict`` resume past a step whose
-                        # weights were never updated.
-                        self.step -= 1
-                        with synchronize_local_errors(
-                            "Training exhaustion reporting", group=self.error_group
-                        ):
-                            logger.warning(
-                                "Ran out of data; the last step was canceled."
-                            )
-                        # Finite data can end before cfg.steps and off the
-                        # checkpoint interval. Preserve the last completed
-                        # update using the configured final-save policy.
-                        saved = self.step > 0 and self.checkpointer.save(
-                            self.step, last_step=True
-                        )
-                        with synchronize_local_errors(
-                            "Training exhausted checkpoint reporting",
-                            group=self.error_group,
-                        ):
-                            if saved:
-                                logger.info(f"Saved checkpoint for step {self.step}")
-                        break
-
-                    # Reporting is local, but a sink can fail on just one
-                    # rank. Agree before any peer starts checkpoint collectives.
-                    with synchronize_local_errors(
-                        "Training metric reporting", group=self.error_group
-                    ):
-                        if step_metrics is not None:
-                            self.metrics.log(
-                                self.step,
-                                global_avg_loss=step_metrics["loss"],
-                                global_max_loss=step_metrics["max_loss"],
-                                grad_norm=step_metrics["grad_norm"],
-                                extra_metrics={
-                                    k: v
-                                    for k, v in step_metrics.items()
-                                    if k not in ("loss", "max_loss", "grad_norm")
-                                },
-                            )
-
-                    # The manager owns the interval policy: ``save`` decides for
-                    # itself whether this step is a checkpointing step. The final
-                    # step is forced so a run that ends off-interval still leaves
-                    # a resumable artifact rather than only a mid-run one.
-                    last_step = self.step == self.cfg.steps
-                    saved = self.checkpointer.save(self.step, last_step=last_step)
-                    with synchronize_local_errors(
-                        "Training checkpoint reporting", group=self.error_group
-                    ):
-                        if saved:
-                            logger.info(f"Saved checkpoint for step {self.step}")
-                            if observer is not None:
-                                self.metrics.log_resources(
-                                    self.step,
-                                    self.checkpointer.observation_metrics.copy(),
-                                )
-
-                    # Validation, after the checkpoint save and before the
-                    # profiler advances -- the reference's order. The pass is
-                    # eval-only and leaves no state behind, so its position in
-                    # the step affects only which step's weights it scores.
-                    if self.should_validate(self.step):
-                        self.validate(self.step)
-
-                    # Advances the schedule. After the save, so the profiler's
-                    # active iteration covers an ordinary step rather than one
-                    # that also wrote a checkpoint.
-                    with synchronize_local_errors(
-                        "Training profiler step", group=self.error_group
-                    ):
-                        profiler.step()
-
-                    if self.step == first_step_of_this_process:
-                        # Startup is finished on this process; from here a long
-                        # wait is a stall, not a slow launch. Skipped entirely on
-                        # a single process: it has no group to time out, and its
-                        # barrier would be the only collective in the program.
-                        if self.parallel_dims is not None:
-                            set_pg_timeouts(
-                                timedelta(
-                                    seconds=self.cfg.parallel.train_timeout_seconds
-                                ),
-                                self.parallel_dims,
-                                device=self.device,
-                            )
+            self._run_training()
         finally:
             # Teardown lives in ``close`` rather than inline so a caller that
             # drives the trainer programmatically -- rather than through
@@ -773,6 +611,154 @@ class Trainer:
                 except BaseException:
                     # Reporting must not replace the active training failure.
                     pass
+
+    def _run_training(self) -> None:
+        """Initialize loop-scoped services and run optimizer steps."""
+
+        # The step this process's *first* train step lands on. Startup work --
+        # process groups, the model build, the first collective, compile --
+        # runs under the long process-group timeout those groups were created
+        # with, because that is what genuinely takes minutes. Once one step
+        # has completed, that work is behind this process, so the timeout can
+        # be lowered to the one a real stall should be measured against (see
+        # ``set_pg_timeouts``). Relative to the loaded step rather than
+        # absolute ``1`` so a resumed run lowers it too.
+        first_step_of_this_process = self.step + 1
+
+        # ``batch_generator`` wraps the bare source so every fetch carries
+        # its token and loading-time accounting; the loop below sees only
+        # batches. One exception type crosses that boundary.
+        with synchronize_local_errors(
+            "Training input initialization", group=self.error_group
+        ):
+            data_iterator = self.batch_generator(self.data_iterator())
+        # Entered around the loop rather than around a single step: the
+        # torch profiler's schedule counts iterations across the whole run
+        # and only dumps a trace at the end of a cycle, so a per-step
+        # context would never reach one. Left open when profiling is off --
+        # the Profiler holds no handles in that case.
+        with ExitStack() as stack:
+            # Local tracing setup can fail after peers acquired handles.
+            # ExitStack closes those handles if the shared boundary raises.
+            with synchronize_local_errors(
+                "Training profiler initialization", group=self.error_group
+            ):
+                profiler_context = assembly.build_profiler(
+                    self.cfg.profiler,
+                    global_step=self.step,
+                    base_folder=self.cfg.dump_folder,
+                    builders=getattr(self, "_builders", None),
+                )
+                # Own cleanup before entry, including partially started traces.
+                self.profiler_resource = profiler_context
+                profiler = stack.enter_context(profiler_context)
+                if not callable(getattr(profiler, "step", None)):
+                    raise TypeError("Entered profiler must provide step()")
+            # Takes the cyclic collector over from CPython for the duration
+            # of training: the default schedule fires at unpredictable
+            # times, often inside a forward, and walking a multi-gigabyte
+            # object graph there is pure stall. Built here rather than in
+            # ``__init__`` because that is when the model and optimizer
+            # exist, so the first collection already covers the real graph.
+            with synchronize_local_errors(
+                "Training GC initialization", group=self.error_group
+            ):
+                self.gc_handler = GarbageCollection(gc_freq=self.cfg.gc_freq)
+            while self.should_continue_training():
+                self.step += 1
+                with synchronize_local_errors(
+                    "Training GC step", group=self.error_group
+                ):
+                    self.gc_handler.run(self.step)
+
+                try:
+                    observer = getattr(self, "training_observer", None)
+                    if observer is not None:
+                        observer.begin()
+                    step_metrics = self.train_step(data_iterator)
+                    if observer is not None:
+                        observations = observer.end()
+                        if step_metrics is not None:
+                            step_metrics.update(observations)
+                except DataloaderExhaustedError:
+                    self._cancel_incomplete_step()
+                    break
+
+                self._report_completed_step(step_metrics, observer=observer)
+
+                # Advances the schedule. After the save, so the profiler's
+                # active iteration covers an ordinary step rather than one
+                # that also wrote a checkpoint.
+                with synchronize_local_errors(
+                    "Training profiler step", group=self.error_group
+                ):
+                    profiler.step()
+
+                if self.step == first_step_of_this_process:
+                    # Startup is finished on this process; from here a long
+                    # wait is a stall, not a slow launch. Skipped entirely on
+                    # a single process: it has no group to time out, and its
+                    # barrier would be the only collective in the program.
+                    if self.parallel_dims is not None:
+                        set_pg_timeouts(
+                            timedelta(seconds=self.cfg.parallel.train_timeout_seconds),
+                            self.parallel_dims,
+                            device=self.device,
+                        )
+
+    def _cancel_incomplete_step(self) -> None:
+        """Restore the completed-step counter and save its latest state."""
+        # An accumulation window is atomic: none of an incomplete step's
+        # batches may contribute to an optimizer update or checkpoint step.
+        self.step -= 1
+        with synchronize_local_errors(
+            "Training exhaustion reporting", group=self.error_group
+        ):
+            logger.warning("Ran out of data; the last step was canceled.")
+        saved = self.step > 0 and self.checkpointer.save(self.step, last_step=True)
+        with synchronize_local_errors(
+            "Training exhausted checkpoint reporting", group=self.error_group
+        ):
+            if saved:
+                logger.info(f"Saved checkpoint for step {self.step}")
+
+    def _report_completed_step(
+        self,
+        step_metrics: dict[str, float] | None,
+        *,
+        observer: TrainingObserver | None,
+    ) -> None:
+        """Log, checkpoint and validate one completed update in that order."""
+        # Agree on local logging success before peers enter checkpoint collectives.
+        with synchronize_local_errors(
+            "Training metric reporting", group=self.error_group
+        ):
+            if step_metrics is not None:
+                self.metrics.log(
+                    self.step,
+                    global_avg_loss=step_metrics["loss"],
+                    global_max_loss=step_metrics["max_loss"],
+                    grad_norm=step_metrics["grad_norm"],
+                    extra_metrics={
+                        key: value
+                        for key, value in step_metrics.items()
+                        if key not in ("loss", "max_loss", "grad_norm")
+                    },
+                )
+
+        saved = self.checkpointer.save(self.step, last_step=self.step == self.cfg.steps)
+        with synchronize_local_errors(
+            "Training checkpoint reporting", group=self.error_group
+        ):
+            if saved:
+                logger.info(f"Saved checkpoint for step {self.step}")
+                if observer is not None:
+                    self.metrics.log_resources(
+                        self.step, self.checkpointer.observation_metrics.copy()
+                    )
+
+        if self.should_validate(self.step):
+            self.validate(self.step)
 
     def close(self) -> None:
         """Release trainer resources in dependency order.

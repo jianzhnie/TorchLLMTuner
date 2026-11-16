@@ -50,7 +50,6 @@ def build_step_metrics(
     accumulation: AccumulationResult,
     global_valid_tokens: torch.Tensor,
     local_valid_tokens: int,
-    local_valid_tokens_tensor: torch.Tensor,
     reduction_meshes: TrainingReductionMeshes,
     update: UpdateResult,
     lr_metrics: dict[str, float],
@@ -65,19 +64,19 @@ def build_step_metrics(
     sequence_mesh = reduction_meshes.sequence_mesh
     if pp_mesh is not None and not pp_has_last_stage:
         accumulated_loss = torch.zeros_like(accumulated_loss)
-    loss = accumulated_loss / global_valid_tokens
+    # Division creates reporting tensors owned here; collectives can update
+    # them directly without copying or mutating the accumulation result.
+    loss_sum = accumulated_loss / global_valid_tokens
 
     if loss_mesh is not None:
         local_loss_sum = accumulated_loss.clone()
         if sequence_mesh is not None:
             all_reduce(local_loss_sum, group=sequence_mesh.get_group())
-        local_avg = (
-            local_loss_sum / local_valid_tokens_tensor
+        local_max = (
+            local_loss_sum / local_valid_tokens
             if local_valid_tokens > 0
             else torch.zeros_like(accumulated_loss)
         )
-        loss_sum = loss.clone()
-        local_max = local_avg.clone()
         all_reduce(loss_sum, group=loss_mesh.get_group())
         if dp_mesh is not None:
             all_reduce(local_max, op="max", group=dp_mesh.get_group())
@@ -87,8 +86,7 @@ def build_step_metrics(
         all_reduce(ntokens_seen_tensor, group=loss_mesh.get_group())
         global_ntokens_seen = float(ntokens_seen_tensor)
     else:
-        loss_sum = loss
-        local_max = loss.clone()
+        local_max = loss_sum.clone()
         global_ntokens_seen = float(ntokens_seen)
     if pp_mesh is not None:
         all_reduce(loss_sum, group=pp_mesh.get_group())

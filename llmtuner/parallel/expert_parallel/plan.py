@@ -32,6 +32,7 @@ from ..plan import (
     FullPlanBindings,
     ParallelPlan,
     PlanTarget,
+    first_paths_by_identity,
     validate_pipeline_targets,
 )
 from .block_conversion import validate_moe_conversion
@@ -86,7 +87,9 @@ def decoder_layers_for_ep(model: nn.Module) -> Iterable[nn.Module]:
     """
     structure = getattr(model, "decoder_structure", None)
     if not isinstance(structure, DecoderStructure):
-        raise TypeError("EP requires a model-owned DecoderStructure")
+        raise TypeError(
+            "EP requires a model-owned decoder_structure (DecoderStructure)"
+        )
     return structure.bind_blocks(model)
 
 
@@ -262,10 +265,11 @@ def resolve_ep_plan(
         if bindings is None
         else bindings["module_bindings"]
     )
+    first_paths = first_paths_by_identity(modules)
     targets = []
     for owner, attribute, block, router_logits in candidates:
-        paths = [path for path, module in modules if module is owner]
-        if not paths:
+        owner_path = first_paths.get(id(owner))
+        if owner_path is None:
             raise ValueError("EP decoder owner is not registered in this model")
         routing = None
         packed_experts = None
@@ -290,7 +294,7 @@ def resolve_ep_plan(
             )
         targets.append(
             PlanTarget(
-                f"{paths[0]}.{attribute}" if paths[0] else attribute,
+                f"{owner_path}.{attribute}" if owner_path else attribute,
                 "moe",
                 block,
                 declared_expert_layout(block) or "fused_gate_up",

@@ -1,6 +1,6 @@
 # Copyright 2026 The DeepSeek-AI Team and The HuggingFace Inc. team.
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from Transformers 5.11 modeling_deepseek_v4.
+# Adapted from Transformers 5.22.2 modeling_deepseek_v4.
 """DeepSeek V4 normalization with explicit native cast boundaries."""
 
 import torch
@@ -9,7 +9,7 @@ from transformers.models.deepseek_v4 import modeling_deepseek_v4 as reference
 
 
 class DeepseekV4RMSNorm(reference.DeepseekV4RMSNorm):
-    """Normalize in FP32, cast back, then multiply the affine weight."""
+    """Normalize and apply FP32 affine weights before casting to the input dtype."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         nn.Module.__init__(self)
@@ -21,7 +21,7 @@ class DeepseekV4RMSNorm(reference.DeepseekV4RMSNorm):
         values = hidden_states.to(torch.float32)
         variance = values.pow(2).mean(-1, keepdim=True)
         values = values * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * values.to(dtype)
+        return (self.weight * values).to(dtype)
 
 
 class DeepseekV4UnweightedRMSNorm(reference.DeepseekV4UnweightedRMSNorm):

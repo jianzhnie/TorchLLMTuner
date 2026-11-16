@@ -58,7 +58,7 @@ def validate_model_geometry(config: Qwen3_5MoeTextConfig) -> None:
     if (
         type(config.num_hidden_layers) is not int
         or config.num_hidden_layers < 0
-        or not isinstance(config.layer_types, (list, tuple))
+        or not isinstance(config.layer_types, list | tuple)
         or len(config.layer_types) != config.num_hidden_layers
     ):
         raise ValueError("Qwen3.5 layer_types must match num_hidden_layers")
@@ -153,23 +153,25 @@ def validate_linear_attention_policy(config: Qwen3_5MoeTextConfig) -> None:
 
 @torch.no_grad()
 def initialize_delta_weights(module: nn.Module) -> bool:
-    """Own native decay initialization and the low-precision log-zero guard.
+    """Initialize positive decay with native RNG and partial-load semantics.
 
-    FP32 keeps the established draw order, including reference partial-load
-    behavior. Low-precision missing decay is drawn in FP32 and clamped before
-    log; an already loaded low-precision decay consumes no RNG.
+    FP32 keeps the reference draw order, including partial-load behavior.
+    Missing low-precision decay is drawn in FP32 before taking its logarithm;
+    an already loaded low-precision decay consumes no RNG.
     """
     if not isinstance(module, reference.Qwen3_5MoeGatedDeltaNet):
         return False
     init.ones_(module.dt_bias)
     if module.A_log.dtype not in (torch.float16, torch.bfloat16):
-        init.copy_(module.A_log, torch.empty_like(module.A_log).uniform_(0, 16).log_())
+        init.copy_(
+            module.A_log, torch.empty_like(module.A_log).uniform_(0.01, 16).log_()
+        )
         return True
     # External loading marks individual tensors before initializing missing
     # state. Preserve loaded decay values and avoid consuming RNG for them.
     if not getattr(module.A_log, "_is_hf_initialized", False):
-        decay = torch.empty_like(module.A_log, dtype=torch.float32).uniform_(0, 16)
-        decay.clamp_min_(torch.finfo(torch.float32).tiny).log_()
+        decay = torch.empty_like(module.A_log, dtype=torch.float32).uniform_(0.01, 16)
+        decay.log_()
         init.copy_(module.A_log, decay)
     return True
 

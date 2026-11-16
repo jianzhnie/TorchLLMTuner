@@ -8,6 +8,8 @@ ownership. Lazy contexts can lack streams before the first forward.
 from collections.abc import Iterable
 from typing import Any
 
+import torch
+
 
 def drain_fsdp_communications(contexts: Iterable[Any], groups: Iterable[Any]) -> None:
     """Wait for all captured work before clearing buffers; preserve them on failure.
@@ -84,6 +86,10 @@ def drain_fsdp_communications(contexts: Iterable[Any], groups: Iterable[Any]) ->
             if first_error is None:
                 first_error = error
     for waitable in waitables.values():
+        # CPU streams are synchronous placeholders with no synchronize method.
+        # Distributed Work objects above still need their explicit wait.
+        if isinstance(waitable, torch.cpu.Stream):
+            continue
         try:
             waitable.synchronize()
         except BaseException as error:

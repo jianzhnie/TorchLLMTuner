@@ -29,7 +29,12 @@ from ..pipeline_parallel.ownership import (
     PipelineOwnership,
     snapshot_pipeline_ownership,
 )
-from ..plan import ParallelPlan, PlanTarget, snapshot_model_bindings
+from ..plan import (
+    ParallelPlan,
+    PlanTarget,
+    model_bindings_from_plan,
+    snapshot_model_bindings,
+)
 from .fine_grained.fine_grained import get_fsdp_strategy, validate_fsdp_hook_target
 from .ownership import module_paths_with_aliases
 from .policies import (
@@ -45,9 +50,8 @@ __all__ = [
 
 
 def _resolve_pattern_units(
-    model: nn.Module, cfg: ParallelConfig
+    module_bindings: tuple[tuple[str, nn.Module], ...], cfg: ParallelConfig
 ) -> tuple[dict[str, nn.Module], dict[str, dict[str, Any]], set[nn.Parameter]]:
-    module_bindings = tuple(model.named_modules(remove_duplicate=False))
     canonical_names: dict[nn.Module, str] = {}
     for name, module in module_bindings:
         canonical_names.setdefault(module, name)
@@ -62,8 +66,7 @@ def _resolve_pattern_units(
         plan_name="FSDP ignored",
     )
 
-    # Ignoring a module excludes its complete subtree, matching the recursive
-    # ignored-parameter collection below.
+    # Ignoring a module excludes its complete subtree, including shared children.
     ignored_modules = {
         module for root in ignored_roots for module in module_paths[root].modules()
     }
@@ -88,8 +91,8 @@ def _resolve_pattern_units(
 
     ignored_params = {
         parameter
-        for name in ignored_roots
-        for parameter in module_paths[name].parameters(recurse=True)
+        for module in ignored_modules
+        for parameter in module.parameters(recurse=False)
     }
     return named_modules, unit_options, ignored_params
 
@@ -127,28 +130,43 @@ def resolve_pipeline_fsdp_configs(
     overrides refer to the copied objects, while meshes and policies retain their
     identity. A part without a selected child still gets its root FSDP state.
     """
-    source_modules, unit_options, _ = _resolve_pattern_units(model, cfg)
-    source_parameters = set(model.parameters())
-    for name, options in unit_options.items():
-        validate_fsdp_hook_target([source_modules[name]], options.get("hook_module"))
-        validate_fsdp_ignored_parameters(
-            options.get("ignored_params"), parameters=source_parameters, unit_name=name
-        )
-    source_paths = dict(model.named_modules(remove_duplicate=False))
-    ignored_names = resolve_module_patterns(
-        list(source_paths),
-        patterns=cfg.fsdp_config.fsdp_ignored_modules,
-        plan_name="FSDP ignored",
-    )
-
     bindings = (
         snapshot_pipeline_ownership(model, parts) if ownership is None else ownership
     )
     if len(bindings) != len(parts):
         raise ValueError("Pipeline ownership must describe every local part")
+    validated_sources: set[int] = set()
     for part, binding in zip(parts, bindings, strict=True):
-        binding.global_plan.validate_binding(model)
+        # Parts normally share one source plan. Distinct supplied snapshots must
+        # each be checked before borrowing any of their registered bindings.
+        source_id = id(binding.global_plan)
+        if source_id not in validated_sources:
+            binding.global_plan.validate_binding(model)
+            validated_sources.add(source_id)
         binding.local_plan.validate_binding(part)
+
+    module_bindings = (
+        model_bindings_from_plan(bindings[0].global_plan)["module_bindings"]
+        if bindings
+        else tuple(model.named_modules(remove_duplicate=False))
+    )
+    source_modules, unit_options, _ = _resolve_pattern_units(module_bindings, cfg)
+    source_parameters = {
+        parameter
+        for module in source_modules.values()
+        for parameter in module.parameters(recurse=False)
+    }
+    for name, options in unit_options.items():
+        validate_fsdp_hook_target([source_modules[name]], options.get("hook_module"))
+        validate_fsdp_ignored_parameters(
+            options.get("ignored_params"), parameters=source_parameters, unit_name=name
+        )
+    source_paths = dict(module_bindings)
+    ignored_names = resolve_module_patterns(
+        list(source_paths),
+        patterns=cfg.fsdp_config.fsdp_ignored_modules,
+        plan_name="FSDP ignored",
+    )
 
     configs = []
     for binding in bindings:
@@ -192,7 +210,7 @@ def resolve_pipeline_fsdp_configs(
 
 
 def _resolve_shared_fsdp_units(
-    model: nn.Module,
+    module_bindings: tuple[tuple[str, nn.Module], ...],
     *,
     named_modules: dict[str, nn.Module],
     unit_options: dict[str, dict[str, Any]],
@@ -212,7 +230,7 @@ def _resolve_shared_fsdp_units(
     # An aliased child may execute under several selected parents. Walking only
     # its canonical path would hide the other owners and split shared storage
     # across independent FSDP states.
-    for module_name, module in model.named_modules(remove_duplicate=False):
+    for module_name, module in module_bindings:
         owner = next(
             (
                 name
@@ -398,7 +416,11 @@ def resolve_fsdp_pattern_plan(
     Only local metadata and backend availability are inspected. Process groups
     must already exist; this resolver performs no collective or tensor copies.
     """
-    named_modules, unit_options, ignored_params = _resolve_pattern_units(model, cfg)
+    bindings = snapshot_model_bindings(model)
+    module_bindings = bindings["module_bindings"]
+    named_modules, unit_options, ignored_params = _resolve_pattern_units(
+        module_bindings, cfg
+    )
     validate_fsdp_pattern_options(
         named_modules,
         unit_options,
@@ -412,7 +434,7 @@ def resolve_fsdp_pattern_plan(
         degree = fsdp_shard_size(edp_mesh)
         expert_placements = {
             parameter: Shard(1 if degree > module.num_experts else 0)
-            for module in model.modules()
+            for module in named_modules.values()
             if isinstance(module, GroupedExperts)
             for parameter in module.parameters(recurse=False)
             if parameter not in ignored_params
@@ -420,7 +442,7 @@ def resolve_fsdp_pattern_plan(
     else:
         expert_counts = {
             parameter: module.num_experts
-            for module in model.modules()
+            for module in named_modules.values()
             if isinstance(module, GroupedExperts)
             for parameter in module.parameters(recurse=False)
             if parameter not in ignored_params
@@ -447,7 +469,7 @@ def resolve_fsdp_pattern_plan(
         )
 
     grouped_options = _resolve_shared_fsdp_units(
-        model,
+        module_bindings,
         named_modules=named_modules,
         unit_options=unit_options,
         ignored_params=ignored_params,
@@ -510,7 +532,7 @@ def resolve_fsdp_pattern_plan(
                 for names, _ in grouped_options
                 for name in names
             ),
-            **snapshot_model_bindings(model),
+            **bindings,
         ),
         named_modules=named_modules,
         units=tuple((tuple(names), options) for names, options in grouped_options),

@@ -12,6 +12,7 @@ from ..models.contracts import DecoderStructure, registered_submodule
 __all__ = [
     "ParallelPlan",
     "PlanTarget",
+    "first_paths_by_identity",
     "model_bindings_from_plan",
     "snapshot_model_bindings",
 ]
@@ -30,6 +31,21 @@ def snapshot_model_bindings(model: nn.Module) -> FullPlanBindings:
         "parameter_bindings": tuple(model.named_parameters(remove_duplicate=False)),
         "buffer_bindings": tuple(model.named_buffers(remove_duplicate=False)),
     }
+
+
+def first_paths_by_identity(
+    module_bindings: tuple[tuple[str, nn.Module], ...],
+) -> dict[int, str]:
+    """Return one stable registered path per module object.
+
+    Aliased modules have several names, but resolution needs one owner path.
+    Keeping this rule in the binding layer prevents each resolver from
+    rebuilding subtly different alias indexes.
+    """
+    paths: dict[int, str] = {}
+    for path, module in module_bindings:
+        paths.setdefault(id(module), path)
+    return paths
 
 
 def model_bindings_from_plan(plan: ParallelPlan) -> FullPlanBindings:

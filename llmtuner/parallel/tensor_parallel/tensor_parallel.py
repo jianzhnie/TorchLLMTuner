@@ -383,6 +383,7 @@ def _resolve_tp_targets(
     *,
     cfg: ParallelConfig,
     raw_plan: Mapping[str, str | tp_sharding.ShardingConfig],
+    module_bindings: tuple[tuple[str, nn.Module], ...] | None = None,
 ) -> tuple[
     list[tuple[str, nn.Linear, tp_sharding.ShardingConfig]], list[tuple[str, nn.Module]]
 ]:
@@ -397,7 +398,16 @@ def _resolve_tp_targets(
         )
 
     targets: list[tuple[str, nn.Linear, tp_sharding.ShardingConfig]] = []
-    for module_path, module in model.named_modules():
+    registered_modules = (
+        module_bindings if module_bindings is not None else tuple(model.named_modules())
+    )
+    # Full ownership snapshots retain aliases; target application must see
+    # each module once, using its first registered path.
+    unique_modules: dict[int, tuple[str, nn.Module]] = {}
+    for path, module in registered_modules:
+        unique_modules.setdefault(id(module), (path, module))
+    modules = tuple(unique_modules.values())
+    for module_path, module in modules:
         if isinstance(module, nn.Linear):
             spec = tp_sharding.match_tp_sharding_spec(module_path, plan=sharding_plan)
             if spec is not None:
@@ -455,7 +465,7 @@ def _resolve_tp_targets(
     moe_blocks: list[tuple[str, nn.Module]] = []
     bracketed_paths: list[str] = []
     if plan_declares_moe and not moe_deferred_to_ep:
-        for module_path, module in model.named_modules():
+        for module_path, module in modules:
             if isinstance(module, FeatureParallelSequenceBoundary):
                 # Already bracketed by an earlier apply_tp pass (the engine is
                 # idempotent per module): still counts as realized MoE TP.
@@ -493,7 +503,7 @@ def _resolve_tp_targets(
     moe_block_paths = [path for path, _ in moe_blocks]
     moe_block_paths.extend(
         path
-        for path, module in model.named_modules()
+        for path, module in modules
         if path not in moe_block_paths
         and is_moe_block(module)
         and not isinstance(module, FeatureParallelSequenceBoundary)
@@ -507,7 +517,9 @@ def _resolve_tp_targets(
     if (
         nothing_sharded
         and not moe_deferred_to_ep
-        and not tp_sharding.resolve_vocab_parallel_targets(model, raw_plan)
+        and not tp_sharding.resolve_vocab_parallel_targets(
+            model, raw_plan, module_bindings=modules
+        )
     ):
         raise ValueError(
             f"apply_tp with tp={cfg.tp_size}: the plan patterns "
@@ -659,8 +671,6 @@ def resolve_tp_plan(
         validate(tp_degree=cfg.tp_size, ep_degree=cfg.ep_size)
     # Resolve targets once before accessing process groups or changing weights.
     raw_plan = tp_sharding.resolve_effective_tp_plan(model, cfg=cfg, plan=plan)
-    targets, moe_blocks = _resolve_tp_targets(model, cfg=cfg, raw_plan=raw_plan)
-    vocab_targets = tp_sharding.resolve_vocab_parallel_targets(model, raw_plan)
     bindings = snapshot_model_bindings(model) if bindings is None else bindings
     # Keep the first registered path, matching named_modules() traversal, while
     # retaining every alias in the ownership snapshot handed to ParallelPlan.
@@ -668,6 +678,12 @@ def resolve_tp_plan(
     for path, module in bindings["module_bindings"]:
         unique_modules.setdefault(id(module), (path, module))
     modules = tuple(unique_modules.values())
+    targets, moe_blocks = _resolve_tp_targets(
+        model, cfg=cfg, raw_plan=raw_plan, module_bindings=bindings["module_bindings"]
+    )
+    vocab_targets = tp_sharding.resolve_vocab_parallel_targets(
+        model, raw_plan, module_bindings=bindings["module_bindings"]
+    )
 
     # A head count that does not divide ``tp`` has no valid local head split,
     # and no downstream guard catches it: the projection-level check in

@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from llmtuner.config.training_config import resolve_batch_size_per_rank
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.parallel.compatibility import (
     chunked_loss_validation,
@@ -31,10 +30,9 @@ from ...datasets.contracts import (
     DataloaderExhaustedError,
     TrainerBatch,
 )
-from ...datasets.loader_builder import build_dataloader
 from .batch import (
+    build_rank_dataloader,
     fetch_batch,
-    resolve_data_parallel_rank,
     validated_batch_token_counts,
 )
 from .reductions import resolve_loss_reduction_meshes
@@ -104,15 +102,9 @@ def create_validation_dataloader(
     ``steps=-1`` reads it to exhaustion (built with repeat=False); a positive
     ``steps`` bounds the pass (built repeating, so the bound is reachable).
     """
-    dp_rank, dp_world_size = resolve_data_parallel_rank(parallel_dims)
-    batch_size_per_rank = resolve_batch_size_per_rank(
-        cfg.global_batch_size, dp_world_size
-    )
-    return build_dataloader(
+    return build_rank_dataloader(
         cfg,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        num_tokens_per_batch=batch_size_per_rank * cfg.max_seq_len,
+        parallel_dims=parallel_dims,
         repeat=validation.steps != -1,
         dataset=validation.dataset,
     )

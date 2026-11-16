@@ -361,7 +361,7 @@ ENTRIES: tuple[CompatibilityRule, ...] = (
         tp_moe_specs_without_block,
         "assembly",
         UnsupportedCombinationError,
-        "parallel/tensor_parallel/tensor_parallel.py::resolve_tp_targets",
+        "parallel/tensor_parallel/tensor_parallel.py::_resolve_tp_targets",
     ),
     CompatibilityRule(
         tp_moe_non_tensor_output,

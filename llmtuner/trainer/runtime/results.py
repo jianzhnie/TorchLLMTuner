@@ -1,13 +1,38 @@
-"""Explicit values crossing execution and training lifecycle boundaries."""
+"""Training state and result values crossing runtime boundaries."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from numbers import Real
 from types import MappingProxyType
+from typing import Any
 
 import torch
 
 from ...components.loss_contract import validate_loss_sum, validate_normalization_tokens
+
+
+@dataclass(slots=True)
+class TrainingProgress:
+    """Checkpointable counters for one training run."""
+
+    step: int = 0
+    ntokens_seen: int = 0
+
+    def state_dict(self) -> dict[str, int]:
+        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
+
+    def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Validate both counters before changing either live value."""
+        step = state_dict["step"]
+        ntokens_seen = state_dict["ntokens_seen"]
+        for name, value in (("step", step), ("ntokens_seen", ntokens_seen)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"trainer {name} must be a nonnegative integer")
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.validate_state_dict(state_dict)
+        self.step = state_dict["step"]
+        self.ntokens_seen = state_dict["ntokens_seen"]
 
 
 @dataclass(frozen=True, slots=True)

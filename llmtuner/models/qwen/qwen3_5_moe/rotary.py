@@ -1,6 +1,6 @@
 # Copyright 2026 The Qwen Team and The HuggingFace Inc. team.
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from Transformers 5.11 modeling_qwen3_5_moe.
+# Adapted from Transformers 5.22.2 modeling_qwen3_5_moe.
 """Qwen3.5 text rotary buffers, partial frequencies and interleaved mRoPE."""
 
 import torch
@@ -84,22 +84,17 @@ class Qwen3_5MoeTextRotaryEmbedding(reference.Qwen3_5MoeTextRotaryEmbedding):
     ) -> tuple[Tensor, Tensor]:
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-        frequencies = (
-            self.inv_freq[None, None, :, None]
-            .float()
-            .expand(3, position_ids.shape[1], -1, 1)
-            .to(hidden_states.device)
+        phases = position_ids[..., None].float() * self.inv_freq.to(
+            device=hidden_states.device, dtype=torch.float32
         )
-        positions = position_ids[:, :, None, :].float()
-        device_type = hidden_states.device.type
-        if device_type == "mps":
-            device_type = "cpu"
-        with reference.maybe_autocast(device_type=device_type, enabled=False):
-            phases = (frequencies.float() @ positions.float()).transpose(2, 3)
-            phases = self.apply_interleaved_mrope(phases, self.mrope_section)
-            embedding = torch.cat((phases, phases), dim=-1)
-            cos = embedding.cos() * self.attention_scaling
-            sin = embedding.sin() * self.attention_scaling
+        cos = self.apply_interleaved_mrope(
+            phases.cos() * self.attention_scaling, self.mrope_section
+        )
+        sin = self.apply_interleaved_mrope(
+            phases.sin() * self.attention_scaling, self.mrope_section
+        )
+        cos = torch.cat((cos, cos), dim=-1)
+        sin = torch.cat((sin, sin), dim=-1)
         return cos.to(hidden_states.dtype), sin.to(hidden_states.dtype)
 
     def apply_interleaved_mrope(

@@ -125,7 +125,6 @@ def swap_moe_blocks(
         UnsupportedCombinationError: if sparse slots lack explicit contracts or
             request unsupported routing, expert storage or dispatch semantics.
     """
-    decoder_layers = tuple(decoder_layers_for_ep(model))
     # Backend gating, before any probing: ParallelConfig.__post_init__ is the
     # primary gate; this is the defensive copy for callers that reach the swap
     # directly.
@@ -152,6 +151,8 @@ def swap_moe_blocks(
     # GLM4), and gets the llmtuner default. Everything else stays off, so a
     # frozen zero bias never lands in the checkpoint.
     default_coeff = getattr(hf_config, "load_balance_coeff", 1e-3)
+
+    decoder_layers = tuple(decoder_layers_for_ep(model))
 
     # Bind targets after preceding stages (TP/PP) have stabilized this instance.
     degree = 1 if ep_group is None else dist.get_world_size(ep_group)
@@ -256,7 +257,13 @@ def swap_moe_blocks(
         raise ValueError("EP plan must cover declared MoE slots in decoder order")
     validate_ep_model_geometry(model, degree=degree, tp_enabled=tp_enabled)
 
-    module_paths = list(model.named_modules(remove_duplicate=False))
+    # A pre-resolved EP plan already owns the unchanged registration table.
+    # Reuse it here; falling back keeps direct callers lightweight.
+    module_paths = list(
+        execution_plan.module_bindings
+        if execution_plan.module_bindings is not None
+        else model.named_modules(remove_duplicate=False)
+    )
     replaced_roots = conversion_roots(candidates, module_paths)
     validate_packed_expert_aliases(
         execution_plan.targets, module_paths, replaced_roots, degree=degree
@@ -271,7 +278,14 @@ def swap_moe_blocks(
     module_targets: dict[nn.Module, nn.Module] = {}
     stacked_projection_sources: dict[int, tuple[int, ...]] = {}
     original_parameters = (
-        {id(parameter): parameter for parameter in model.parameters()}
+        {
+            id(parameter): parameter
+            for _, parameter in (
+                execution_plan.parameter_bindings
+                if execution_plan.parameter_bindings is not None
+                else model.named_parameters(remove_duplicate=False)
+            )
+        }
         if on_replacement is not None
         else {}
     )

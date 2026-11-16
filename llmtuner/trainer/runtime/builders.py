@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -225,16 +225,7 @@ class TrainingBuilders:
     checkpoint: CheckpointFactory | None = None
 
     def __post_init__(self) -> None:
-        for name in (
-            "loss",
-            "pipeline_schedule",
-            "optimizer",
-            "scheduler",
-            "ema",
-            "metrics",
-            "profiler",
-            "checkpoint",
-        ):
-            value = getattr(self, name)
+        for factory in fields(self):
+            value = getattr(self, factory.name)
             if value is not None and not callable(value):
-                raise TypeError(f"Training builder {name!r} must be callable")
+                raise TypeError(f"Training builder {factory.name!r} must be callable")

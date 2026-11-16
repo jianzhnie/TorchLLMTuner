@@ -1,6 +1,7 @@
 # TorchLLMTuner 设计文档
 
-TorchLLMTuner 是直接基于 Hugging Face `transformers` 的混合并行训练框架，
+TorchLLMTuner 是使用本地显式模型实现的混合并行训练框架，复用
+Hugging Face `transformers` 的配置、输出协议和部分叶子算子。
 Python 包名为 `llmtuner`。本文描述稳定的模块职责与运行时契约，不记录逐次
 修复或单次实验结果。
 
@@ -15,7 +16,7 @@ Python 包名为 `llmtuner`。本文描述稳定的模块职责与运行时契�
 - **数值语义可验证**：结构或实现变化必须由逐位一致或容差明确的测试保护。
 
 `torch.distributed` 提供 DeviceMesh、ProcessGroup、FSDP2 和流水线调度；
-`spmd_types` 提供 SPMD 类型系统；`transformers` 提供模型构造和 `_tp_plan`。
+`spmd_types` 提供 SPMD 类型系统；`transformers` 提供配置、输出协议和参考算子。
 这些依赖无需重新抽象。
 
 ## 2. 总体架构
@@ -27,13 +28,13 @@ LLMTunerConfig
     ↓
 Trainer
     ↓
-HF wrapper 与并行装配
+显式模型构造与并行装配
     ↓
 TP → EP → CP → AC → Swap（可选）→ Compile（可选）→ FSDP
     ↓
-HFTransformerModel
+本地模型分段 + ModelPartLayout
     ↓
-accelerator/spmd.py ↔ models/common/*
+TrainingEngine → 模型执行与训练组件
 ```
 
 主要依赖方向是 `trainer → parallel → models`。`models/common` 中的小型数学
@@ -45,7 +46,7 @@ accelerator/spmd.py ↔ models/common/*
 llmtuner/
 ├── config/          # 分组配置、聚合配置和 CLI 标量视图
 ├── trainer/         # CLI、训练、验证和 runtime 装配
-├── models/          # HF wrapper、通用构件、Kimi 专用适配
+├── models/          # 模型注册、结构契约、各模型族与共享数学构件
 ├── parallel/        # 五类并行、拓扑、stage 和组合裁决
 ├── memory/          # AC、区域重计算、激活交换
 ├── accelerator/     # 设备、分布式、collectives、能力探测
@@ -116,33 +117,24 @@ ModelConfig + ParallelConfig + OptimizerConfig + TrainingConfig
 只有顶层装配读取聚合配置。并行层接收 `ParallelConfig` 和明确参数，底层模型
 构件不接收完整运行配置。
 
-### 4.2 HF wrapper
+### 4.2 模型拥有结构与执行语义
 
-`HFTransformerModel` 直接调用解析出的 `ForCausalLM` 类，对并行层公开：
+`models/registry.py` 保存配置工厂和模型类的惰性加载入口；
+`models/configuration.py::resolve_model_class()` 只选择已注册的本地实现，
+不自动回退到任意 HF 模型。注册不要求模型继承某个框架基类。
 
-1. **前向接口**：接收一维 token 流及显式 positions、attention masks，返回
-   logits。wrapper 负责 batch 维、RoPE 位置和 BlockMask 适配。
-2. **部件视图**：`named_children()` 呈现
-   `tok_embeddings / layers / norm / lm_head / rotary_emb`。
-   这只是遍历视图，不改变 state-dict key。
-3. **TP plan**：将 HF `_tp_plan` 重写为 wrapper 内的实际模块路径。
+模型直接提供以下声明，通用并行层不猜测候选属性、类名或 forward 源码：
 
-`input_preparation.py` 负责 batch 规范化与 CP/TP 输入切分，
-`attention_masks.py` 负责 dense/Flex/CP mask。自定义架构通过
-`models/registry.py` 注册，模型类保持惰性加载。原生 HF 架构无需注册。
+- `DecoderStructure` 定义注册模块路径，供 PP、AC、TP、CP 和 FSDP 绑定。
+  `layers` 等便利属性不替代真实 state-dict 路径。
+- 每层的 `moe_block_name` 标明稀疏槽位；`None` 明确声明 dense 层。
+  `MoEBlockContract` 或模型自有转换接口定义路由与专家数学。
+- `ModelExecutionCapabilities` 声明执行能力；`PipelineStageIO` 定义流水线边界。
+- `tp_config` 给出模型原生 TP 计划，`prepare_inputs()` 负责输入语义。
+  通用文本准备复用 `models/common/input_preparation.py`。
 
-架构注册本身与建模后端无关：允许模型自有配置和普通 `nn.Module`，不要求
-继承 HF 类型；HF factory 仅作为既有接入路径。逐步解耦 Trainer、初始化及
-权重格式的边界见 [模型优先的执行层](model_backend_direction.md)。
-查询架构和构造 Kimi 配置不会加载其 decoder；仅模型类 loader 导入 decoder，
-依赖错误在选中该模型时报告并保留异常原因，不缓存一次失败阻塞后续重试。
-
-注册仅保存构造 hook，不加载模型实现或可选依赖。加载本地配置时，只解析选中
-架构的配置类型，并在 HF 构造前刷新注册，确保显式替换不会使用旧配置类。
-离线构造会复制 architecture overrides，避免 HF 修改调用方的嵌套字典。
-配置未声明位置上限时使用请求的序列长度；已声明的上限不会因加载而缩短。
-
-HF checkpoint 键转换由 state-dict adapter 负责，不能隐藏在部件视图中。
+HF 权重键映射由模型状态格式和 checkpoint adapter 负责。模型便利属性不得
+重复注册模块或参数；PP 和参数替换后，消费者重新绑定当前实例的声明。
 
 ### 4.3 并行变换与分布式上下文
 
@@ -177,9 +169,10 @@ EP 复用已有 DP 设备轴。并行度乘积不能替代实际 mesh 和 rank o
 
 ### 5.2 TP
 
-TP 由 HF `_tp_plan` 驱动。`ColumnParallelLinear` 和 `RowParallelLinear`
-提供 sequence-parallel 的 collective + GEMM 边界；plan 缺省时读取
-`model.tp_plan`。无法安全处理的 bias 或布局必须拒绝。
+TP 由模型的 `tp_config` 和显式配置覆盖驱动。`ColumnParallelLinear` 和
+`RowParallelLinear` 提供 sequence-parallel 的 collective + GEMM 边界。
+解析阶段绑定具体模块和参数，执行阶段消费计划并拒绝失效绑定；无法安全处理
+的 bias 或布局必须拒绝。
 
 支持的 MoE-under-TP 路径沿专家 hidden 维切分 routed experts，router 保持
 复制，并通过块边界 all-gather / reduce-scatter 对齐序列分片。非标准 shared
@@ -187,21 +180,19 @@ expert × TP × EP 组合会被拒绝。
 
 ### 5.3 CP
 
-CP 支持 KV AllGather、Ulysses 和已接入的 KCP 路径。输入分片同步处理
-`input_ids`、labels 和 positions，mask 按 kernel 语义切分或保留全局文档结构。
+CP 的公共入口只接受已接入的模型自有 KCP 或 Compressor 后端；通用
+standard-attention CP 内核已移除。拓扑和输入分片代码保留 KV、Ulysses 等轴的
+描述能力，不代表所有后端组合均可执行。
 
-主要约束：
-
-- 序列长度满足 CP/TP 联合整除要求；headtail 还需额外整除。
-- Ulysses 要求 attention head 数满足切分要求，且不与 load balancer 组合。
-- packed 文档边界是全局元数据，不能从已切分 positions 中猜测。
-- 双轴 KV × Ulysses 的查询偏移按 KV local rank 计算。
-- 完整 SDPA 文档 mask 为 `O(T²)`，不代表稀疏 attention 的性能。
+模型必须提供 `set_cp_mesh()` 及对应后端的验证、前向接口。CP 预检先拒绝
+不支持的后端，再绑定具体 attention 目标；PP 切分后重新检查本地目标归属。
+输入分片同步处理 tokens、labels、positions 和 padding 元数据，不能从已切分
+positions 中猜测全局文档边界。
 
 ### 5.4 EP
 
-EP 通过结构探测将可表达的 HF MoE 块替换为原生 router、grouped experts 和
-dispatcher。EP=1 使用本地 dispatch；EP>1 使用本地专家切片和 EP 通信组。
+EP 按模型声明的稀疏槽位和数学契约，将支持的专家块替换为原生 router、
+grouped experts 和 dispatcher。EP=1 使用本地 dispatch；EP>1 使用本地专家切片和 EP 通信组。
 AllToAll 是默认后端，TorchAO padded dispatcher 是可选后端，MC2/Domino 有
 专用实现。DeepEP/HybridEP 仍明确拒绝。
 
@@ -232,9 +223,9 @@ FSDP 最后包装模型，dense 与专家参数使用各自的 mesh 和所有权
 `fsdp_reduce_dtype` 独立控制梯度通信精度，默认 FP32；选择 BF16 或 FP64 时
 必须单独验证。
 
-`fsdp_apply_modules` 的 `ignored_params`、`hook_module` 和
-`fsdp_ignored_modules` 使用对象引用。装配在 TP/EP 前记录逻辑路径，变换后按
-参数或模块身份重新绑定，避免保留失效引用。
+`fsdp_apply_modules` 与 `fsdp_ignored_modules` 使用模块路径模式；单元选项的
+`ignored_params`、`hook_module` 可含对象引用。装配在 TP/EP 前记录归属和
+替换映射，变换后重新绑定，避免重用已失效的路径或对象。
 
 CPU offload 与 pin-memory、forward/backward prefetch 分开配置。optimizer
 state 的 NPU 常驻与 CPU 常驻是不同策略，不能共用含义不清的开关。
@@ -245,7 +236,7 @@ state 的 NPU 常驻与 CPU 常驻是不同策略，不能共用含义不清的�
 
 ```text
 DataLoader → Batch
-  → HFTransformerModel.preprocess_inputs
+  → TrainingEngine.preprocess → 模型 prepare_inputs
   → 统一 batch / mask，先 CP 后 TP 切分
   → spmd_context
   → model forward（TP / CP / EP 在对应边界通信）
@@ -257,6 +248,20 @@ DataLoader → Batch
 
 PP 由 schedule 驱动 microbatch。validation 使用 eval 和 `no_grad`，复用对应的
 单模型或 PP 驱动，不更新参数，也不推进训练 token 计数。
+
+运行时职责集中在以下位置，避免新增同义入口：
+
+| 模块 | 职责 |
+|---|---|
+| `trainer/trainer.py` | 恢复、训练循环、验证时机、保存与资源关闭 |
+| `trainer/runtime/assembly.py` | 构造模型和训练服务，连接显式依赖 |
+| `trainer/runtime/engine.py` | 前后向、累积、梯度同步与更新 |
+| `trainer/runtime/batch.py` | 统一训练/验证 loader 构造及 batch 适配 |
+| `trainer/runtime/results.py` | 进度计数与步骤结果类型 |
+| `trainer/runtime/gradients.py` | 梯度校验、归约及参考范数布局 |
+
+训练与验证均使用 `build_rank_dataloader()`，由 `repeat` 和可选 dataset 区分。
+`TrainingBuilders` 只注入组件工厂，组件不读取或改写完整 Trainer。
 
 ### 6.2 数据与 mask
 
@@ -362,6 +367,10 @@ EMA 固定跟踪构造时的 FQN、shape、dtype、device 和张量身份；DTen
 mesh、placements 和本地 shape。逐步更新在匹配的本地存储上执行，不隐式重分片。
 分布式 `state_dict()` / `load_state_dict()` 必须所有 rank 同序调用。
 
+EMA 与训练优化器共用 `optimizer/checkpoint_state.py::OptimizerCheckpointState`
+的参数归属校验和 FQN 状态序列化。EMA 不继承训练优化器的更新接口；Trainer
+显式调用 `step(current_step)`。
+
 ### 8.3 本地错误协调
 
 `synchronize_local_errors` 用于“各 rank 先执行本地操作，再共同决定是否继续”：
@@ -385,6 +394,10 @@ staging/save 等待点；完成报告失败不代表 checkpoint 未发布，不�
 上传结束。PROCESS staging 在上一轮完成后释放实例，下一轮重新创建；构造
 失败时保留尚未使用的实例。
 
+`Trainer.close()` 按依赖顺序释放资源。检查点 drain 失败时保留 checkpointer
+和它仍可能读取的 dataloader、优化器等依赖；独立的日志、验证和 GC 资源仍尝试
+关闭。成功释放的资源不重复关闭，失败资源由原所有者保留以便重试。
+
 ## 9. 验证策略
 
 - CPU 单测验证纯逻辑、局部模块和故障分支。
@@ -406,28 +419,12 @@ git diff --check
 pre-commit run --all-files
 ```
 
-## 10. 代码量与模块边界
+## 10. 模块边界与简洁性
 
-以下数据统计于 2026-11-04 的本地工作树。“物理行”包含注释和 docstring；
-“有效代码行”排除空行、纯注释行和 docstring。目录统计包含其全部 `.py` 文件。
-外部项目使用职责最接近的实现，不代表功能范围完全一致。
-
-| 功能 | TorchLLMTuner 物理/有效行 | 对应实现物理/有效行 | 范围说明 |
-|---|---:|---:|---|
-| AC | 717 / 384 | TorchTitan `activation_remat.py`：210 / 124 | 本项目含四种模式、NPU reduce-scatter 保留和兼容校验 |
-| PP | 1033 / 594 | TorchTitan `pipeline_parallel.py`：913 / 617 | 本项目拆为 stage 切分、驱动和公共入口 |
-| CP | 2383 / 1652 | TorchTitan `context_parallel.py`：394 / 292 | 本项目另含 KCP、压缩注意力和多种 mask/输入布局 |
-| Checkpoint | 4675 / 3352 | TorchTitan checkpointer：1990 / 1311 | 本项目含 HF/Kimi、远程发布、异步 staging 和恢复预检 |
-| Trainer | 2631 / 1726 | TorchTitan `trainer.py` + `training_engine.py`：1460 / 1185 | 本项目另含 runtime 装配、validation 和 PP 驱动 |
-| DistMuon/FlexShard | 4377 / 3716 | TorchTitan FlexShard：4533 / 3786 | 规模和职责接近，不存在数量级简化 |
-
-方法级数据同样应避免“少即是好”的误判：`parallelize_model` 为
-193/166 行，承担全部并行装配和组合校验；`Trainer.train` 为 150/83 行，覆盖
-训练、validation、保存和关闭路径。`stages.py` 的 80/59 行只负责声明顺序，
-不包含各 `apply_*` 的实现成本。
-
-代码简洁性应从公共入口数量、依赖方向、重复实现和失败语义评估。物理行数用于
-暴露维护成本，不用于推断性能、数值正确性或架构优劣。
+以公共入口、依赖方向、重复实现和失败语义评估复杂度，不用历史文件行数推断
+性能或正确性。训练编排保留在 Trainer，数学和输入语义归模型，参数变换归并行层，
+状态序列化归组件。合并共享逻辑时，需同时迁移调用方和验证脚本；删除内部模块
+后不保留无人使用的兼容转发层。
 
 ## 11. 已知边界
 

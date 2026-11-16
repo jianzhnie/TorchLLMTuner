@@ -105,7 +105,7 @@ def initialize_model_weights(module: nn.Module, std: float) -> None:
         init.ones_(module.weight)
     elif isinstance(module, DeepseekV4UnweightedRMSNorm):
         pass
-    elif isinstance(module, (DeepseekV4TopKRouter, DeepseekV4HashRouter)):
+    elif isinstance(module, DeepseekV4TopKRouter | DeepseekV4HashRouter):
         init.normal_(module.weight, mean=0.0, std=std)
         if isinstance(module, DeepseekV4TopKRouter):
             init.zeros_(module.e_score_correction_bias)
@@ -125,7 +125,7 @@ def initialize_model_weights(module: nn.Module, std: float) -> None:
         init.zeros_(module.hc_base)
         init.ones_(module.hc_scale)
     elif isinstance(
-        module, (DeepseekV4HCACompressor, DeepseekV4CSACompressor, DeepseekV4Indexer)
+        module, DeepseekV4HCACompressor | DeepseekV4CSACompressor | DeepseekV4Indexer
     ):
         init.zeros_(module.position_bias)
     elif isinstance(module, DeepseekV4RotaryEmbedding):
@@ -149,7 +149,7 @@ class DeepseekV4Experts(HFDeepseekV4Experts):
 
     def __init__(self, config: DeepseekV4Config) -> None:
         nn.Module.__init__(self)
-        self.num_experts = config.num_local_experts
+        self.num_experts = config.n_routed_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.intermediate_size
         self.gate_up_proj = nn.Parameter(
@@ -486,7 +486,7 @@ class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
                 "hc_mult",
                 "hc_eps",
                 "hc_sinkhorn_iters",
-                "num_local_experts",
+                "n_routed_experts",
                 "num_experts_per_tok",
                 "n_shared_experts",
                 "scoring_func",
@@ -534,7 +534,7 @@ class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
             compute_dtype=getattr(config, "compute_dtype", None),
         )
         self.router_aux_loss_coef = config.router_aux_loss_coef
-        self.num_experts = config.num_local_experts
+        self.num_experts = config.n_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.post_init()
 

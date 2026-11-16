@@ -52,7 +52,7 @@ def read_hf_weight_map(index_path: str | Path) -> dict[str, str]:
             or ".." in PurePosixPath(filename).parts
         ):
             raise ValueError(
-                f"Invalid HF checkpoint index entry: {name!r}: {filename!r}"
+                f"Invalid HF checkpoint weight_map entry: {name!r}: {filename!r}"
             )
     return weight_map
 

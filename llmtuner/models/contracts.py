@@ -112,7 +112,7 @@ class MoEBlockContract:
             raise ValueError("MoE route_norm must be boolean")
         if (
             isinstance(self.route_scale, bool)
-            or not isinstance(self.route_scale, (int, float))
+            or not isinstance(self.route_scale, int | float)
             or not math.isfinite(self.route_scale)
             or self.route_scale <= 0
         ):
