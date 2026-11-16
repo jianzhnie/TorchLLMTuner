@@ -32,7 +32,7 @@ from llmtuner.parallel.topology import ParallelTopology, resolve_parallel_topolo
 @pytest.mark.parametrize("field", ["dp_replicate", "dp_shard", "cp", "tp", "ep"])
 @pytest.mark.parametrize("value", [True, 1.0, 1.5, "2"])
 def test_topology_degrees_require_integer_values(field, value):
-    values = dict(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1)
+    values = dict(dp_replicate=1, dp_shard=1, cp=1, tp=1, ep=1, world_size=1)
     values[field] = value
     with pytest.raises(ValueError, match=">= 1"):
         ParallelTopology(**values)
@@ -105,7 +105,6 @@ def _dims(world_size: int = 8, **overrides) -> ParallelTopology:
         "dp_shard": 8,
         "cp": 1,
         "tp": 1,
-        "pp": 1,
         "ep": 1,
         "world_size": world_size,
         **overrides,

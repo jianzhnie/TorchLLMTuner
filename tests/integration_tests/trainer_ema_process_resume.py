@@ -17,8 +17,6 @@ Add `moe` for native Qwen3 MoE with fixed routing and auxiliary loss;
 `ep2` additionally shards experts; `dp4` selects four worker ranks.
 Add `tp2` with dp4/moe for DP2 x TP2 fixed routing at EP1.
 Add `quantile` with moe/ep2 for DeepSeek-V3 sigmoid quantile routing.
-Add `pp2` with dp4 for dense DP2 x PP2 Interleaved1F1B, six layers
-and four microbatches; this mode excludes moe/tp2/ep2.
 CPU only; no accelerator kernel coverage.
 """
 
@@ -108,7 +106,7 @@ def worker(
     config = parse_config(
         [
             "--model_name_or_path",
-            "qwen3",
+            "qwen3_moe",
             "--vocab_size",
             "32",
             "--hidden_size",
@@ -143,7 +141,6 @@ def worker(
             str(folder),
         ]
     )
-    pp_size = 1
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     if moe_enabled:
@@ -157,6 +154,9 @@ def worker(
         )
         config.parallel.ep_config.fixed_router = True
         config.parallel.ep_config.router_aux_loss_coef = 0.03
+    else:
+        config.model.arch_overrides.update(mlp_only_layers=[0, 1])
+    config.model.arch_overrides.setdefault("head_dim", 8)
     if quantile_enabled:
         config.model.model_name_or_path = "deepseek_v3"
         config.model.arch_overrides = dict(
@@ -179,7 +179,7 @@ def worker(
         config.parallel.ep_config.moe_quantile_balancing = True
     config.parallel.expert_parallel_size = ep_size
     config.parallel.tensor_parallel_size = tp_size
-    config.parallel.data_parallel_shard_size = world_size // (tp_size * pp_size)
+    config.parallel.data_parallel_shard_size = world_size // tp_size
     config.parallel.fsdp_config.fsdp_implementation = implementation
     config.training.activation_checkpoint_mode = "full" if recompute else "none"
     if validation_enabled:
@@ -300,7 +300,7 @@ def worker(
                     for part in trainer.model_parts
                     for module in part.modules()
                 )
-                == config.model.num_hidden_layers // pp_size
+                == config.model.num_hidden_layers
             )
         if name == "initial":
             torch.save(snapshot(trainer), root / f"initial_boundary{rank}.pt")
@@ -442,7 +442,6 @@ def main():
     world_size = 4 if "dp4" in sys.argv[1:] else 2 if "dp2" in sys.argv[1:] else 1
     if "ep2" in sys.argv[1:] and ("moe" not in sys.argv[1:] or world_size < 2):
         raise ValueError("ep2 requires moe and dp2 or dp4")
-    pp_size = 1
     ep_size = 2 if "ep2" in sys.argv[1:] else 1
     if "quantile" in sys.argv[1:] and (
         "moe" not in sys.argv[1:] or "tp2" in sys.argv[1:] or ep_size != 2
@@ -524,7 +523,7 @@ def main():
             f"{name} left collective work pending: {root / f'{name}.log'}"
         )
     for rank in range(world_size):
-        dp_rank = (rank // tp_size) % (world_size // (tp_size * pp_size))
+        dp_rank = (rank // tp_size) % (world_size // tp_size)
         rank_id = f"dp_rank_{dp_rank}"
         initial = torch.load(root / f"initial{rank}.pt", weights_only=False)
         boundary = torch.load(root / f"loaded_boundary{rank}.pt", weights_only=False)
@@ -564,19 +563,14 @@ def main():
             assert rank_id in initial["dataloader"]
         else:
             assert initial["dataloader"]["steps"] == (
-                {str(dp_rank): 2} if world_size // (tp_size * pp_size) > 1 else 2
+                {str(dp_rank): 2} if world_size // tp_size > 1 else 2
             )
         assert_state_equal(boundary, initial)
         continuous = torch.load(root / f"continuous{rank}.pt", weights_only=False)
         resumed = torch.load(root / f"resume{rank}.pt", weights_only=False)
         assert continuous["train_state"] == {
             "step": 4,
-            "ntokens_seen": (
-                4
-                * (8 if pp_size > 1 else max(2, world_size))
-                * 8
-                // (world_size // pp_size)
-            ),
+            "ntokens_seen": (4 * max(2, world_size) * 8 // (world_size)),
         }
         assert continuous["lr_scheduler"] == {"last_epoch": 4}
         if corpus:
@@ -587,7 +581,7 @@ def main():
             assert continuous["dataloader"][rank_id] != initial["dataloader"][rank_id]
         else:
             assert continuous["dataloader"]["steps"] == (
-                {str(dp_rank): 4} if world_size // (tp_size * pp_size) > 1 else 4
+                {str(dp_rank): 4} if world_size // tp_size > 1 else 4
             )
         assert_state_equal(resumed, continuous)
         before = torch.load(root / f"initial_boundary{rank}.pt", weights_only=False)

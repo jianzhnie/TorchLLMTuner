@@ -43,9 +43,7 @@ def production_state():
     optim = get_flat_optim_state_dict(optimizer)
     trainer = object.__new__(Trainer)
     trainer.step, trainer.ntokens_seen = 100, 800
-    degrees = dict(
-        dp_replicate=1, dp_shard=8, cp=1, tp=1, pp=1, ep=1, cp_kv=1, cp_ulysses=1
-    )
+    degrees = dict(dp_replicate=1, dp_shard=8, cp=1, tp=1, ep=1, cp_kv=1, cp_ulysses=1)
     layout = dict(
         num_tokens_per_batch=32,
         max_context_length=32,

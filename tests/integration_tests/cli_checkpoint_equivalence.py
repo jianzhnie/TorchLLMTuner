@@ -4,12 +4,11 @@ PYTHONPATH=. python tests/integration_tests/cli_checkpoint_equivalence.py
 
 Default: one CPU process per run, eager Qwen3, synthetic data and native DCP.
 Artifacts and logs remain in the printed temporary directory for inspection.
-Append dp2 or pp2 for DP2 or DP2 x PP2; add custom, async, ac and/or profile.
+Append dp2 for DP2; add custom, async, ac and/or profile.
 Append first_fit for local JSONL data and production FirstFit packing, with one
 document chunk per row so CPU SDPA needs no cross-document attention mask.
 Append seed for a single-process step-0 export before the initial training run
-and a fresh loading boundary (single process, DP2 or DP2 x PP2).
-PP uses Interleaved1F1B with four microbatches and six layers.
+and a fresh loading boundary (single process or DP2).
 EMA, validation and compile-backend configuration are programmatic-only;
 this script does not expose those or exercise target-device kernels.
 """
@@ -115,7 +114,6 @@ def main():
     print(f"Artifacts: {root}", flush=True)
     command = [sys.executable, "-m", "llmtuner"]
     options = {
-        "model_name_or_path": "qwen3",
         "vocab_size": 32,
         "hidden_size": 16,
         "intermediate_size": 32,
@@ -155,6 +153,25 @@ def main():
             max_num_documents=1,
             vocab_size=len(VOCAB),
         )
+    # CLI intentionally accepts scalar fields only. A local configuration keeps
+    # the registered Qwen3 model entirely dense without adding CLI-only knobs.
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+
+    architecture_path = root / "architecture"
+    Qwen3MoeConfig(
+        vocab_size=options["vocab_size"],
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=16,
+        mlp_only_layers=[0, 1],
+    ).save_pretrained(architecture_path)
+    options["model_name_or_path"] = str(architecture_path)
     if world_size > 1:
         options["data_parallel_shard_size"] = dp_size
     if "custom" in modes:
@@ -232,8 +249,7 @@ def main():
             f"Seed boundary failed: {root / 'seed-boundary.log'}"
         )
 
-        # PP initializes stages with distinct seeds. Both trajectories must
-        # start from the exported weights, rather than comparing unrelated starts.
+        # Both trajectories start from the same exported weights.
         command.extend(["--initial_load_path", str(root / "resumed/checkpoint/step-0")])
 
     for index, (name, steps, folder) in enumerate(

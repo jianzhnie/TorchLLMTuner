@@ -5,7 +5,7 @@ attempt (sys.modules first, so the stub runner's injected fakes count as
 present) or an attribute probe. Distinct from ``llmtuner.accelerator.capabilities``
 on purpose: that is the *runtime* registry for torch knobs a built feature
 checks; this table is about import-level hard dependencies of test modules
-(DTensor, grain, pipelining, ...), which fail at collection, not at a guard.
+(DTensor, grain, ...), which fail at collection, not at a guard.
 
 A test module declares what it needs with a top-of-file comment::
 
@@ -89,8 +89,6 @@ CAPS: dict[str, Callable[[], bool]] = {
     "flex_attention": lambda: _importable_attr(
         "torch.nn.attention.flex_attention", "create_block_mask"
     ),
-    # torch.distributed.pipelining (PipelineStage, schedules)
-    "pipelining": lambda: importable("torch.distributed.pipelining"),
     # torch.distributed.checkpoint's HF storage surface the checkpointer reads
     "dcp": lambda: _importable_attr(
         "torch.distributed.checkpoint", "HuggingFaceStorageWriter"

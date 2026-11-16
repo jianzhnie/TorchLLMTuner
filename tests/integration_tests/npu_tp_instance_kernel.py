@@ -13,9 +13,9 @@ from types import MethodType
 
 import torch
 import torch.distributed as dist
-from llmtuner.models.qwen.qwen3.experts import forward_torchtitan_moe
 from torch import nn
 
+from llmtuner.models.qwen.qwen3.experts import forward_torchtitan_moe
 from llmtuner.parallel.tensor_parallel.tensor_parallel import realize_moe_blocks_tp
 from tests.caps import require_env
 

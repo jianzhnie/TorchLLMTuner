@@ -149,7 +149,6 @@ def test_mesh_manifest_reads_existing_process_groups(monkeypatch):
         dp_shard=2,
         tp=2,
         ep=1,
-        pp=1,
         cp=1,
         world_size=4,
         _global_meshes={"dense": Mesh()},

@@ -23,14 +23,12 @@ def verify(audit: Path, layout: str):
         dense = row["meshes"]["dense"]["local_groups"]
         sparse = row["meshes"]["sparse"]["local_groups"]
         assert dense == {
-            "pp": [rank],
             "dp_replicate": [rank],
             "dp_shard": list(range(rank % tp, 8, tp)),
             "cp": [rank],
             "tp": list(range(rank // tp * tp, (rank // tp + 1) * tp)),
         }, (rank, "dense")
         assert sparse == {
-            "pp": [rank],
             "dp_replicate": [rank],
             "efsdp": list(range(rank % ep, 8, ep)),
             "ep": list(range(rank // ep * ep, (rank // ep + 1) * ep)),

@@ -5,14 +5,14 @@ import pytest
 from llmtuner.components.metrics import compute_utilization, token_throughput
 
 
-@pytest.mark.parametrize("dp,tp,cp,pp", [(8, 1, 1, 1), (2, 2, 1, 1), (1, 2, 2, 1)])
-def test_global_and_per_device_utilization_agree(dp, tp, cp, pp):
+@pytest.mark.parametrize("dp,tp,cp", [(8, 1, 1), (2, 2, 1), (1, 2, 2)])
+def test_global_and_per_device_utilization_agree(dp, tp, cp):
     global_tokens = 8 * 4096 * 4
     seconds = 2.0
-    world_size = dp * tp * cp * pp
+    world_size = dp * tp * cp
     global_tps = token_throughput(global_tokens, seconds)
     rank_tps = token_throughput(
-        global_tokens // dp, seconds, replication_degree=tp * cp * pp
+        global_tokens // dp, seconds, replication_degree=tp * cp
     )
     options = dict(flops_per_token=27_913_617_408, peak_flops_per_device=376e12)
     total = compute_utilization(

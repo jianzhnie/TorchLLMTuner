@@ -88,7 +88,7 @@ def train(args) -> None:
             num_key_value_heads=2,
         ),
         parallel=ParallelConfig(
-            data_parallel_shard_size=world // (args.tp * args.cp * args.pp),
+            data_parallel_shard_size=world // (args.tp * args.cp),
             tensor_parallel_size=args.tp,
             expert_parallel_size=args.ep,
             context_parallel_ulysses_size=args.cp,
@@ -140,7 +140,7 @@ def train(args) -> None:
             )
             for part in trainer.model_parts
         ), "TP must actually shard projections"
-    if world // (args.tp * args.cp * args.pp) > 1:
+    if world // (args.tp * args.cp) > 1:
         assert any(
             isinstance(parameter, DTensor)
             for optimizer in trainer.optimizer.optimizers
@@ -355,8 +355,6 @@ def suite(args) -> None:
             str(args.tp),
             "--cp",
             str(args.cp),
-            "--pp",
-            str(args.pp),
             "--checkpoint-backend",
             args.checkpoint_backend,
             "--async-mode",
@@ -458,7 +456,6 @@ def main() -> None:
         subparser.add_argument("--ep", type=int, default=1)
         subparser.add_argument("--tp", type=int, default=1)
         subparser.add_argument("--cp", type=int, default=1)
-        subparser.add_argument("--pp", type=int, choices=(1,), default=1)
         subparser.add_argument(
             "--async-mode",
             choices=("disabled", "async", "async_with_pinned_mem"),

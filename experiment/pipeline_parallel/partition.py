@@ -1,0 +1,571 @@
+"""Split a model into pipeline stages.
+
+Two independent pieces, usable on their own:
+
+* ``generate_llm_fqn_per_model_part`` -- pure arithmetic that decides which
+  layers go on which stage, so no model is needed to compute the split.
+* ``split_model_into_stages`` -- performs the split: deep-copies the model once
+  per local stage, deletes everything that stage does not own, and wraps the
+  result in a ``PipelineStage``.
+
+Vendored from torchtitan's ``experiments/transformers_modeling_backend/pipeline.py``.
+Two changes, both removals of torchtitan's module layer:
+
+* ``ModuleList`` / ``ModuleDict`` -> the plain ``nn`` equivalents. torchtitan's
+  versions exist so the containers take part in its module protocol; llmtuner has
+  none, and ``nn.ModuleList`` is what every HF model already uses. The kept
+  layers are re-keyed to their original indices (via ``add_module``), because a
+  fresh ``ModuleList`` would renumber them and two stages' state-dict keys would
+  collide in one checkpoint.
+* ``get_mesh`` defaults to ``None``. torchtitan passes a callback so each stage
+  can rebuild a DTensor from the plain tensor it receives from the previous stage
+  (DTensors carry a ProcessGroup, which cannot cross a stage boundary). llmtuner
+  runs no SPMD/DTensor path, so stages exchange plain tensors and no callback is
+  needed.
+
+The stage-splitting arithmetic is otherwise unchanged.
+"""
+
+from __future__ import annotations
+
+import copy
+import inspect
+from collections.abc import Callable, Iterator
+
+import torch
+import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining._backward import stage_backward
+from torch.distributed.pipelining.schedules import (
+    ScheduleDualPipeV,
+    ScheduleZBVZeroBubble,
+    get_schedule_class,
+)
+
+from experiment.pipeline_parallel.execution import validate_pipeline_stage_io
+from experiment.pipeline_parallel.registered_state import registered_state_paths
+from llmtuner.errors import UnsupportedCombinationError
+from llmtuner.models.contracts import DecoderStructure
+from llmtuner.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class ComposablePipelineStage(PipelineStage):
+    """Finalize any FSDP state, including custom composable implementations.
+
+    PyTorch 2.14's stage uses fully_shard.state(), which only discovers state
+    registered by that specific API. FSDPModule's accessor discovers the actual
+    state attached to the module and preserves custom lifecycle callbacks.
+    """
+
+    def backward_maybe_with_nosync(
+        self, backward_type, bwd_kwargs: dict, last_backward: bool = False
+    ):
+        if (
+            self.device.type != "npu"
+            or backward_type != "full"
+            or not isinstance(self.submod, FSDPModule)
+        ):
+            return super().backward_maybe_with_nosync(
+                backward_type, bwd_kwargs, last_backward
+            )
+        # Keep upstream's delayed gradient reduction, but release each group's
+        # full parameters before upcasting its accumulated gradient. This does
+        # not change accumulation order; later microbatches gather parameters
+        # again. Split input/weight backward retains the upstream lifecycle.
+        self.submod.set_is_last_backward(False)
+        self.submod.set_reshard_after_backward(True)
+        self.submod.set_requires_gradient_sync(False)
+        return (
+            stage_backward(
+                bwd_kwargs["stage_output"],
+                bwd_kwargs["output_grads"],
+                bwd_kwargs["input_values"],
+            ),
+            None,
+        )
+
+    def _send_meta(self, meta, dst_stage: int) -> None:
+        if self.device.type != "npu":
+            return super()._send_meta(meta, dst_stage)
+        # Torch 2.12 batches the object's size and payload P2P. Cross-node
+        # HCCL fails that path; sequential object P2P preserves the protocol.
+        torch.distributed.send_object_list(
+            [meta],
+            dst=self._resolve_peer_global_rank(dst_stage),
+            group=self.group,
+            device=self.device,
+            use_batch=False,
+        )
+
+    def _recv_meta(self, src_stage: int):
+        if self.device.type != "npu":
+            return super()._recv_meta(src_stage)
+        objects = [None]
+        torch.distributed.recv_object_list(
+            objects,
+            src=self._resolve_peer_global_rank(src_stage),
+            group=self.group,
+            device=self.device,
+            use_batch=False,
+        )
+        return objects[0]
+
+    def perform_reduce_grad(self, grad_scale_factor: int) -> None:
+        if not isinstance(self.submod, FSDPModule):
+            super().perform_reduce_grad(grad_scale_factor)
+            return
+        module = self.submod
+        module.set_is_last_backward(True)
+        module.set_reshard_after_backward(True)
+        module.set_requires_gradient_sync(True)
+        state = module._get_fsdp_state()
+        for child_state in state._state_ctx.all_states:
+            for group in child_state._fsdp_param_groups:
+                group.post_backward()
+        state._root_post_backward_final_callback()
+        if grad_scale_factor != 1:
+            self.scale_grads(grad_scale_factor)
+
+
+__all__ = [
+    "generate_llm_fqn_per_model_part",
+    "split_model_into_stages",
+    "validate_pipeline_ownership",
+]
+
+
+def generate_llm_fqn_per_model_part(
+    num_stages: int,
+    num_layers: int,
+    *,
+    input_weight: int = 1,
+    output_weight: int = 1,
+) -> list[list[str]]:
+    """Assign each module to a pipeline stage.
+
+    The model is treated as ``input_weight`` pseudo-layers of embedding, then
+    ``num_layers`` transformer layers, then ``output_weight`` pseudo-layers of
+    final norm and lm_head. Those weights are how a caller says "the embedding
+    costs about as much as N layers", so the split is balanced by cost rather
+    than by module count.
+
+    Args:
+        num_stages: Number of pipeline stages.
+        num_layers: Total transformer layers in the model.
+        input_weight: Cost of the input modules, in layers.
+        output_weight: Cost of the output modules, in layers.
+
+    Returns:
+        One list of module names per stage.
+
+    Example:
+        ``generate_llm_fqn_per_model_part(2, 3, input_weight=2, output_weight=2)``
+        treats the embedding and the norm+head as two layers each when deciding
+        the split.
+    """
+    if (
+        not isinstance(num_stages, int)
+        or isinstance(num_stages, bool)
+        or num_stages < 1
+    ):
+        raise ValueError("Number of stages must be at least 1")
+
+    for name, value in (
+        ("num_layers", num_layers),
+        ("input_weight", input_weight),
+        ("output_weight", output_weight),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer, got {value!r}")
+
+    if num_stages == 1:
+        # Single stage gets everything.
+        layer_names = [f"layers.{i}" for i in range(num_layers)]
+        return [["tok_embeddings"] + layer_names + ["norm", "lm_head", "rotary_emb"]]
+
+    num_effective_layers = num_layers + input_weight + output_weight
+
+    if num_stages > num_effective_layers:
+        raise ValueError(
+            f"Number of stages ({num_stages}) cannot be greater than effective "
+            f"layers ({num_effective_layers})"
+        )
+
+    # Layers per stage, distributing the remainder over the first stages.
+    layers_per_stage = num_effective_layers // num_stages
+    extra_layers = num_effective_layers % num_stages
+
+    # The weighted modules must fit inside a stage, or that stage would hold
+    # nothing but the embedding (or nothing but the head).
+    if input_weight > layers_per_stage:
+        raise ValueError(
+            f"input_weight ({input_weight}) exceeds minimum layers per stage "
+            f"({layers_per_stage})."
+        )
+    if output_weight > layers_per_stage:
+        raise ValueError(
+            f"output_weight ({output_weight}) exceeds minimum layers per stage "
+            f"({layers_per_stage})."
+        )
+
+    module_names_per_stage = []
+    current_layer = 0
+
+    for stage_idx in range(num_stages):
+        stage_modules = []
+
+        effective_layers_for_stage = layers_per_stage
+        if stage_idx < extra_layers:
+            effective_layers_for_stage += 1
+
+        if stage_idx == 0:
+            # First stage owns the input modules.
+            stage_modules.append("tok_embeddings")
+            effective_layers_for_stage -= input_weight
+        elif stage_idx == num_stages - 1:
+            effective_layers_for_stage -= output_weight
+
+        for _ in range(effective_layers_for_stage):
+            if current_layer < num_layers:
+                stage_modules.append(f"layers.{current_layer}")
+                current_layer += 1
+
+        if stage_idx == num_stages - 1:
+            stage_modules.extend(["norm", "lm_head"])
+
+        stage_modules.append("rotary_emb")
+        module_names_per_stage.append(stage_modules)
+
+    return module_names_per_stage
+
+
+def prune_declared_stage(model: nn.Module, targets: set[str]) -> None:
+    """Keep exact registered FQNs and their ancestors, preserving block IDs."""
+    ancestors = {parent for target in targets for parent in _ancestor_paths(target)}
+
+    def prune(parent: nn.Module, prefix: str) -> None:
+        for name, child in list(parent._modules.items()):
+            path = f"{prefix}.{name}" if prefix else name
+            if path in targets:
+                continue
+            if child is not None and (
+                path in ancestors or isinstance(child, nn.ModuleList | nn.ModuleDict)
+            ):
+                # Containers keep their registered type even when no entries
+                # belong here; models may still iterate an empty block set.
+                prune(child, path)
+            elif isinstance(parent, nn.ModuleList | nn.ModuleDict):
+                del parent._modules[name]
+            else:
+                setattr(parent, name, nn.Identity())
+
+    prune(model, "")
+
+
+def build_stage_from_modules(
+    whole_model: nn.Module,
+    pp_mesh: DeviceMesh,
+    device: torch.device,
+    get_mesh: Callable | None,
+    supports_get_mesh: bool,
+    stage_idx: int,
+    module_names: list[str],
+    num_stages: int,
+) -> tuple[PipelineStage, nn.Module]:
+    configure = getattr(whole_model, "configure_pipeline_stage", None)
+    if not callable(configure):
+        raise UnsupportedCombinationError("PP requires model-owned stage I/O")
+    model = copy.deepcopy(whole_model)
+    prune_declared_stage(model, set(module_names))
+    model.configure_pipeline_stage(
+        first=stage_idx == 0, last=stage_idx == num_stages - 1
+    )
+    validate_pipeline_stage_io(
+        model, first=stage_idx == 0, last=stage_idx == num_stages - 1
+    )
+
+    stage_kwargs = {"group": pp_mesh.get_group()}
+    # ``get_mesh`` was added after PyTorch 2.10. llmtuner passes None because
+    # its stages exchange plain tensors, so omitting it on older releases
+    # has exactly the same semantics.
+    if supports_get_mesh:
+        stage_kwargs["get_mesh"] = get_mesh
+    stage = ComposablePipelineStage(
+        model, stage_idx, num_stages, device, **stage_kwargs
+    )
+    return stage, model
+
+
+def _ancestor_paths(path: str) -> Iterator[str]:
+    """Yield registration ancestors, excluding the path itself and model root."""
+    parent, _, _ = path.rpartition(".")
+    while parent:
+        yield parent
+        parent, _, _ = parent.rpartition(".")
+
+
+def validate_pipeline_ownership(
+    whole_model: nn.Module,
+    module_names_per_stage: list[list[str]],
+    *,
+    replicated_module_names: tuple[str, ...] = (),
+) -> None:
+    """Validate global stage ownership without a mesh or model mutation.
+
+    Check model-owned partition constraints, overlapping targets, checkpoint
+    coverage and shared resources before creating any local stage. This is a
+    local preflight only; callers coordinate failures across ranks separately.
+    """
+    if not module_names_per_stage:
+        raise ValueError("PP ownership requires at least one stage")
+    structure = getattr(whole_model, "decoder_structure", None)
+    if structure is not None and not isinstance(structure, DecoderStructure):
+        raise TypeError("Pipeline decoder_structure must be DecoderStructure")
+    validate = getattr(whole_model, "validate_pipeline_partition", None)
+    configure = getattr(whole_model, "configure_pipeline_stage", None)
+    if structure is not None:
+        if not callable(validate) or not callable(configure):
+            raise UnsupportedCombinationError(
+                "Explicit PP requires model-owned partition validation and stage I/O"
+            )
+    if not callable(configure):
+        raise UnsupportedCombinationError("PP requires model-owned stage I/O")
+    if validate is not None:
+        if not callable(validate):
+            raise TypeError("validate_pipeline_partition must be callable")
+        validate(module_names_per_stage)
+
+    # Independent copies of stages cannot preserve a Parameter shared across
+    # their consumers. Validate globally before copying any local stage, so
+    # every rank rejects the same partition without entering communication.
+    # Parameter checks alone miss buffer-only/parameterless modules and a
+    # parent container assigned alongside one of its children. Reject ambiguous
+    # target ownership before copying or constructing any communicating stage.
+    replicated = set(replicated_module_names)
+    for path in replicated:
+        module = whole_model.get_submodule(path)
+        if registered_state_paths(module):
+            raise ValueError(
+                f"PP replicated runtime module {path!r} must have no parameters "
+                "or persistent state"
+            )
+    target_owners: dict[str, int] = {}
+    for stage_idx, module_names in enumerate(module_names_per_stage):
+        for module_name in module_names:
+            if not isinstance(module_name, str) or not module_name:
+                raise ValueError("PP module targets must be non-empty paths")
+            owner = target_owners.get(module_name)
+            if owner is not None and (
+                module_name not in replicated or owner == stage_idx
+            ):
+                raise ValueError(
+                    f"PP module targets {module_name!r} (stage {owner}) and "
+                    f"{module_name!r} (stage {stage_idx}) overlap"
+                )
+            target_owners[module_name] = stage_idx
+
+    # All targets are known now, so ancestor lookup catches overlaps regardless
+    # of declaration order without comparing every pair of module names.
+    for module_name, stage_idx in target_owners.items():
+        for parent in _ancestor_paths(module_name):
+            if parent in target_owners:
+                raise ValueError(
+                    f"PP module targets {parent!r} (stage {target_owners[parent]}) "
+                    f"and {module_name!r} (stage {stage_idx}) overlap"
+                )
+
+    # Stage ownership must cover every checkpoint path, including aliases
+    # and root-level state. Otherwise pruning can silently discard state or
+    # leave root tensors duplicated in independently copied stages.
+    unowned = [
+        path
+        for path in registered_state_paths(whole_model)
+        if not any(parent in target_owners for parent in _ancestor_paths(path))
+    ]
+    if unowned:
+        raise ValueError(f"PP has unassigned state paths: {unowned!r}")
+
+    module_owners: dict[int, tuple[int, str]] = {}
+    # A Parameter can also be registered as a buffer on another module. Use a
+    # single tensor ownership map so changing registration role cannot conceal
+    # a cross-stage alias from either traversal.
+    tensor_owners: dict[int, tuple[int, str]] = {}
+    storage_owners: dict[int, tuple[int, str, torch.Tensor]] = {}
+
+    def validate_storage_owner(
+        tensor: torch.Tensor, path: str, stage_idx: int, module_name: str
+    ) -> None:
+        # Distinct Parameter/buffer views can share storage without sharing
+        # Python identity. Independent stage copies cannot preserve that alias.
+        # Tensor subclasses own their storage semantics; this check covers
+        # ordinary strided tensors, including meta views before allocation.
+        if (
+            type(tensor) not in (torch.Tensor, nn.Parameter)
+            or tensor.layout != torch.strided
+        ):
+            return
+        owner = storage_owners.setdefault(
+            tensor.untyped_storage()._cdata, (stage_idx, path, tensor)
+        )
+        replicated_owner = module_name in replicated and (
+            owner[1] == module_name or owner[1].startswith(module_name + ".")
+        )
+        if owner[0] != stage_idx and not replicated_owner:
+            raise UnsupportedCombinationError(
+                f"PP shared storage {owner[1]!r} / {path!r} spans stages "
+                f"{owner[0]} and {stage_idx}; cross-stage storage aliases "
+                "are not supported."
+            )
+        # Parameter.__deepcopy__ clones independently of tensor storage's memo.
+        # Even within one stage, a distinct Parameter/Parameter or
+        # Parameter/buffer view would silently lose its original alias.
+        if owner[2] is not tensor and (
+            isinstance(owner[2], nn.Parameter) or isinstance(tensor, nn.Parameter)
+        ):
+            raise UnsupportedCombinationError(
+                f"PP distinct tensors {owner[1]!r} / {path!r} share storage "
+                "with a Parameter; stage deepcopy cannot preserve this alias. "
+                "Use a shared Parameter object or independent storage."
+            )
+
+    for stage_idx, module_names in enumerate(module_names_per_stage):
+        for module_name in module_names:
+            if getattr(whole_model, module_name, False) is None:
+                continue
+            module = whole_model.get_submodule(module_name)
+            # Distinct paths can alias a whole module or just one buffer.
+            # Deep-copying those into different stages loses their shared
+            # lifecycle even when no trainable Parameter exposes the alias.
+            for role, values, owners in (
+                ("module", module.named_modules(remove_duplicate=False), module_owners),
+                ("buffer", module.named_buffers(remove_duplicate=False), tensor_owners),
+            ):
+                for name, value in values:
+                    path = f"{module_name}.{name}" if name else module_name
+                    owner = owners.setdefault(id(value), (stage_idx, path))
+                    replicated_owner = module_name in replicated and (
+                        owner[1] == module_name
+                        or owner[1].startswith(module_name + ".")
+                    )
+                    if owner[0] != stage_idx and not replicated_owner:
+                        raise UnsupportedCombinationError(
+                            f"PP shared {role} {owner[1]!r} / {path!r} spans "
+                            f"stages {owner[0]} and {stage_idx}; cross-stage "
+                            "shared resource ownership is not implemented."
+                        )
+                    if role == "buffer":
+                        validate_storage_owner(value, path, stage_idx, module_name)
+            for name, parameter in module.named_parameters(remove_duplicate=False):
+                owner = tensor_owners.setdefault(
+                    id(parameter), (stage_idx, f"{module_name}.{name}")
+                )
+                if owner[0] != stage_idx:
+                    raise UnsupportedCombinationError(
+                        f"PP shared parameter {owner[1]!r} / "
+                        f"{module_name}.{name!s} spans stages {owner[0]} and "
+                        f"{stage_idx}. Place its consumers in the same stage; "
+                        "cross-stage shared-parameter gradient synchronization "
+                        "is not implemented."
+                    )
+                validate_storage_owner(
+                    parameter, f"{module_name}.{name}", stage_idx, module_name
+                )
+
+
+def split_model_into_stages(
+    whole_model: nn.Module,
+    pp_mesh: DeviceMesh,
+    pp_schedule: str,
+    device: torch.device,
+    module_names_per_stage: list[list[str]],
+    get_mesh: Callable | None = None,
+    *,
+    replicated_module_names: tuple[str, ...] = (),
+) -> tuple[list[PipelineStage], list[nn.Module]]:
+    """Build this rank's pipeline stages from a per-stage module assignment.
+
+    Each stage gets its own deep copy of the model with every module it does not
+    own removed -- layers deleted from the ``ModuleList``, everything else
+    replaced by ``nn.Identity``. A deep copy per stage (rather than a partial
+    view) is what lets a rank own two stages of different shapes.
+
+    Models select stage tensor I/O through configure_pipeline_stage; decoder
+    models also validate exact ownership. Registered FQNs are pruned without
+    renumbering blocks or inferring roles from container names.
+
+    Args:
+        whole_model: The complete model to split.
+        pp_mesh: The pipeline-parallel device mesh.
+        pp_schedule: Schedule name; used to decide looped vs V layout.
+        device: Device the stages run on.
+        module_names_per_stage: Module names for each stage, dot-separated:
+            ``"tok_embeddings"``, ``"layers.0"``, ``"norm"``, ``"lm_head"``.
+        replicated_module_names: Explicit parameter-free runtime modules to copy
+            per stage. Persistent checkpoint state cannot be replicated here.
+        get_mesh: Optional callback letting a stage resolve a ``DeviceMesh`` for
+            an incoming tensor. llmtuner leaves this ``None``: it exists so stages
+            can rebuild DTensors, and llmtuner passes plain tensors.
+
+    Returns:
+        ``(stages, models)`` -- the ``PipelineStage`` objects for this rank and
+        their corresponding model chunks.
+    """
+    pp_rank = pp_mesh.get_local_rank()
+    pp_size = pp_mesh.size()
+    supports_get_mesh = "get_mesh" in inspect.signature(PipelineStage).parameters
+    if get_mesh is not None and not supports_get_mesh:
+        raise ValueError("this PyTorch PipelineStage does not support get_mesh")
+
+    num_stages = len(module_names_per_stage)
+    stages = []
+    models = []
+
+    schedule_class = get_schedule_class(pp_schedule)
+    style = (
+        "v" if schedule_class in (ScheduleZBVZeroBubble, ScheduleDualPipeV) else "loop"
+    )
+
+    if num_stages < 1 or num_stages % pp_size != 0:
+        raise ValueError(
+            f"num_stages {num_stages} must be evenly divisible by pp_size {pp_size}"
+        )
+    stages_per_rank = num_stages // pp_size
+    if style == "loop":
+        stage_indices = tuple(pp_rank + s * pp_size for s in range(stages_per_rank))
+    else:
+        # "v": the rank takes one stage from each half, paired front-to-back.
+        if stages_per_rank != 2:
+            raise ValueError(
+                f"v schedules assume 2 stages per rank, got {stages_per_rank}"
+            )
+        stage_indices = (pp_rank, num_stages - 1 - pp_rank)
+
+    validate_pipeline_ownership(
+        whole_model,
+        module_names_per_stage,
+        replicated_module_names=replicated_module_names,
+    )
+    for stage_idx in stage_indices:
+        module_names = module_names_per_stage[stage_idx]
+        stage, model_chunk = build_stage_from_modules(
+            whole_model,
+            pp_mesh,
+            device,
+            get_mesh,
+            supports_get_mesh,
+            stage_idx,
+            module_names,
+            num_stages,
+        )
+        logger.info(
+            f"PP rank {pp_rank} is building stage_idx {stage_idx} "
+            f"with modules {module_names}"
+        )
+        stages.append(stage)
+        models.append(model_chunk)
+
+    return stages, models

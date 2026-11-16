@@ -97,7 +97,6 @@ class AuditContract:
             "dp_shard",
             "cp",
             "tp",
-            "pp",
             "ep",
             "cp_kv",
             "cp_ulysses",
@@ -109,8 +108,7 @@ class AuditContract:
         )
         p = self.parallel_degrees
         require(
-            p["dp_replicate"] * p["dp_shard"] * p["cp"] * p["tp"] * p["pp"]
-            == self.world_size,
+            p["dp_replicate"] * p["dp_shard"] * p["cp"] * p["tp"] == self.world_size,
             "contract world_size/topology mismatch",
         )
         require(bool(self.expected_fqns), "empty expectedFQNs contract")

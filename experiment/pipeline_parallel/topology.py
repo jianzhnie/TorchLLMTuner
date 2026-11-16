@@ -1,0 +1,655 @@
+"""Resolved parallel degrees and every DeviceMesh view built from them.
+
+Config says how many ways to split (``config/parallel_config.py``); this module turns
+that into the actual process topology: the dense mesh (dp_shard x dp_replicate
+x cp x tp, x pp) and, under EP, the sparse mesh (pp x dp_replicate x efsdp x
+ep). It also owns ``resolve_parallel_topology`` and ``build_device_mesh``
+entry points and the loss/dataloading sub-mesh derivations the trainer
+reduces over.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, fields
+
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+
+from llmtuner.accelerator.device import device_type
+from llmtuner.config.llmtuner_config import LLMTunerConfig
+from llmtuner.config.parallel_config import ParallelConfig
+from llmtuner.errors import ConfigError
+from llmtuner.parallel.topology import ParallelTopologySnapshot as BaseSnapshot
+from llmtuner.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+__all__ = [
+    "MESH_AXES",
+    "ParallelTopology",
+    "ParallelTopologySnapshot",
+    "build_device_mesh",
+    "resolve_parallel_topology",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ParallelTopologySnapshot(BaseSnapshot):
+    """Resolved degrees without process-group ownership or mutable mesh caches."""
+
+    dp_replicate: int = 1
+    dp_shard: int = 1
+    cp: int = 1
+    tp: int = 1
+    pp: int = 1
+    ep: int = 1
+    world_size: int = 1
+    cp_kv: int = 1
+    cp_ulysses: int = 1
+
+    def __post_init__(self) -> None:
+        if self.dp_shard < 1:
+            raise ValueError("Topology snapshot requires a resolved dp_shard degree")
+        # Share degree invariants; this creates no process groups or meshes.
+        ParallelTopology(**asdict(self))
+
+    @classmethod
+    def capture(
+        cls, topology: ParallelTopology | ParallelTopologySnapshot
+    ) -> ParallelTopologySnapshot:
+        return cls(**{item.name: getattr(topology, item.name) for item in fields(cls)})
+
+
+@dataclass
+class ParallelTopology:
+    dp_replicate: int
+    dp_shard: int
+    cp: int
+    tp: int
+    pp: int
+    ep: int
+    world_size: int
+    cp_kv: int = 1
+    cp_ulysses: int = 1
+    # Cache by axis name(s); DeviceMesh equality is by identity, so reuse the
+    # same object instead of re-slicing a submesh on every lookup.
+    _single_axis_meshes: dict[str, DeviceMesh] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _multi_axis_meshes: dict[tuple[str, ...], DeviceMesh] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _global_meshes: dict[str, DeviceMesh] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _world_mesh: DeviceMesh | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    @classmethod
+    def from_config(
+        cls, parallelism_config: ParallelConfig, world_size: int
+    ) -> ParallelTopology:
+        return cls(
+            dp_replicate=parallelism_config.data_parallel_replicate_size,
+            dp_shard=parallelism_config.data_parallel_shard_size,
+            cp=parallelism_config.cp_size,
+            tp=parallelism_config.tensor_parallel_size,
+            pp=parallelism_config.pipeline_parallel_size,
+            ep=parallelism_config.expert_parallel_size,
+            world_size=world_size,
+            cp_kv=parallelism_config.context_parallel_kv_allgather_size,
+            cp_ulysses=parallelism_config.context_parallel_ulysses_size,
+        )
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        dp_replicate, dp_shard, cp, tp, pp, ep = (
+            self.dp_replicate,
+            self.dp_shard,
+            self.cp,
+            self.tp,
+            self.pp,
+            self.ep,
+        )
+        named_degrees = {
+            "dp_replicate": dp_replicate,
+            "cp": cp,
+            "tp": tp,
+            "pp": pp,
+            "ep": ep,
+            "cp_kv": self.cp_kv,
+            "cp_ulysses": self.cp_ulysses,
+        }
+        for name, degree in named_degrees.items():
+            if not isinstance(degree, int) or isinstance(degree, bool) or degree < 1:
+                raise ValueError(
+                    f"{name} must be >= 1 (a positive integer), got {degree!r}"
+                )
+        if self.cp_kv * self.cp_ulysses not in (1, cp):
+            raise ValueError(
+                "cp_kv * cp_ulysses must equal cp when explicit CP axes are used"
+            )
+        if (
+            not isinstance(dp_shard, int)
+            or isinstance(dp_shard, bool)
+            or (dp_shard != -1 and dp_shard < 1)
+        ):
+            raise ValueError(
+                f"dp_shard must be -1 or >= 1 (a positive integer), got {dp_shard!r}"
+            )
+        if (
+            not isinstance(self.world_size, int)
+            or isinstance(self.world_size, bool)
+            or self.world_size < 1
+        ):
+            raise ValueError(
+                f"world_size must be >= 1 (a positive integer), got {self.world_size!r}"
+            )
+        if dp_shard < 0:
+            fixed = dp_replicate * cp * tp * pp
+            if self.world_size % fixed != 0:
+                raise ValueError(
+                    f"world_size ({self.world_size}) must be divisible by "
+                    f"dp_replicate * cp * tp * pp ({fixed}) when dp_shard=-1"
+                )
+            self.dp_shard = dp_shard = self.world_size // fixed
+
+        if dp_replicate * dp_shard * cp * tp * pp != self.world_size:
+            raise ValueError(
+                f"Invalid parallel dims: dp_replicate({dp_replicate}) * "
+                f"dp_shard({dp_shard}) * "
+                f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
+            )
+
+        sparse_region = dp_shard * cp * tp
+        if sparse_region % ep != 0:
+            raise ValueError(
+                f"expert_parallel_size ({ep}) must divide "
+                f"dp_shard * cp * tp ({sparse_region})"
+            )
+
+    def _mesh_exist(self, name: str, size: int) -> bool:
+        if name == "dp_shard":
+            # Keep the DP storage axis alive at size 1 so ``fully_shard`` can
+            # install MixedPrecisionPolicy and discriminate the DP submesh on
+            # TP/DDP/PP-only.
+            return True
+        if name == "efsdp":
+            # We always keep the efsdp if EP is larger than 1 because we need
+            # FSDP wrapping to help the MoE layers do mixed precision training.
+            return True if self.ep > 1 else False
+        return size > 1
+
+    def build_device_mesh(self) -> DeviceMesh:
+        """
+        Build the device mesh with the required mesh dimensions.
+
+        The following mesh dimensions will be created:
+
+            pp:      Pipeline Parallelism (PP).
+            batch:   Used by data loading to determine the global batch size and
+                     which part of the data each rank should read. This dimension
+                     includes both ``dp_replicate`` and ``dp_shard``.
+            loss:    Used by all-reduce when computing the loss. Includes
+                     ``dp_replicate``, ``dp_shard``, ``cp``, and ``tp``
+                     degrees, as all of them shard the batch whose loss is
+                     summed: dp over rows, cp and tp over the sequence. (tp is
+                     in this view, unlike upstream torchtitan, because llmtuner's
+                     TP is sequence-parallel end to end: each rank's loss sum
+                     covers only its ``T / tp`` token shard, where upstream's
+                     TP replicas all compute the full-sequence loss.)
+            dp_replicate: For DDP or HSDP replicate dimension.
+            cp:      Context Parallelism (CP).
+            tp:      Tensor Parallelism (TP).
+            ep:      Expert Parallelism (EP).
+            efsdp:   FSDP in the EP region.
+
+        Note: Most dimensions above are created by unflattening the world mesh,
+        except for loss, which is created by flattening the batch, cp, and tp
+        dimensions.
+        This API performs the following unflatten operations from the world mesh:
+
+            ["pp", "batch", "cp", "tp"]  # dataloading_mesh
+            ["pp", "dp_replicate", "dp_shard", "cp", "tp"]  # storage mesh
+            ["pp", "dp", "cp", "tp"]  # fwd/bwd dense mesh
+            ["pp", "dp_replicate", "efsdp", "ep"]  # sparse_mesh
+
+        DeviceMesh currently recreates process groups for each view. Use its
+        default backend for every axis, including inactive axes: PyTorch's
+        ``fake`` backend is not usable by all supported c10d builds. Inactive
+        axes are still hidden by ``get_optional_mesh``.
+        """
+
+        # Mesh views and their cached submeshes must always belong to the same
+        # world mesh. Rebuilding here would leave cached multi-axis views tied
+        # to the old process groups while replacing all single-axis views.
+        if self._world_mesh is not None:
+            return self._world_mesh
+
+        def unflatten_mesh(
+            world_mesh: DeviceMesh,
+            dim_names: tuple[str, ...],
+            dim_sizes: tuple[int, ...],
+        ) -> DeviceMesh:
+            """Unflatten the world mesh to create the required mesh dimensions.
+
+            Keep all axes backed by usable process groups so mesh slicing works
+            consistently across PyTorch versions and parallel combinations.
+            """
+            # ``DeviceMesh._unflatten`` is private and only present from torch
+            # 2.12 on. On older builds (torch 2.9, the Ascend/torch_npu stack)
+            # rebuild the identical row-major n-D layout over the same world
+            # ranks with the public ``init_device_mesh``. Each view then carries
+            # its own process groups instead of sharing the world mesh's, which
+            # matches the "DeviceMesh recreates process groups for each view"
+            # behaviour already relied on above.
+            unflatten = getattr(world_mesh, "_unflatten", None)
+            if unflatten is not None:
+                return unflatten(
+                    0,
+                    dim_sizes,
+                    dim_names,
+                )
+            return init_device_mesh(device_type, dim_sizes, mesh_dim_names=dim_names)
+
+        logger.info(
+            f"Building device mesh with parallelism: "
+            f"pp={self.pp}, dp_replicate={self.dp_replicate}, "
+            f"dp_shard={self.dp_shard}, "
+            f"cp={self.cp}, tp={self.tp}, ep={self.ep}"
+        )
+
+        batch = self.dp_replicate * self.dp_shard
+        efsdp = self.dp_shard * self.cp * self.tp // self.ep
+
+        world_mesh = init_device_mesh(
+            device_type, (self.world_size,), mesh_dim_names=("world",)
+        )
+        dataloading_mesh = unflatten_mesh(
+            world_mesh,
+            ("pp", "batch", "cp", "tp"),
+            (self.pp, batch, self.cp, self.tp),
+        )
+        loss_mesh = dataloading_mesh["batch", "cp", "tp"]._flatten("loss_mesh")
+        # Two mesh views over the same devices:
+        #
+        # full_dense_mesh_for_fsdp (dp_replicate, dp_shard, cp, tp) is passed to
+        # fully_shard() so FSDP can shard parameters along dp_shard.
+        # spmd_dense_mesh_for_fwdbwd (dp, cp, tp) is used for forward/backward
+        # typechecking, with dp folding dp_replicate * dp_shard into one axis.
+        full_dense_mesh_for_fsdp = unflatten_mesh(
+            world_mesh,
+            ("pp", "dp_replicate", "dp_shard", "cp", "tp"),
+            (self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp),
+        )
+        full_dense_mesh_for_fwdbwd = unflatten_mesh(
+            world_mesh,
+            ("pp", "dp", "cp", "tp"),
+            (self.pp, batch, self.cp, self.tp),
+        )
+        spmd_dense_mesh_for_fwdbwd = full_dense_mesh_for_fwdbwd["dp", "cp", "tp"]
+
+        full_sparse_mesh = unflatten_mesh(
+            world_mesh,
+            ("pp", "dp_replicate", "efsdp", "ep"),
+            (self.pp, self.dp_replicate, efsdp, self.ep),
+        )
+
+        global_meshes = {
+            "dataloading": dataloading_mesh,
+            "loss": loss_mesh,
+            "dense": full_dense_mesh_for_fsdp,
+            "sparse": full_sparse_mesh,
+        }
+        global_meshes["spmd_dense_for_fwdbwd"] = spmd_dense_mesh_for_fwdbwd
+        if self.ep > 1:
+            global_meshes["spmd_sparse_for_fwdbwd"] = full_sparse_mesh[
+                "dp_replicate", "efsdp", "ep"
+            ]
+        single_axis_meshes = {
+            "pp": dataloading_mesh["pp"],
+            "batch": dataloading_mesh["batch"],
+            "loss": loss_mesh,
+            "dp_replicate": full_dense_mesh_for_fsdp["dp_replicate"],
+            "cp": dataloading_mesh["cp"],
+            "tp": dataloading_mesh["tp"],
+            "ep": full_sparse_mesh["ep"],
+            "efsdp": full_sparse_mesh["efsdp"],
+        }
+        if self.cp_kv * self.cp_ulysses == self.cp and self.cp > 1:
+            cp_axes_mesh = unflatten_mesh(
+                world_mesh,
+                ("pp", "batch", "cp_kv", "cp_ulysses", "tp"),
+                (self.pp, batch, self.cp_kv, self.cp_ulysses, self.tp),
+            )
+            single_axis_meshes["cp_kv"] = cp_axes_mesh["cp_kv"]
+            single_axis_meshes["cp_ulysses"] = cp_axes_mesh["cp_ulysses"]
+        single_axis_meshes["dp"] = spmd_dense_mesh_for_fwdbwd["dp"]
+        single_axis_meshes["dp_shard"] = full_dense_mesh_for_fsdp["dp_shard"]
+
+        self._validate_meshes(single_axis_meshes)
+        self._world_mesh = world_mesh
+        self._global_meshes = global_meshes
+        self._single_axis_meshes = single_axis_meshes
+
+        logger.info(
+            f"Successfully created meshes with active dimensions: "
+            f"{list(self.get_all_one_dimensional_meshes().keys())}"
+        )
+
+        return self._world_mesh
+
+    def _expected_mesh_sizes(self) -> dict[str, int]:
+        """The size contract of every single-axis mesh ``build_device_mesh`` creates.
+
+        Split out of ``_validate_meshes`` so the contract is stated once and is
+        readable without a process group -- which is the only way to pin the
+        one deliberate divergence from upstream: ``loss`` spans ``tp`` as well
+        as ``dp`` and ``cp``. llmtuner's TP is sequence-parallel end to end, so
+        each rank's loss sum covers only its ``T / tp`` token shard; upstream's
+        TP ranks each hold the full sequence, so its ``loss`` mesh stops at
+        ``dp * cp`` and the tp reduction happens inside the vocab-parallel CE
+        instead (see the ``lm_head`` row in docs/llmtuner_upstream_map.md).
+        """
+        sizes = {
+            "pp": self.pp,
+            "batch": self.dp_replicate * self.dp_shard,
+            "loss": self.dp_replicate * self.dp_shard * self.cp * self.tp,
+            "dp_replicate": self.dp_replicate,
+            "cp": self.cp,
+            "tp": self.tp,
+            "ep": self.ep,
+            "efsdp": self.dp_shard * self.cp * self.tp // self.ep,
+        }
+        sizes["dp"] = self.dp_replicate * self.dp_shard
+        sizes["dp_shard"] = self.dp_shard
+        if self.cp_kv * self.cp_ulysses == self.cp and self.cp > 1:
+            sizes["cp_kv"] = self.cp_kv
+            sizes["cp_ulysses"] = self.cp_ulysses
+        return sizes
+
+    def _validate_meshes(self, meshes: dict[str, DeviceMesh]) -> None:
+        """Validate that created meshes have the expected sizes."""
+        for mesh_name, expected_size in self._expected_mesh_sizes().items():
+            actual_size = meshes[mesh_name].size()
+            assert actual_size == expected_size, (
+                f"Mesh '{mesh_name}' has unexpected size: "
+                f"expected {expected_size}, got {actual_size}"
+            )
+
+    def get_optional_mesh(
+        self,
+        dims: str | list[str],
+        *,
+        include_singleton_axes: bool = False,
+    ) -> DeviceMesh | None:
+        """Get a device mesh by dimension name(s), returning None if not enabled.
+
+        Args:
+            dims: Names of the mesh dimension. Valid options include:
+                 'pp', 'batch', 'loss', 'dp_replicate', 'dp', 'dp_shard',
+                 'cp', 'tp', 'ep', 'efsdp'.
+            include_singleton_axes: Include axes with size 1 in the returned
+                 submesh. This is used for distributed parameter and buffer
+                 registration so spmd_types can handle size-1 axis filtering.
+
+        Returns:
+            DeviceMesh for the requested dimension(s), or None if:
+            - The dimension size is 1 (parallelism not enabled)
+            - The dimension doesn't exist
+            Note: 'dp_shard' always exists (for mixed precision via
+            fully_shard()), and 'efsdp' exists when ep > 1, even if their
+            size is 1.
+
+        Raises:
+            ValueError: If the requested dimension name(s) is not valid.
+        """
+        if isinstance(dims, str):
+            dims = [dims]
+        if not dims or len(set(dims)) != len(dims):
+            raise ValueError("mesh dimensions must be nonempty and unique")
+
+        if not self._single_axis_meshes:
+            self.build_device_mesh()
+
+        for mesh_name in dims:
+            if mesh_name not in self._single_axis_meshes:
+                raise ValueError(
+                    f"Invalid mesh dim: '{mesh_name}'. "
+                    f"Valid dimensions are: {list(self._single_axis_meshes.keys())}"
+                )
+
+        if not include_singleton_axes and any(
+            not self._mesh_exist(dim, self._single_axis_meshes[dim].size())
+            for dim in dims
+        ):
+            return None
+
+        if len(dims) == 1:
+            return self._single_axis_meshes[dims[0]]
+
+        # Cache to ensure mesh equality by object identity.
+        key = tuple(dims)
+        if key in self._multi_axis_meshes:
+            return self._multi_axis_meshes[key]
+
+        candidates = [
+            (name, global_mesh)
+            for name, global_mesh in self._global_meshes.items()
+            if global_mesh.mesh_dim_names is not None
+            and set(dims).issubset(set(global_mesh.mesh_dim_names))
+        ]
+        if not candidates:
+            raise ValueError(f"Invalid mesh name combinations {dims}.")
+        submesh = candidates[0][1][key]
+        self._multi_axis_meshes[key] = submesh
+        return submesh
+
+    def get_mesh(self, dims: str | list[str]) -> DeviceMesh:
+        """Get a device mesh by dimension name(s), raising if not available.
+
+        Args:
+            dims: Names of the mesh dimension. Valid options include:
+                 'pp', 'batch', 'loss', 'dp_replicate', 'dp', 'dp_shard',
+                 'cp', 'tp', 'ep', 'efsdp'.
+
+        Returns:
+            DeviceMesh for the requested dimension(s).
+
+        Raises:
+            ValueError: If the mesh is not available (dimension size = 1 or not
+                enabled), or if the requested dimension name(s) is not valid.
+        """
+        mesh = self.get_optional_mesh(dims)
+        if mesh is None:
+            enabled_str = (
+                "enabled (size > 1)" if isinstance(dims, str) else "all enabled"
+            )
+            raise ValueError(
+                f"Mesh '{dims}' is not available. "
+                f"Ensure the corresponding parallelism dimension is {enabled_str}."
+            )
+        return mesh
+
+    def spmd_dense_mesh(self) -> DeviceMesh:
+        """Dense SPMD mesh used for forward/backward typechecking."""
+        if not self._single_axis_meshes:
+            self.build_device_mesh()
+        return self._global_meshes["spmd_dense_for_fwdbwd"]
+
+    def spmd_sparse_mesh(self) -> DeviceMesh | None:
+        """Sparse SPMD mesh used inside expert dispatch."""
+        if not self._single_axis_meshes:
+            self.build_device_mesh()
+        return self._global_meshes.get("spmd_sparse_for_fwdbwd")
+
+    def get_all_one_dimensional_meshes(self) -> dict[str, DeviceMesh]:
+        """Get all enabled one-dimensional device meshes.
+
+        Returns a dictionary of enabled one-dimensional device meshes, allowing you to
+        access their process groups.
+
+        Note:
+            Logically inactive axes are excluded by ``_mesh_exist``. For
+            example, ``efsdp`` is hidden when EP is disabled, even though the
+            underlying DeviceMesh has a usable process group for that view.
+
+        Returns:
+            dict[str, DeviceMesh]: A dictionary mapping mesh dimension names to their
+                corresponding DeviceMesh objects. Only includes meshes where:
+                - ndim == 1 (one-dimensional)
+                - parallelism is enabled (size > 1)
+                - the axis is logically active
+
+        Example:
+            >>> parallel_dims = ParallelTopology(
+            ...     dp_replicate=2, dp_shard=2, cp=1, tp=2, pp=1, ep=1, world_size=8
+            ... )
+            >>> meshes = parallel_dims.get_all_one_dimensional_meshes()
+            >>> print(meshes.keys())
+            dict_keys(['batch', 'loss', 'dp_replicate', 'tp', 'dp', 'dp_shard'])
+
+        """
+        if not self._single_axis_meshes:
+            self.build_device_mesh()
+        return {
+            k: v
+            for k, v in self._single_axis_meshes.items()
+            if v.ndim == 1 and v.size() > 1 and self._mesh_exist(k, v.size())
+        }
+
+    @property
+    def dp_enabled(self):
+        return self.dp_replicate > 1 or self.dp_shard > 1
+
+    @property
+    def dp_replicate_enabled(self):
+        return self.dp_replicate > 1
+
+    @property
+    def dp_shard_enabled(self):
+        return self.dp_shard > 1
+
+    @property
+    def cp_enabled(self):
+        return self.cp > 1
+
+    @property
+    def dp_cp_enabled(self):
+        return self.dp_enabled or self.cp_enabled
+
+    @property
+    def tp_enabled(self):
+        return self.tp > 1
+
+    @property
+    def pp_enabled(self):
+        return self.pp > 1
+
+    @property
+    def ep_enabled(self):
+        return self.ep > 1
+
+    @property
+    def non_data_parallel_size(self):
+        return self.cp * self.tp * self.pp
+
+
+# Mesh axis names. `axis` names a specific DeviceMesh axis; `dim` is for shapes.
+# These are the axes of the dense mesh the parallel layer is handed; ``pp`` is
+# not among them because pipeline stages live on disjoint rank sets -- the PP
+# path resolves its own views off ParallelTopology instead (see
+# experiment/pipeline_parallel/pipeline_parallel.py).
+MESH_AXES = ("dp", "cp", "tp")
+
+
+def resolve_parallel_topology(
+    cfg: LLMTunerConfig, *, world_size: int
+) -> ParallelTopology | None:
+    """Resolve the parallelism degrees against ``world_size`` (torchtitan class).
+
+    Single-process (step 0, no torchrun) -> ``None``: no process group, no
+    parallelism, so downstream code guards on ``parallel_dims is None``.
+    Any non-1 degree in that case is a config error, not a silent no-op:
+    upstream validates the degree product against every world size, and a
+    single-process run that asked for tp/pp/... must not train a fully
+    replicated model while logging the configured degrees.
+    """
+    if world_size == 1:
+        par = cfg.parallel
+        requested = {
+            field: value
+            for field, value in (
+                ("tensor_parallel_size", par.tensor_parallel_size),
+                ("pipeline_parallel_size", par.pipeline_parallel_size),
+                (
+                    "context_parallel_kv_allgather_size",
+                    par.context_parallel_kv_allgather_size,
+                ),
+                ("context_parallel_ulysses_size", par.context_parallel_ulysses_size),
+                ("context_parallel_kcp_size", par.context_parallel_kcp_size),
+                ("expert_parallel_size", par.expert_parallel_size),
+                ("data_parallel_replicate_size", par.data_parallel_replicate_size),
+            )
+            if value != 1
+        }
+        if par.data_parallel_shard_size not in (-1, 1):
+            requested["data_parallel_shard_size"] = par.data_parallel_shard_size
+        if requested:
+            raise ConfigError(
+                "world_size=1 (no torchrun) cannot satisfy the configured "
+                f"parallel degrees: {requested}. Either launch with torchrun "
+                "at the matching world size or set them back to 1."
+            )
+        return None
+    return ParallelTopology.from_config(cfg.parallel, world_size)
+
+
+def build_device_mesh(parallel_dims: ParallelTopology | None):
+    """The dense ``(dp, cp, tp)`` mesh the parallel ``apply_*`` functions index.
+
+    Takes the *already-resolved* ``ParallelTopology`` (see
+    ``resolve_parallel_topology``)
+    rather than a config, so a run has exactly one degree-resolution object --
+    and therefore one set of process groups. ``None`` in, ``None`` out: there is
+    no process group and no parallelism to describe.
+
+    Aliases ``ParallelTopology.spmd_dense_mesh()``, which is the same object the
+    SPMD context registers, so ``apply_tp``'s ``mesh["tp"]`` and a component's
+    ``spmd_mesh_group("tp")`` resolve to the very same process group.
+
+    ``build_device_mesh`` deliberately does NOT call ``init_device_mesh`` itself. The
+    parallelism layer needs more than one view of the same ranks -- FSDP wants
+    ``(dp_replicate, dp_shard, cp, tp)``, SPMD type checking wants ``(dp, cp,
+    tp)`` with the two DP axes folded and singletons dropped, EP wants a
+    separate sparse mesh -- and those views have to come from ONE unflatten of
+    the world mesh or they end up with disjoint process groups covering the
+    same ranks. ``ParallelTopology`` owns that unflatten; this function just hands
+    back the dense view the parallel ``apply_*`` functions index.
+    """
+    if parallel_dims is None:
+        return None
+    mesh = parallel_dims.spmd_dense_mesh()
+    if mesh.mesh_dim_names != MESH_AXES:
+        raise ValueError(
+            f"dense mesh axes {mesh.mesh_dim_names} != expected {MESH_AXES}; the "
+            "parallel layer indexes these names directly"
+        )
+    # The dense mesh spans dp * cp * tp ranks. PP is not an axis of it, so a
+    # ``pp > 1`` run must not be handed this mesh as if it covered the world:
+    # the trainer takes the per-stage dense view off ``parallel_dims`` instead.
+    covered = (
+        parallel_dims.dp_replicate
+        * parallel_dims.dp_shard
+        * parallel_dims.cp
+        * parallel_dims.tp
+    )
+    if covered != parallel_dims.world_size:
+        raise ValueError(
+            f"dense mesh (dp*cp*tp = {covered}) does not cover the world "
+            f"({parallel_dims.world_size} ranks); is pp > 1?"
+        )
+    return mesh

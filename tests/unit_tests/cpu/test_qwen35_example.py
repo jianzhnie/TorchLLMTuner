@@ -149,7 +149,6 @@ def test_recipe_exposes_topology_without_changing_model_geometry(tmp_path):
     args.dp_replicate = 1
     args.tp = 2
     args.ep = 1
-    args.pp = 1
     args.cp = 1
     config = build_config(args)
     assert config.parallel.data_parallel_shard_size == 4

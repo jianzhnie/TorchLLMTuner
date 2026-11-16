@@ -98,7 +98,7 @@ def test_validation_finishes_staging_before_forward_mutates_weights(monkeypatch)
 
 def _trainer_cls():
     """The trainer, imported lazily: on torch < 2.10 its import chain
-    (DTensor, pipelining, distributed.checkpoint internals) fails at
+    (DTensor and distributed.checkpoint internals) fails at
     collection, and the tests that need it skip rather than error. The config
     and gating tests above do not need it and always run."""
     return pytest.importorskip(
@@ -261,9 +261,6 @@ def test_validation_steps_must_be_positive_or_neg1() -> None:
 
 
 def test_validation_defaults_to_off() -> None:
-    # TrainingConfig alone: LLMTunerConfig() also builds ParallelConfig,
-    # whose schedule check imports torch.distributed.pipelining (absent on
-    # older torch), which is not what this assertion is about.
     assert TrainingConfig().validation is None
 
 
@@ -358,42 +355,6 @@ def test_validate_reports_token_normalized_loss_and_restores_train_mode(
     # Validation is a pure observer of the checkpointed training counter.
     assert trainer.ntokens_seen == 7
     assert loader.closed
-
-
-class _FakePPSchedule:
-    """Records the eval driver call; each microbatch's loss is a known constant.
-
-    Exposes both seams: the native ``eval(arg_mbs=...)`` microbatch driver
-    (torch 2.10+) and the older ``_step_microbatches`` entry the fallback driver
-    in ``parallel/pipeline_parallel/microbatch_drivers.py`` uses. One fake, so
-    this test covers whichever seam the running torch carries.
-    """
-
-    def __init__(self, per_mb_loss: float):
-        self.per_mb_loss = per_mb_loss
-        self._loss_fn = SimpleNamespace(global_valid_tokens=torch.tensor(1.0))
-        self.eval_calls: list[dict[str, Any]] = []
-        self._has_backward = True
-        self._stage = SimpleNamespace(
-            has_backward=True, clear_runtime_states=lambda: None
-        )
-
-    def eval(self, *, arg_mbs, kwarg_mbs, target_mbs, losses):
-        self.eval_calls.append(
-            {"arg_mbs": arg_mbs, "kwarg_mbs": kwarg_mbs, "target_mbs": target_mbs}
-        )
-        self._record_losses(losses, target_mbs)
-
-    def _step_microbatches(self, arg_mbs, kwarg_mbs, target_mbs, losses):
-        self.eval_calls.append(
-            {"arg_mbs": arg_mbs, "kwarg_mbs": kwarg_mbs, "target_mbs": target_mbs}
-        )
-        self._record_losses(losses, target_mbs)
-
-    def _record_losses(self, losses, target_mbs) -> None:
-        assert losses is not None
-        n = len(target_mbs)
-        losses.extend(torch.tensor(self.per_mb_loss) for _ in range(n))
 
 
 def test_validate_positive_steps_bounds_the_pass(

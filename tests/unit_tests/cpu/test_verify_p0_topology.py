@@ -16,7 +16,6 @@ def write_dp8(root: Path):
             "meshes": {
                 "dense": {
                     "local_groups": {
-                        "pp": [rank],
                         "dp_replicate": [rank],
                         "dp_shard": list(range(8)),
                         "cp": [rank],
@@ -25,7 +24,6 @@ def write_dp8(root: Path):
                 },
                 "sparse": {
                     "local_groups": {
-                        "pp": [rank],
                         "dp_replicate": [rank],
                         "efsdp": list(range(8)),
                         "ep": [rank],
@@ -79,7 +77,6 @@ def test_required_tp_ep_layouts_use_explicit_group_membership(
             "meshes": {
                 "dense": {
                     "local_groups": {
-                        "pp": [rank],
                         "dp_replicate": [rank],
                         "dp_shard": list(range(rank % tp, 8, tp)),
                         "cp": [rank],
@@ -88,7 +85,6 @@ def test_required_tp_ep_layouts_use_explicit_group_membership(
                 },
                 "sparse": {
                     "local_groups": {
-                        "pp": [rank],
                         "dp_replicate": [rank],
                         "efsdp": expert_group,
                         "ep": list(range(ep_start, ep_start + ep_size)),

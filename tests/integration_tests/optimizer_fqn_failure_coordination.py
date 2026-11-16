@@ -6,7 +6,6 @@ from copy import deepcopy
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed.device_mesh import init_device_mesh
 
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config import OptimizerConfig
@@ -63,12 +62,9 @@ def main():
         outcomes = [None, None]
         dist.all_gather_object(outcomes, (type(error).__name__, str(error)))
         assert outcomes[0][0] == "ValueError", outcomes
-        message = (
-            "overlap across inner optimizers"
-            if args.split_optimizers
-            else "Duplicate optimizer parameter FQN"
+        assert "parameter names disagree with assembly ownership" in outcomes[0][1], (
+            outcomes
         )
-        assert message in outcomes[0][1], outcomes
         assert outcomes[1][0] == "RuntimeError", outcomes
         assert "failed on another rank" in outcomes[1][1], outcomes
         for inner, parameter, original, values in originals:
@@ -122,42 +118,6 @@ def main():
                 f"PASS optimizer {phase}-load-hook coordinated failure/reload "
                 f"rank={rank}"
             )
-        # A parameterless pipeline stage must still enter every world boundary.
-        empty_peer = OptimizersContainer(
-            OptimizerConfig(implementation="for-loop"),
-            model_parts=[model if rank == 0 else nn.Module()],
-            pipeline_mesh=init_device_mesh(device.type, (2,), mesh_dim_names=("pp",)),
-        )
-        local_checkpoint = deepcopy(empty_peer.state_dict())
-        assert len(empty_peer.optimizers) == (1 if rank == 0 else 0)
-        assert bool(local_checkpoint) == (rank == 0)
-
-        def fail_owned_load(*args):
-            raise ValueError("injected owned optimizer load failure")
-
-        handle = (
-            empty_peer.optimizers[0].register_load_state_dict_post_hook(fail_owned_load)
-            if rank == 0
-            else None
-        )
-        error = None
-        try:
-            empty_peer.load_state_dict(local_checkpoint)
-        except (ValueError, RuntimeError) as caught:
-            error = caught
-        finally:
-            if handle is not None:
-                handle.remove()
-        dist.all_gather_object(outcomes, (type(error).__name__, str(error)))
-        assert outcomes[0][0] == "ValueError", outcomes
-        assert "injected owned optimizer load failure" in outcomes[0][1], outcomes
-        assert outcomes[1][0] == "RuntimeError", outcomes
-        assert (
-            "Optimizer checkpoint application failed on another rank" in outcomes[1][1]
-        )
-        empty_peer.load_state_dict(local_checkpoint)
-        torch.testing.assert_close(empty_peer.state_dict(), local_checkpoint)
-        print(f"PASS optimizer empty-owner coordinated failure/reload rank={rank}")
     finally:
         dist.destroy_process_group()
 

@@ -13,10 +13,6 @@ test cannot pass by the constructor rejecting everything.
 
 from __future__ import annotations
 
-# ``ParallelConfig.__post_init__`` imports ``torch.distributed.pipelining`` to
-# validate the schedule name, so *every* config construction needs it -- that,
-# not DTensor, is this module's hard dependency. The two tests that also read
-# the checkpointer's state keys carry their own ``dcp`` guard below.
 import re
 import subprocess
 import sys

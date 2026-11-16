@@ -16,7 +16,6 @@ from tests.integration_tests.harness import init_distributed
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pp-size", type=int, choices=(1,), default=1)
     args = parser.parse_args()
     init_distributed()
     module = importlib.import_module(

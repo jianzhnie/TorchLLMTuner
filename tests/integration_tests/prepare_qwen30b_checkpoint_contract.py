@@ -158,7 +158,7 @@ def prepare_contract(model_path: str, dataset_path: str):
         ntokens_seen=100 * (4 * 4096) // (2 * 2),
         device_type="npu",
         parallel_degrees=dict(
-            dp_replicate=1, dp_shard=2, cp=2, tp=2, pp=1, ep=4, cp_kv=2, cp_ulysses=1
+            dp_replicate=1, dp_shard=2, cp=2, tp=2, ep=4, cp_kv=2, cp_ulysses=1
         ),
         expected_fqns=expected,
         optimizer_tensors={

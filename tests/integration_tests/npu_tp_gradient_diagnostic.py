@@ -90,12 +90,8 @@ def main() -> None:
     parallel = config.parallel
     if parallel.fsdp_config.fsdp_cpu_offload:
         raise ValueError("This diagnostic does not support CPU-offloaded gradients")
-    if (
-        parallel.expert_parallel_size != 1
-        or parallel.pipeline_parallel_size != 1
-        or parallel.cp_size != 1
-    ):
-        raise ValueError("This diagnostic requires EP=PP=CP=1")
+    if parallel.expert_parallel_size != 1 or parallel.cp_size != 1:
+        raise ValueError("This diagnostic requires EP=CP=1")
     if not os.environ.get("LLMTUNER_DUMP_FOLDER"):
         raise ValueError("Set LLMTUNER_DUMP_FOLDER to a fresh diagnostic directory")
     torch.set_default_dtype(torch.bfloat16)

@@ -3,7 +3,6 @@
 Run with torchrun --nproc_per_node=2; append custom, compile and/or ac.
 Add ep2 for fixed-routing MoE, or tp2 with four ranks for DP2 x TP2 MoE.
 Add cp2 with four ranks for real DeepSeek V4 HCA CP2, without attention mocks.
-Add pp2 with four ranks for DP2 x PP2 using the real 1F1B schedule.
 Uses the real Trainer, synthetic loader, model forward/backward and optimizers.
 Only the returned loss or one post-backward local gradient is corrupted.
 Rank-local diagnostic hook failures must also stop every update before clipping.
@@ -42,13 +41,10 @@ def main():
         tp_size = 2 if "tp2" in sys.argv else 1
         ep_size = 2 if "ep2" in sys.argv else 1
         cp_size = 2 if "cp2" in sys.argv else 1
-        if "pp2" in sys.argv:
-            raise ValueError("PP tests moved to experiments/pipeline_parallel")
-        pp_size = 1
-        if cp_size > 1 and (tp_size > 1 or ep_size > 1 or pp_size > 1):
-            raise ValueError("The HCA CP scenario requires TP1, EP1 and PP1")
+        if cp_size > 1 and (tp_size > 1 or ep_size > 1):
+            raise ValueError("The HCA CP scenario requires TP1 and EP1")
         moe_enabled = tp_size > 1 or ep_size > 1 or cp_size > 1
-        assert dist.get_world_size() == 2 * tp_size * cp_size * pp_size
+        assert dist.get_world_size() == 2 * tp_size * cp_size
         with TemporaryDirectory() as root:
             config = parse_config(
                 [
@@ -69,7 +65,7 @@ def main():
                     "--max_seq_len",
                     "8",
                     "--global_batch_size",
-                    str(8 if pp_size > 1 else 2),
+                    "2",
                     "--seed",
                     "42",
                     "--deterministic",

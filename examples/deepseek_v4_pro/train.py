@@ -48,7 +48,6 @@ def build_config(args: argparse.Namespace) -> LLMTunerConfig:
             data_parallel_replicate_size=args.dp_replicate,
             tensor_parallel_size=args.tp,
             expert_parallel_size=args.ep,
-
             context_parallel_kv_allgather_size=args.cp,
             fsdp_config=FSDPConfig(fsdp_cpu_offload=args.cpu_offload),
         ),
@@ -110,7 +109,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dp-replicate", type=int, default=1)
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--ep", type=int, default=1)
-    parser.add_argument("--pp", type=int, default=1)
     parser.add_argument("--cp", type=int, default=1, help="Compressor CP degree")
     parser.add_argument(
         "--cpu-offload",

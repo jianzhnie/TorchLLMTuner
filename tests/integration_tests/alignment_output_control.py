@@ -15,7 +15,7 @@ from llmtuner.accelerator.linear_collectives import all_gather_along
 def install_output_layout_control(trainer):
     """Install only for explicit diagnostic replay, never normal training."""
     dims = trainer.parallel_dims
-    if dims.tp <= 1 or dims.cp != 1 or dims.pp != 1:
+    if dims.tp <= 1 or dims.cp != 1:
         raise ValueError("Output layout control requires TP and no CP/PP")
     head = trainer.model_parts[0].lm_head
     if head.bias is not None or getattr(head, "compute_dtype", None) is not None:

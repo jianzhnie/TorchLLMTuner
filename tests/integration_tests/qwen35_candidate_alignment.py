@@ -486,7 +486,7 @@ class AlignmentTrainer(Trainer):
             )
             dims = self.parallel_dims
             assert dims.dp_shard == 8 and dims.dp_replicate == 1
-            assert (dims.tp, dims.cp, dims.pp, dims.ep) == (1, 1, 1, 1)
+            assert (dims.tp, dims.cp, dims.ep) == (1, 1, 1)
             text = self.model.model.config
             assert (text.num_hidden_layers, text.hidden_size, text.num_experts) == (
                 40,

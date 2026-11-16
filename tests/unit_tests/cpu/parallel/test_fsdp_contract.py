@@ -496,7 +496,7 @@ def test_apply_fsdp_preserves_parameter_dtype_for_mixed_precision(
     parallel_dims = type(
         "ParallelTopologyStub",
         (),
-        {"pp_enabled": False, "ep": 1},
+        {"ep": 1},
     )()
     config = ParallelConfig()
     config.fsdp_config.fsdp_reduce_dtype = reduce_dtype
@@ -527,7 +527,7 @@ def test_apply_fsdp_forwards_cpu_offload_policy(
     )
 
     model = nn.Linear(4, 4)
-    parallel_dims = type("ParallelTopologyStub", (), {"pp_enabled": False, "ep": 1})()
+    parallel_dims = type("ParallelTopologyStub", (), {"ep": 1})()
     config = ParallelConfig(
         fsdp_config=FSDPConfig(fsdp_cpu_offload=True, fsdp_cpu_offload_pin_memory=False)
     )

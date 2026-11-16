@@ -6,7 +6,79 @@ import torch
 from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.parallel.execution import (
     ExecutionLayout,
+    resolve_execution_layout,
 )
+
+
+@pytest.mark.parametrize("declaration", [{"head": "head"}, "head", 1])
+def test_execution_resolution_rejects_malformed_structure_declaration(declaration):
+    model = torch.nn.Linear(2, 2)
+    model.execution_capabilities = ModelExecutionCapabilities()
+    model.decoder_structure = declaration
+    with pytest.raises(TypeError, match="DecoderStructure declaration"):
+        resolve_execution_layout(
+            model,
+            tp_size=1,
+            cp_size=1,
+            tp_plan=None,
+            chunked_loss=False,
+            compile_enabled=False,
+            activation_swap=False,
+        )
+
+
+def test_execution_resolution_requires_registered_output_projection():
+    from llmtuner.models.contracts import DecoderStructure
+
+    model = torch.nn.Module()
+    model.execution_capabilities = ModelExecutionCapabilities()
+    model.decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="blocks", norm="norm", head="head"
+    )
+    # A module exposed as an ordinary attribute has no checkpoint ownership.
+    object.__setattr__(model, "head", torch.nn.Linear(2, 2))
+    with pytest.raises(AttributeError, match="not registered"):
+        resolve_execution_layout(
+            model,
+            tp_size=1,
+            cp_size=1,
+            tp_plan=None,
+            chunked_loss=False,
+            compile_enabled=False,
+            activation_swap=False,
+        )
+
+
+@pytest.mark.parametrize("change", ["add", "remove", "reorder", "empty_add"])
+def test_materialization_refresh_rejects_registration_changes_without_mutating_layout(
+    change,
+):
+    from torch import nn
+
+    from llmtuner.parallel.assembly import ModelPartLayout
+
+    model = nn.Module() if change == "empty_add" else nn.Linear(2, 2)
+    layout = ModelPartLayout()
+    layout.refresh(model)
+    bindings = dict(layout.parameter_bindings)
+    replacements = dict(layout.replacements.parameter_targets)
+    if change in {"add", "empty_add"}:
+        model.extra = nn.Parameter(torch.ones(2))
+    elif change == "remove":
+        del model.bias
+    else:
+        weight = model.weight
+        del model.weight
+        model.weight = weight
+
+    with pytest.raises(ValueError, match="registration paths or order"):
+        layout.refresh(model)
+
+    assert tuple(layout.parameter_bindings) == tuple(bindings)
+    assert all(
+        layout.parameter_bindings[key] is value for key, value in bindings.items()
+    )
+    assert dict(layout.replacements.parameter_targets) == replacements
 
 
 @pytest.mark.parametrize("change", ["split", "merge"])
@@ -95,7 +167,7 @@ def test_local_parts_cannot_mix_topology_snapshots():
     parts = [nn.Linear(2, 2), nn.Linear(2, 2)]
     layouts = (
         ModelPartLayout(topology=ParallelTopologySnapshot()),
-        ModelPartLayout(topology=ParallelTopologySnapshot(world_size=2)),
+        ModelPartLayout(topology=ParallelTopologySnapshot(dp_shard=2, world_size=2)),
     )
     for model, layout in zip(parts, layouts, strict=True):
         layout.refresh(model)

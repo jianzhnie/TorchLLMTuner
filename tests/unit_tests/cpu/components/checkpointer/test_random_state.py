@@ -62,9 +62,7 @@ def test_rng_checkpoint_empty_state_rejects_before_changing_streams():
 def test_rng_restore_rejects_changed_parallel_degrees(changed_axis, monkeypatch):
     from types import SimpleNamespace
 
-    degrees = dict(
-        dp_replicate=1, dp_shard=2, cp=1, tp=1, pp=1, ep=1, cp_kv=1, cp_ulysses=1
-    )
+    degrees = dict(dp_replicate=1, dp_shard=2, cp=1, tp=1, ep=1, cp_kv=1, cp_ulysses=1)
     monkeypatch.setattr(
         "llmtuner.components.checkpointer.core.random_state.get_world_size", lambda: 2
     )
@@ -193,9 +191,7 @@ def test_rng_checkpoint_rejects_non_dictionary_payload(payload):
 def test_rng_checkpoint_rejects_noninteger_parallel_degree(axis, value):
     from types import SimpleNamespace
 
-    degrees = dict(
-        dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, cp_kv=1, cp_ulysses=1
-    )
+    degrees = dict(dp_replicate=1, dp_shard=1, cp=1, tp=1, ep=1, cp_kv=1, cp_ulysses=1)
     with preserve_rng_state(torch.device("cpu")):
         checkpoint = RNGCheckpointState(
             torch.device("cpu"), topology=SimpleNamespace(**degrees, world_size=1)
@@ -458,7 +454,6 @@ def test_rng_capture_rejects_unresolved_or_wrong_world_topology(dp_shard, world_
         dp_shard=dp_shard,
         cp=1,
         tp=1,
-        pp=1,
         ep=1,
         cp_kv=1,
         cp_ulysses=1,

@@ -31,7 +31,7 @@ def main():
         labels = torch.tensor([1, 4, -100, 0, 8, 3, 11, 2], device=device)
         full_input = inputs.detach().clone().requires_grad_()
         local_input = inputs.chunk(world)[rank].detach().clone().requires_grad_()
-        dims = SimpleNamespace(tp=world, cp=1, pp=1, get_mesh=lambda name: mesh)
+        dims = SimpleNamespace(tp=world, cp=1, get_mesh=lambda name: mesh)
         trainer = SimpleNamespace(
             parallel_dims=dims,
             model_parts=[SimpleNamespace(lm_head=head)],

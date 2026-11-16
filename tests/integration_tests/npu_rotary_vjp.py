@@ -6,8 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-from llmtuner.models.qwen.qwen3.qkv_projection import apply_configured_rotary
 
+from llmtuner.models.qwen.qwen3.qkv_projection import apply_configured_rotary
 from llmtuner.utils.seeding import set_deterministic_algorithms
 from tests.caps import require_env
 

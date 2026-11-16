@@ -176,7 +176,6 @@ def test_split_entry_rejects_missing_or_single_rank_topology(monkeypatch):
                 "ep_enabled",
                 "tp_enabled",
                 "cp_enabled",
-                "pp_enabled",
                 "dp_replicate_enabled",
             )
         }

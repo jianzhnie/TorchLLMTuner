@@ -80,14 +80,9 @@ class _TaggingLogger(_RecordingLogger):
 class _FakeParallelTopology:
     """The subset of ParallelTopology that the metrics rank logic reads."""
 
-    def __init__(self, *, pp: int = 1, world_size: int = 1, non_data_parallel: int = 1):
-        self.pp = pp
+    def __init__(self, *, world_size: int = 1, non_data_parallel: int = 1):
         self.world_size = world_size
         self.non_data_parallel_size = non_data_parallel
-
-    @property
-    def pp_enabled(self) -> bool:
-        return self.pp > 1
 
 
 def _processor(num_flops_per_token: int = 1000, **config_overrides) -> MetricsProcessor:
@@ -118,7 +113,7 @@ def _derive(processor: MetricsProcessor, step: int = 1):
 def _capturing():
     """Attach a recording handler to the module's logger and collect records.
 
-    The pipeline-parallel warnings go through ``logger.warning``, not
+    The metric warnings go through ``logger.warning``, not
     ``warnings.warn``, so ``pytest.warns`` cannot see them.
     """
     records: list[logging.LogRecord] = []
@@ -206,17 +201,17 @@ def test_throughput_is_not_divided_without_parallel_dims() -> None:
 
 
 @pytest.mark.parametrize(
-    "dp_shard,tp,ep,cp,pp",
+    "dp_shard,tp,ep,cp",
     [
-        (8, 1, 1, 1, 1),
-        (4, 2, 1, 1, 1),
-        (4, 2, 4, 1, 1),
-        (8, 1, 8, 1, 1),
-        (2, 2, 2, 2, 1),
+        (8, 1, 1, 1),
+        (4, 2, 1, 1),
+        (4, 2, 4, 1),
+        (8, 1, 8, 1),
+        (2, 2, 2, 2),
     ],
 )
 def test_real_topologies_report_the_same_global_work_per_device(
-    dp_shard, tp, ep, cp, pp
+    dp_shard, tp, ep, cp
 ) -> None:
     topology = ParallelTopology(
         dp_replicate=1,
@@ -231,7 +226,7 @@ def test_real_topologies_report_the_same_global_work_per_device(
     )
     try:
         # One global batch of 8192 tokens over two seconds on eight devices.
-        # Fetch counts each DP shard before TP/CP partitioning or PP execution.
+        # Fetch counts each DP shard before TP/CP partitioning during execution.
         processor.add_tokens(8192 // dp_shard)
         processor.gpu_peak_flops = 376e12
         processor.time_last_log -= 2.0
@@ -532,7 +527,7 @@ def test_only_rank_zero_records_unless_all_ranks_are_asked_for(monkeypatch) -> N
     require_env("tensorboard")
     processor = MetricsProcessor(
         Config(enable_tensorboard=True),
-        parallel_dims=_FakeParallelTopology(pp=1, world_size=1),
+        parallel_dims=_FakeParallelTopology(world_size=1),
         num_flops_per_token=0,
     )
     # Single process, metrics rank 0, so this rank does record.
@@ -541,7 +536,7 @@ def test_only_rank_zero_records_unless_all_ranks_are_asked_for(monkeypatch) -> N
     monkeypatch.setattr(metrics_module, "get_distributed_rank", lambda: 1)
     off_rank = MetricsProcessor(
         Config(enable_tensorboard=True),
-        parallel_dims=_FakeParallelTopology(pp=1, world_size=4),
+        parallel_dims=_FakeParallelTopology(world_size=4),
         num_flops_per_token=0,
     )
     # The non-writer rank retains a no-op sink.

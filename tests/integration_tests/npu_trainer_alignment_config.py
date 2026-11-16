@@ -846,14 +846,13 @@ def mesh_manifest(parallel_dims: Any) -> dict[str, Any]:
             "dp_shard": 1,
             "tp": 1,
             "ep": 1,
-            "pp": 1,
             "cp": 1,
             "world_size": 1,
             "meshes": {},
         }
     result = {
         name: getattr(parallel_dims, name)
-        for name in ("dp_replicate", "dp_shard", "tp", "ep", "pp", "cp", "world_size")
+        for name in ("dp_replicate", "dp_shard", "tp", "ep", "cp", "world_size")
     }
     meshes = {}
     for name, mesh in getattr(parallel_dims, "_global_meshes", {}).items():

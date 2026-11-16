@@ -1,0 +1,492 @@
+"""Pipeline parallelism: split the model, then build the schedule over it.
+
+``partition.py`` (same package) computes the stage split; this module is the
+driver around it, vendored in shape from torchtitan's
+``distributed/pipeline_parallel.pipeline_llm``:
+
+* ``apply_pp`` -- decides the stage count from the schedule class and splits
+  the model into this rank's stages. Parallelizing the resulting chunks (TP,
+  compile, FSDP) is the caller's job: ``parallelize`` owns that assembly
+  order for both the split and the unsplit path, so this module never imports
+  a sibling parallelism family. Its ``first_stage_module_fqns`` option is
+  torchtitan's ``pipeline_with_first_stage_modules``: extra top-level modules
+  co-located with stage 0 (see ``prepend_first_stage_modules``).
+* ``build_pipeline_schedule`` -- instantiates the torch pipelining schedule
+  over this rank's stages, with the summed next-token CE the trainer
+  normalizes, wrapped down to the bare scalar a schedule requires.
+
+What is not ported: the ``get_mesh`` callback (llmtuner passes plain tensors
+across stage boundaries, never DTensors -- see ``partition.py``) and csv-loaded
+runtime schedules, which are rejected rather than honored.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining.schedules import (
+    PipelineScheduleMulti,
+    PipelineScheduleSingle,
+    _PipelineSchedule,
+    get_schedule_class,
+)
+
+from experiment.pipeline_parallel.collectives import synchronize_local_errors
+from experiment.pipeline_parallel.microbatch_drivers import (
+    bind_stage_rng,
+)
+from experiment.pipeline_parallel.parallel_config import ParallelConfig
+from experiment.pipeline_parallel.partition import (
+    generate_llm_fqn_per_model_part,
+    split_model_into_stages,
+    validate_pipeline_ownership,
+)
+from experiment.pipeline_parallel.topology import ParallelTopology
+from llmtuner.components.loss import cross_entropy_loss
+from llmtuner.components.loss_contract import (
+    LossSum,
+    validate_loss_sum,
+    validate_normalization_tokens,
+)
+from llmtuner.config.training_config import resolve_batch_size_per_rank
+from llmtuner.config.utils import require_integer_at_least
+from llmtuner.models.contracts import DecoderStructure
+from llmtuner.models.execution import validate_training_output
+from llmtuner.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+__all__ = ["PipelineParallelSetup", "apply_pp", "build_pipeline_schedule"]
+
+
+@dataclass
+class PipelineParallelSetup:
+    """Everything the trainer needs to drive a ``pp > 1`` run.
+
+    Returned by ``parallelize_model`` in place of the parallelized
+    model: under pipeline parallelism there is no single model to hand back --
+    this rank holds only its stages' chunks, and a schedule drives them.
+    """
+
+    schedule: _PipelineSchedule
+    stages: list[PipelineStage]
+    model_parts: list[nn.Module]
+    has_first_stage: bool
+    has_last_stage: bool
+
+
+@dataclass(slots=True, kw_only=True)
+class PipelineLoss:
+    """Own the schedule loss configuration and current normalization denominator.
+
+    Pre-split drivers update this object before execution. Public schedule
+    drivers may supply an explicit denominator through loss_kwargs.
+    """
+
+    tp_group: dist.ProcessGroup | None = None
+    global_vocab_size: int | None = None
+    logits_width: int | None = None
+    loss_sum: LossSum = cross_entropy_loss
+    global_valid_tokens: torch.Tensor = field(
+        default_factory=lambda: torch.ones((), dtype=torch.float32)
+    )
+
+    def __post_init__(self) -> None:
+        if self.logits_width is not None and (
+            type(self.logits_width) is not int or self.logits_width <= 0
+        ):
+            raise ValueError("Pipeline logits width must be a positive integer")
+        if not callable(self.loss_sum):
+            raise TypeError("Pipeline loss_sum must be callable")
+
+    def __call__(
+        self,
+        pred: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        global_valid_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Validate original axes before flattening; equal token counts alone
+        # must not hide a swapped batch/sequence layout.
+        validate_training_output(pred, labels, output_width=self.logits_width)
+        denominator = (
+            self.global_valid_tokens
+            if global_valid_tokens is None
+            else global_valid_tokens
+        )
+        validate_normalization_tokens(denominator, device=pred.device)
+        loss = self.loss_sum(
+            pred.reshape(-1, pred.shape[-1]),
+            labels.reshape(-1),
+            tp_group=self.tp_group,
+            global_vocab_size=self.global_vocab_size,
+        )
+        validate_loss_sum(loss, device=pred.device)
+        return loss / denominator
+
+
+def get_pipeline_metadata(
+    parallel_dims: ParallelTopology,
+    parallelism: ParallelConfig,
+    num_layers: int,
+) -> tuple[int, int, int]:
+    """Decide the stage count, from the schedule class and the config.
+
+    Returns ``(num_stages, input_weight, output_weight)``. Vendored from
+    torchtitan's ``get_pipeline_metadata``: single-stage schedules (GPipe,
+    1F1B) default to one stage per rank, looped ones (Interleaved1F1B, ...)
+    to two; ``pipeline_parallel_layers_per_stage`` overrides the default and
+    is validated against the schedule kind.
+    """
+    schedule_class = get_schedule_class(
+        parallelism.pp_config.pipeline_parallel_schedule
+    )
+    is_single_stage_schedule = issubclass(schedule_class, PipelineScheduleSingle)
+    layers_per_stage = parallelism.pp_config.pipeline_parallel_layers_per_stage
+    input_weight = parallelism.pp_config.pipeline_parallel_first_stage_less_layers
+    output_weight = parallelism.pp_config.pipeline_parallel_last_stage_less_layers
+
+    if layers_per_stage is None:
+        stages_per_rank = 1 if is_single_stage_schedule else 2
+        num_stages = parallel_dims.pp * stages_per_rank
+        return num_stages, input_weight, output_weight
+
+    num_stages = math.ceil(
+        (num_layers + input_weight + output_weight) / layers_per_stage
+    )
+    model_info = (
+        f"model has {num_layers} layers with "
+        f"pipeline_parallel_layers_per_stage={layers_per_stage}"
+    )
+    if num_stages % parallel_dims.pp != 0:
+        raise ValueError(
+            f"Number of pipeline stages ({num_stages}) must be divisible by "
+            f"the pipeline parallel degree ({parallel_dims.pp}); {model_info}."
+        )
+    stages_per_rank = num_stages // parallel_dims.pp
+    if is_single_stage_schedule and stages_per_rank != 1:
+        raise ValueError(
+            f"Schedule {parallelism.pp_config.pipeline_parallel_schedule!r} "
+            "runs exactly "
+            f"1 stage per rank, but the split yields {stages_per_rank}; "
+            f"{model_info}."
+        )
+    if not is_single_stage_schedule and stages_per_rank < 2:
+        raise ValueError(
+            f"Schedule {parallelism.pp_config.pipeline_parallel_schedule!r} needs at "
+            f"least 2 stages per rank, but the split yields {stages_per_rank}; "
+            f"{model_info}."
+        )
+    return num_stages, input_weight, output_weight
+
+
+def prepend_first_stage_modules(
+    module_names_per_stage: list[list[str]],
+    model: nn.Module,
+    first_stage_module_fqns: Sequence[str],
+) -> None:
+    """Co-locate extra top-level modules with pipeline stage 0, in place.
+
+    The generated LLM split only knows the decoder parts (``tok_embeddings``,
+    ``layers.*``, ``norm``, ``lm_head``, ``rotary_emb``). This prepends each
+    present module from ``first_stage_module_fqns`` to stage 0's FQN list, in
+    the given order; ``split_model_into_stages`` then keeps the real module on
+    stage 0 and blanks it to ``nn.Identity`` everywhere else, so the model's
+    ``forward`` must tolerate the blanked version.
+
+    Invariants:
+
+    * FQN stability: the modules stay top-level children under their original
+      names, so every stage's state-dict keys for them match the unsplit
+      model's -- optimizer and checkpoint keys do not move.
+    * No cross-stage ownership: an FQN the split already assigned (e.g. a
+      decoder part, or a duplicate in ``first_stage_module_fqns``) would put a
+      live copy on two stages and collide their keys in one checkpoint, so it
+      is rejected rather than merged.
+    * Absent modules (``getattr(model, fqn, None) is None``) are skipped, so a
+      caller may list modules that only some model variants carry.
+    """
+    owned = {name for stage in module_names_per_stage for name in stage}
+    seen: set[str] = set()
+    present = []
+    for fqn in first_stage_module_fqns:
+        module = getattr(model, fqn, None)
+        if module is None:
+            continue
+        if not isinstance(module, nn.Module):
+            raise ValueError(
+                f"first-stage module {fqn!r} must be an nn.Module, "
+                f"got {type(module).__name__}"
+            )
+        if fqn in owned:
+            raise ValueError(
+                f"first-stage module {fqn!r} is already assigned to a pipeline "
+                "stage by the split; co-locating it with stage 0 would give "
+                "two stages a live copy of the same parameter."
+            )
+        if fqn in seen:
+            raise ValueError(f"first-stage module {fqn!r} is listed more than once.")
+        seen.add(fqn)
+        present.append(fqn)
+    module_names_per_stage[0][:0] = present
+
+
+def validate_microbatches(
+    parallel_dims: ParallelTopology, cfg: ParallelConfig, global_batch_size: int
+) -> None:
+    """Fail at setup, not mid-step, on a batch that cannot be microbatched.
+
+    The trainer chunks each rank's rows into ``num_pp_microbatches`` pieces, so
+    the per-rank row count must divide evenly; the schedule would otherwise be
+    fed uneven (or wrong-count) microbatches and hang in a p2p.
+    """
+    dp = parallel_dims.dp_replicate * parallel_dims.dp_shard
+    rows_per_rank = resolve_batch_size_per_rank(global_batch_size, dp)
+    num_microbatches = cfg.pp_config.num_pp_microbatches
+    # Revalidate direct callers whose config may have changed after construction.
+    require_integer_at_least(cfg.pp_config, "num_pp_microbatches", group="parallel")
+    if rows_per_rank % num_microbatches != 0:
+        raise ValueError(
+            f"per-rank batch rows ({global_batch_size} / {dp} = "
+            f"{rows_per_rank}) must be divisible by num_pp_microbatches "
+            f"({num_microbatches})"
+        )
+
+
+def apply_pp(
+    model: nn.Module,
+    *,
+    parallel_dims: ParallelTopology,
+    cfg: ParallelConfig,
+    device: torch.device,
+    global_batch_size: int,
+    first_stage_module_fqns: Sequence[str] | None = None,
+    error_group: dist.ProcessGroup | None = None,
+) -> tuple[list[PipelineStage], list[nn.Module], bool, bool]:
+    """Split ``model`` into this rank's pipeline stages.
+
+    The chunks come back unparallelized: running each through TP, (optionally)
+    ``torch.compile`` and FSDP -- and rebinding ``stage.submod`` afterwards, so
+    a wrapping transform cannot leave the stage running the pre-wrap module --
+    is ``parallelize_model``'s job, which owns that assembly order
+    for the split and unsplit paths alike.
+
+    ``global_batch_size`` is a training-side value the PP guards need; it is
+    an explicit parameter rather than a read off a run-wide config so this
+    layer never sees ``LLMTunerConfig``.
+
+    ``first_stage_module_fqns`` names extra top-level modules (e.g. a
+    multimodal encoder) to co-locate with stage 0; see
+    ``prepend_first_stage_modules`` for the invariants. It only applies to
+    the auto-generated split -- an explicit ``module_fqns_per_model_part``
+    already places modules by hand, so the two are not merged (a warning is
+    logged and the explicit split wins). The default ``None`` leaves the
+    split, and every stage's state-dict keys, bitwise unchanged. Note the
+    auto split does not model the added load (``input_weight`` only accounts
+    for ``tok_embeddings``); rebalance with
+    ``pipeline_parallel_first_stage_less_layers``.
+
+    Returns ``(stages, model_parts, has_first_stage, has_last_stage)``; the
+    schedule over the stages is built separately (``build_pipeline_schedule``).
+
+    Every member of ``error_group`` (the default world group when omitted)
+    must call this entry point in the same order. Only local partition checks
+    run inside that coordination boundary. Each PP group then agrees on the
+    partition and schedule metadata before stage construction; collectives
+    themselves stay outside the local error boundaries.
+    """
+    with synchronize_local_errors("Pipeline partition validation", group=error_group):
+        structure = getattr(model, "decoder_structure", None)
+        parallelism = cfg
+        validate_microbatches(parallel_dims, cfg, global_batch_size)
+
+        module_names_per_stage = parallelism.pp_config.module_fqns_per_model_part
+        if module_names_per_stage is None:
+            if not isinstance(structure, DecoderStructure):
+                raise TypeError(
+                    "Automatic PP partitioning requires a model-owned "
+                    "DecoderStructure; custom models must provide an explicit split"
+                )
+            blocks = structure.bind(model).blocks
+            num_layers = len(blocks)
+            num_stages, input_weight, output_weight = get_pipeline_metadata(
+                parallel_dims, parallelism, num_layers
+            )
+            module_names_per_stage = generate_llm_fqn_per_model_part(
+                num_stages,
+                num_layers,
+                input_weight=input_weight,
+                output_weight=output_weight,
+            )
+            runtime_modules = getattr(model, "pipeline_runtime_modules", ())
+            block_ids = tuple(blocks._modules)
+            aliases = {
+                "tok_embeddings": structure.embedding,
+                "norm": structure.norm,
+                "lm_head": structure.head,
+            }
+
+            def bind_target(target: str) -> list[str]:
+                if target == "rotary_emb":
+                    return list(runtime_modules)
+                if target.startswith("layers."):
+                    block = block_ids[int(target.removeprefix("layers."))]
+                    return [f"{structure.blocks}.{block}"]
+                return [aliases[target]]
+
+            module_names_per_stage = [
+                [path for target in targets for path in bind_target(target)]
+                for targets in module_names_per_stage
+            ]
+            if first_stage_module_fqns:
+                prepend_first_stage_modules(
+                    module_names_per_stage, model, first_stage_module_fqns
+                )
+        else:
+            if first_stage_module_fqns:
+                logger.warning(
+                    "first_stage_module_fqns is ignored because "
+                    "module_fqns_per_model_part already defines the split; "
+                    "place the extra modules in the explicit split instead."
+                )
+            # An explicit split still has to land a whole number of stages per
+            # rank; the per-schedule-kind check happens in get_pipeline_metadata
+            # for the generated path, so assert the divisibility here.
+            num_stages = len(module_names_per_stage)
+            if num_stages % parallel_dims.pp != 0:
+                raise ValueError(
+                    f"module_fqns_per_model_part defines {num_stages} stages, "
+                    f"which is not divisible by the pipeline parallel degree "
+                    f"({parallel_dims.pp})"
+                )
+            # Same schedule-kind constraint as the generated path: single-stage
+            # schedules (GPipe, 1F1B) drive exactly one stage per rank -- an
+            # explicit split with more would have its extra chunks silently
+            # dropped by the PipelineScheduleSingle branch.
+            schedule_class = get_schedule_class(
+                parallelism.pp_config.pipeline_parallel_schedule
+            )
+            if issubclass(schedule_class, PipelineScheduleSingle) and (
+                num_stages != parallel_dims.pp
+            ):
+                raise ValueError(
+                    f"module_fqns_per_model_part defines {num_stages} stages "
+                    f"({num_stages // parallel_dims.pp} per rank), but schedule "
+                    f"{parallelism.pp_config.pipeline_parallel_schedule!r} "
+                    "drives exactly "
+                    "one stage per rank. Use a looped schedule (e.g. "
+                    "interleaved_1f1b) or one stage per rank."
+                )
+
+        replicated_module_names = tuple(getattr(model, "pipeline_runtime_modules", ()))
+        validate_pipeline_ownership(
+            model,
+            module_names_per_stage,
+            replicated_module_names=replicated_module_names,
+        )
+        partition_signature = (
+            tuple(tuple(names) for names in module_names_per_stage),
+            replicated_module_names,
+            parallelism.pp_config.pipeline_parallel_schedule,
+            parallelism.pp_config.num_pp_microbatches,
+            global_batch_size,
+        )
+
+    pp_mesh = parallel_dims.get_mesh("pp")
+    signatures = [None] * pp_mesh.size()
+    # Compare only ranks exchanging pipeline activations. Keep the collective
+    # outside local error coordination, then propagate disagreement to all
+    # assembly participants before any group constructs its stages.
+    dist.all_gather_object(signatures, partition_signature, group=pp_mesh.get_group())
+    with synchronize_local_errors("Pipeline partition agreement", group=error_group):
+        if any(signature != partition_signature for signature in signatures):
+            raise ValueError(
+                "Pipeline ranks disagree on module partitions, replicated modules, "
+                "schedule, microbatch count or global batch size"
+            )
+    stages, model_parts = split_model_into_stages(
+        model,
+        pp_mesh,
+        parallelism.pp_config.pipeline_parallel_schedule,
+        device,
+        module_names_per_stage,
+        replicated_module_names=replicated_module_names,
+    )
+    has_first_stage = any(stage.is_first for stage in stages)
+    has_last_stage = any(stage.is_last for stage in stages)
+    return stages, model_parts, has_first_stage, has_last_stage
+
+
+def build_pipeline_schedule(
+    stages: list[PipelineStage],
+    *,
+    cfg: ParallelConfig,
+    tp_group: dist.ProcessGroup | None = None,
+    global_vocab_size: int | None = None,
+    logits_width: int | None = None,
+    loss_sum: LossSum | None = None,
+) -> _PipelineSchedule:
+    """Build the schedule that drives this rank's stages.
+
+    Vendored from torchtitan's ``_build_pipeline_schedule``, minus the
+    csv-loaded runtime schedule. ``scale_grads=False`` because the loss is a
+    sum over tokens divided by the global token count before backward, so
+    the schedule must not average over microbatches again.
+
+    ``tp_group`` / ``global_vocab_size`` are the vocab-parallel loss arguments
+    for this run, or ``None`` when TP is off or the vocabulary is unknown; they
+    are handed to :class:`PipelineLoss` and are a no-op while the
+    ``lm_head`` is replicated, because :func:`cross_entropy_loss` dispatches on
+    the logits' shape. ``logits_width`` separately declares a replicated
+    vocabulary width and is checked before invoking the selected loss service.
+    """
+    parallelism = cfg
+    if parallelism.pp_config.pipeline_parallel_schedule_csv:
+        raise NotImplementedError(
+            "pipeline_parallel_schedule_csv is not wired: llmtuner builds "
+            "schedules by name only."
+        )
+    schedule_class = get_schedule_class(
+        parallelism.pp_config.pipeline_parallel_schedule
+    )
+    num_microbatches = parallelism.pp_config.num_pp_microbatches
+    num_total_stages = parallelism.pipeline_parallel_size * len(stages)
+    if num_microbatches < num_total_stages:
+        logger.warning(
+            f"Number of microbatches ({num_microbatches}) is less than the "
+            f"total number of stages ({num_total_stages}), which may result in "
+            "a bubble in the pipeline."
+        )
+
+    schedule_loss = PipelineLoss(
+        tp_group=tp_group,
+        global_vocab_size=global_vocab_size,
+        logits_width=logits_width,
+        loss_sum=cross_entropy_loss if loss_sum is None else loss_sum,
+    )
+    if issubclass(schedule_class, PipelineScheduleMulti):
+        schedule = schedule_class(
+            stages,
+            n_microbatches=num_microbatches,
+            loss_fn=schedule_loss,
+            scale_grads=False,
+        )
+    else:
+        schedule = schedule_class(
+            stages[0],
+            n_microbatches=num_microbatches,
+            loss_fn=schedule_loss,
+            scale_grads=False,
+        )
+    bind_stage_rng(schedule)
+    logger.info(
+        f"Using pipeline schedule {parallelism.pp_config.pipeline_parallel_schedule} "
+        f"with {num_microbatches} microbatches and {num_total_stages} stages."
+    )
+    return schedule

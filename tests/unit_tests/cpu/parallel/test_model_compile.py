@@ -45,7 +45,7 @@ from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
 try:
     ParallelConfig()
     _PARALLEL_CONFIG_ERROR = None
-except Exception as e:  # noqa: BLE001 - env gate (torch 2.2 has no pipelining)
+except Exception as e:  # noqa: BLE001 - environment dependency gate
     _PARALLEL_CONFIG_ERROR = e
 
 requires_parallel_config = pytest.mark.skipif(

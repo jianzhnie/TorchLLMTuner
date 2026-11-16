@@ -364,7 +364,7 @@ def main() -> None:
         )
         assert trainer.parallel_dims.tp == config.parallelism.tensor_parallel_degree
         assert trainer.parallel_dims.ep == config.parallelism.expert_parallel_degree
-        assert trainer.parallel_dims.pp == trainer.parallel_dims.cp == 1
+        assert trainer.parallel_dims.cp == 1
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     (root / "optimizer.json").write_text(
         json.dumps(optimizer_manifest(trainer), indent=2)

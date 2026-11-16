@@ -6,7 +6,6 @@ from torch import nn
 from llmtuner.models.registered_state import (
     named_extra_state_owners,
     named_persistent_buffers,
-    registered_state_paths,
 )
 
 
@@ -37,14 +36,4 @@ def test_registered_state_preserves_aliases_without_executing_hooks():
     assert dict(named_extra_state_owners(model)) == {
         "first._extra_state": child,
         "second._extra_state": child,
-    }
-    assert set(registered_state_paths(model)) == {
-        "first.weight",
-        "second.weight",
-        "first.saved",
-        "first.alias",
-        "second.saved",
-        "second.alias",
-        "first._extra_state",
-        "second._extra_state",
     }

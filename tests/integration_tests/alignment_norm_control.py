@@ -61,7 +61,7 @@ class PartitionedNormWeightGradient(torch.autograd.Function):
 
 def install_norm_partition_control(trainer, geometry):
     dims = trainer.parallel_dims
-    if dims.tp <= 1 or dims.cp != 1 or dims.pp != 1:
+    if dims.tp <= 1 or dims.cp != 1:
         raise ValueError("Norm partition control requires TP without CP/PP")
     model = trainer.model_parts[0]
     norms = [model.norm]

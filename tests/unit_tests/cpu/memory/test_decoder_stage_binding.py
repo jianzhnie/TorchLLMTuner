@@ -1,4 +1,4 @@
-"""Memory and compile stages bind declared PP-local blocks, not aliases."""
+"""Memory and compile stages bind model-declared blocks before mutation."""
 
 import pytest
 import torch.nn as nn
@@ -72,22 +72,28 @@ def test_stages_reject_invalid_declarations_without_fallback(local_model, stage)
     assert local_model.decoder.blocks[0] is original
 
 
-@pytest.mark.parametrize("stage", ["ac", "compile"])
+@pytest.mark.parametrize("stage", ["ac", "compile", "swap"])
+@pytest.mark.parametrize("declaration", ["missing", "none", "malformed"])
 def test_assembly_rejects_bad_targets_before_transforms(
-    local_model, stage, monkeypatch
+    local_model, stage, declaration, monkeypatch
 ):
-    local_model.decoder_structure = "decoder.blocks"
+    if declaration == "missing":
+        del local_model.decoder_structure
+    else:
+        local_model.decoder_structure = (
+            None if declaration == "none" else "decoder.blocks"
+        )
     original = local_model.decoder.blocks[0]
     reached = []
     monkeypatch.setattr(
         "llmtuner.parallel.parallelize.validate_fsdp_environment",
-        lambda *args: reached.append("fsdp validation"),
+        lambda *args, **kwargs: reached.append("fsdp validation"),
     )
-    options = (
-        {"activation_checkpoint": "full"}
-        if stage == "ac"
-        else {"compile": True, "compile_config": CompileConfig(per_block=True)}
-    )
+    options = {
+        "ac": {"activation_checkpoint": "full"},
+        "compile": {"compile": True, "compile_config": CompileConfig(per_block=True)},
+        "swap": {"activation_swap": True},
+    }[stage]
 
     with pytest.raises(TypeError, match="DecoderStructure"):
         parallelize_model(
