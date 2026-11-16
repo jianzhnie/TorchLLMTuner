@@ -63,7 +63,7 @@ def build_config(args: argparse.Namespace) -> LLMTunerConfig:
             data_parallel_replicate_size=getattr(args, "dp_replicate", 1),
             tensor_parallel_size=getattr(args, "tp", 1),
             expert_parallel_size=getattr(args, "ep", 1),
-            pipeline_parallel_size=getattr(args, "pp", 1),
+
             context_parallel_kv_allgather_size=getattr(args, "cp", 1),
         ),
         training=TrainingConfig(

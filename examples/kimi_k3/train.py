@@ -57,7 +57,7 @@ def build_config(args: argparse.Namespace) -> LLMTunerConfig:
             data_parallel_replicate_size=args.dp_replicate,
             tensor_parallel_size=args.tp,
             expert_parallel_size=args.ep,
-            pipeline_parallel_size=args.pp,
+
             context_parallel_kv_allgather_size=args.cp,
         ),
         optimizer=OptimizerConfig(

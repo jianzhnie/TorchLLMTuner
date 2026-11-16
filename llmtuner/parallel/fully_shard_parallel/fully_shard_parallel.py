@@ -225,7 +225,6 @@ def apply_fsdp_to_decoder(
         dp_mesh (DeviceMesh): The device mesh to use for data parallelism.
         param_dtype (torch.dtype): The data type to use for model parameters.
         reduce_dtype (torch.dtype): The data type to use for reductions.
-        pp_enabled (bool): Whether pipeline parallelism is enabled.
         cpu_offload (bool, optional): Whether to offload model parameters to
             CPU. Defaults to False.
         cpu_offload_pin_memory (bool, optional): Whether CPU-offloaded buffers

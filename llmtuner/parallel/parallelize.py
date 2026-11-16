@@ -1,7 +1,7 @@
 """Apply TP/EP/CP and memory transformations to explicit whole models.
 
 Stages follow the single STAGE_ORDER and return final local layout metadata.
-Pipeline execution is isolated in experiments/pipeline_parallel.
+Pipeline execution is isolated in experiment/pipeline_parallel.
 """
 
 from __future__ import annotations

@@ -315,7 +315,6 @@ def clip_grad_norm_(
         norm_type: type of the used p-norm. ``'inf'`` for infinity norm.
         error_if_nonfinite: throw if the total norm is nan/inf.
         foreach: use the faster foreach implementation (``None`` lets torch pick).
-        pp_mesh: pipeline-parallel mesh; when present the norm is reduced across
             stages before clipping.
         ep_mesh: expert-parallel mesh. When present, only the norm contribution
             from ``expert_parameters`` is reduced over this mesh.

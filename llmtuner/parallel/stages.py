@@ -41,10 +41,7 @@ STAGES: tuple[Stage, ...] = (
     Stage(
         "ep",
         "After TP: expert replacement consumes TP's dense sharding and owns "
-        "the routed experts. On the PP path too: the sparse mesh carries a pp "
-        "axis, so each stage's ranks form their own EP group and expert "
-        "conversion runs per stage chunk (upstream: pipeline() parallelizes "
-        "each model part).",
+        "the routed experts on the sparse EP mesh.",
     ),
     Stage(
         "cp",

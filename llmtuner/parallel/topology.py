@@ -2,7 +2,7 @@
 
 Config says how many ways to split (``config/parallel_config.py``); this module turns
 that into the actual process topology: the dense mesh (dp_shard x dp_replicate
-x cp x tp, x pp) and, under EP, the sparse mesh (pp x dp_replicate x efsdp x
+x cp x tp) and, under EP, the sparse mesh (dp_replicate x efsdp x
 ep). It also owns ``resolve_parallel_topology`` and ``build_device_mesh``
 entry points and the loss/dataloading sub-mesh derivations the trainer
 reduces over.
@@ -184,7 +184,6 @@ class ParallelTopology:
 
         The following mesh dimensions will be created:
 
-            pp:      Pipeline Parallelism (PP).
             batch:   Used by data loading to determine the global batch size and
                      which part of the data each rank should read. This dimension
                      includes both ``dp_replicate`` and ``dp_shard``.
@@ -207,10 +206,10 @@ class ParallelTopology:
         dimensions.
         This API performs the following unflatten operations from the world mesh:
 
-            ["pp", "batch", "cp", "tp"]  # dataloading_mesh
-            ["pp", "dp_replicate", "dp_shard", "cp", "tp"]  # storage mesh
-            ["pp", "dp", "cp", "tp"]  # fwd/bwd dense mesh
-            ["pp", "dp_replicate", "efsdp", "ep"]  # sparse_mesh
+            ["batch", "cp", "tp"]  # dataloading_mesh
+            ["dp_replicate", "dp_shard", "cp", "tp"]  # storage mesh
+            ["dp", "cp", "tp"]  # fwd/bwd dense mesh
+            ["dp_replicate", "efsdp", "ep"]  # sparse_mesh
 
         DeviceMesh currently recreates process groups for each view. Use its
         default backend for every axis, including inactive axes: PyTorch's
@@ -383,7 +382,7 @@ class ParallelTopology:
 
         Args:
             dims: Names of the mesh dimension. Valid options include:
-                 'pp', 'batch', 'loss', 'dp_replicate', 'dp', 'dp_shard',
+                 'batch', 'loss', 'dp_replicate', 'dp', 'dp_shard',
                  'cp', 'tp', 'ep', 'efsdp'.
             include_singleton_axes: Include axes with size 1 in the returned
                  submesh. This is used for distributed parameter and buffer
@@ -446,7 +445,7 @@ class ParallelTopology:
 
         Args:
             dims: Names of the mesh dimension. Valid options include:
-                 'pp', 'batch', 'loss', 'dp_replicate', 'dp', 'dp_shard',
+                 'batch', 'loss', 'dp_replicate', 'dp', 'dp_shard',
                  'cp', 'tp', 'ep', 'efsdp'.
 
         Returns:
@@ -499,7 +498,7 @@ class ParallelTopology:
 
         Example:
             >>> parallel_dims = ParallelTopology(
-            ...     dp_replicate=2, dp_shard=2, cp=1, tp=2, pp=1, ep=1, world_size=8
+            ...     dp_replicate=2, dp_shard=2, cp=1, tp=2, ep=1, world_size=8
             ... )
             >>> meshes = parallel_dims.get_all_one_dimensional_meshes()
             >>> print(meshes.keys())
@@ -548,10 +547,7 @@ class ParallelTopology:
 
 
 # Mesh axis names. `axis` names a specific DeviceMesh axis; `dim` is for shapes.
-# These are the axes of the dense mesh the parallel layer is handed; ``pp`` is
-# not among them because pipeline stages live on disjoint rank sets -- the PP
-# path resolves its own views off ParallelTopology instead (see
-# experiments/pipeline_parallel/pipeline_parallel.py).
+# Axes consumed by the production dense transformations.
 MESH_AXES = ("dp", "cp", "tp")
 
 
@@ -564,7 +560,7 @@ def resolve_parallel_topology(
     parallelism, so downstream code guards on ``parallel_dims is None``.
     Any non-1 degree in that case is a config error, not a silent no-op:
     upstream validates the degree product against every world size, and a
-    single-process run that asked for tp/pp/... must not train a fully
+    single-process run that asked for tp/cp/ep must not train a fully
     replicated model while logging the configured degrees.
     """
     if world_size == 1:
@@ -626,9 +622,7 @@ def build_device_mesh(parallel_dims: ParallelTopology | None):
             f"dense mesh axes {mesh.mesh_dim_names} != expected {MESH_AXES}; the "
             "parallel layer indexes these names directly"
         )
-    # The dense mesh spans dp * cp * tp ranks. PP is not an axis of it, so a
-    # ``pp > 1`` run must not be handed this mesh as if it covered the world:
-    # the trainer takes the per-stage dense view off ``parallel_dims`` instead.
+    # Validate complete rank coverage before transformations.
     covered = (
         parallel_dims.dp_replicate
         * parallel_dims.dp_shard
@@ -638,6 +632,6 @@ def build_device_mesh(parallel_dims: ParallelTopology | None):
     if covered != parallel_dims.world_size:
         raise ValueError(
             f"dense mesh (dp*cp*tp = {covered}) does not cover the world "
-            f"({parallel_dims.world_size} ranks); is pp > 1?"
+            f"({parallel_dims.world_size} ranks)"
         )
     return mesh

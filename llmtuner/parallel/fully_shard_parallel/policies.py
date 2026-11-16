@@ -134,7 +134,6 @@ def get_fsdp_reshard_after_forward_policy(reshard_after_forward_policy: str) -> 
 
     Args:
         reshard_after_forward_policy: One of "always", "never", or "default".
-        pp_enabled: Whether pipeline parallelism is enabled.
 
     Returns:
         Boolean indicating whether to reshard after forward.

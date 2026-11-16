@@ -207,7 +207,7 @@ class LLMTunerConfig:
             )
 
     # -- Flat view: lets the trainer read cfg.lr / cfg.steps / ... uniformly. --
-    # The parallel degrees (dp/tp/pp/cp/ep) are deliberately NOT here: the
+    # The parallel degrees (dp/tp/cp/ep) are deliberately NOT here: the
     # parallel layer takes ``cfg.parallel`` (a ParallelConfig) directly, so a
     # second flat spelling of the same numbers could only drift apart.
     @property

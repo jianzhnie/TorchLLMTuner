@@ -134,16 +134,14 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
     across local model parts and colliding checkpoint FQNs are rejected before
     constructing any inner optimizer.
 
-    Rules are validated across local parts, or across pipeline ranks when an
-    explicit pipeline_mesh is supplied. All pipeline ranks must then construct
-    the container together with the same ordered rules.
+    Rules are validated across local parts. Distributed construction errors
+    coordinate through the explicit initialization group.
 
     Args:
         config: the run's optimizer configuration. ``param_groups`` is the list
             of ``ParamGroupConfig`` patterns; ``implementation`` selects
             ``fused`` / ``foreach`` / ``for-loop`` for every inner optimizer.
         model_parts: the model chunks to optimize, one per pipeline stage.
-        pipeline_mesh: optional PP axis for checking rules over every stage.
         initialization_group: optional group coordinating local planning and
             construction errors; defaults to the PP group. Trainer supplies world
             so failures also reach other data replicas. All members must construct

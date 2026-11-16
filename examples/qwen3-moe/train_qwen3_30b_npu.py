@@ -51,7 +51,6 @@ from llmtuner.config import (
     ModelConfig,
     OptimizerConfig,
     ParallelConfig,
-    PipelineParallelConfig,
     TrainingConfig,
 )
 from llmtuner.config.parallel_config import FSDPConfig
@@ -77,7 +76,7 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
     # One microbatch per stage is the floor the schedule accepts, and the only
     # default that works unasked: pp=2 with a single microbatch is rejected by
     # torch's 1F1B schedule constructor (n_microbatches >= num_stages).
-    num_pp_microbatches = int(
+    int(
         os.environ.get(
             "LLMTUNER_NUM_PP_MICROBATCHES", str(max(1, pipeline_parallel_size))
         )
@@ -107,9 +106,8 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
             ),
             expert_parallel_size=expert_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
-            pipeline_parallel_size=pipeline_parallel_size,
+
             context_parallel_kv_allgather_size=context_parallel_size,
-            pp_config=PipelineParallelConfig(num_pp_microbatches=num_pp_microbatches),
             ep_config=ExpertParallelConfig(
                 ep_token_dispatcher=os.environ.get(
                     "LLMTUNER_EP_TOKEN_DISPATCHER", "alltoall"
