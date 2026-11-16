@@ -19,14 +19,13 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env("dtensor", "pipelining", "spmd_types")
+require_env("dtensor", "spmd_types")
 
 
 import os
 import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
 import torch
@@ -72,7 +71,6 @@ from llmtuner.trainer.runtime.batch import (
     prepare_model_inputs,
 )
 from llmtuner.trainer.runtime.engine import TrainingEngine, loss_vocab_kwargs
-from llmtuner.trainer.runtime.pipeline import run_pipeline_step
 from llmtuner.trainer.runtime.results import StepResult
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.seeding import seed_everything
@@ -92,6 +90,10 @@ def bind_test_engine(trainer: Trainer) -> None:
         optimizer=trainer.optimizer,
         lr_scheduler=trainer.lr_scheduler,
         ema=getattr(trainer, "ema", None),
+        max_norm=getattr(getattr(trainer, "cfg", None), "max_norm", 1.0),
+        grad_norm_precision=getattr(
+            getattr(trainer, "cfg", None), "grad_norm_precision", "float32"
+        ),
     )
 
 
@@ -251,86 +253,6 @@ def test_train_step_rejects_a_fully_masked_window_before_forward() -> None:
     bind_test_engine(trainer)
     with pytest.raises(RuntimeError, match="zero valid tokens"):
         trainer.train_step(iter([object()]))
-
-
-def test_pp_forward_backward_releases_consumed_loss_graphs(monkeypatch) -> None:
-    """The PP schedule's reporting losses must not retain completed graphs."""
-    monkeypatch.setattr(
-        "llmtuner.parallel.pipeline_parallel.microbatch_drivers.capability",
-        lambda name: False if name == "pipelining_microbatch_drivers" else True,
-    )
-    activation_refs: list[weakref.ReferenceType[torch.Tensor]] = []
-    loss_refs: list[weakref.ReferenceType[torch.Tensor]] = []
-    loss_containers: list[list[torch.Tensor]] = []
-    gradients: list[torch.Tensor] = []
-
-    class _FakeStage:
-        """The stage attributes the fallback driver primes before stepping."""
-
-        def __init__(self) -> None:
-            self.has_backward = True
-
-        def clear_runtime_states(self) -> None:
-            pass
-
-    class _FakeSchedule:
-        """Schedule shaped like torch 2.9's: one stage, no microbatch eval form.
-
-        The fallback driver reaches for ``_has_backward`` / ``_stage`` and then
-        ``_step_microbatches``, which is the same seam the real schedule offers.
-        """
-
-        def __init__(self) -> None:
-            self._has_backward = True
-            self._stage = _FakeStage()
-            self._loss_fn = SimpleNamespace(global_valid_tokens=None)
-
-        def _step_microbatches(self, args, kwargs_mbs, targets, losses) -> None:
-            loss_containers.append(losses)
-            for value in (1.0, 2.0):
-                activation = torch.tensor(value, requires_grad=True)
-                # PP losses are normalized before the schedule runs backward.
-                # The trainer multiplies their detached sum by the global
-                # denominator to recover the raw reporting sum.
-                loss = activation.square().view(()) / self._loss_fn.global_valid_tokens
-                loss.backward()
-                assert activation.grad is not None
-                gradients.append(activation.grad.detach().clone())
-                activation_refs.append(weakref.ref(activation))
-                loss_refs.append(weakref.ref(loss))
-                losses.append(loss)
-
-    trainer = cast(
-        Trainer,
-        SimpleNamespace(
-            error_group=None,
-            pp_has_first_stage=True,
-            pp_has_last_stage=True,
-            pp_schedule=_FakeSchedule(),
-            parallel_dims=None,
-            param_context=nullcontext,
-            pp_microbatches=lambda batch: [batch, batch],
-            preprocess=lambda microbatch: (
-                torch.ones(1),
-                torch.ones(1, dtype=torch.long),
-                {},
-            ),
-        ),
-    )
-
-    reporting_loss = run_pipeline_step(
-        trainer,
-        Batch(input_ids=torch.ones(1, 1), labels=torch.ones(1, 1)),
-        global_valid_tokens=torch.tensor(2),
-    )
-
-    torch.testing.assert_close(reporting_loss, torch.tensor(5.0))
-    torch.testing.assert_close(torch.stack(gradients), torch.tensor([1.0, 2.0]))
-    assert not reporting_loss.requires_grad
-    assert reporting_loss.grad_fn is None
-    assert loss_containers == [[]]
-    assert all(reference() is None for reference in loss_refs)
-    assert all(reference() is None for reference in activation_refs)
 
 
 # -- setup helpers -------------------------------------------------------------
@@ -2262,7 +2184,7 @@ def test_trainer_retains_checkpointer_after_interrupted_close():
     assert trainer.checkpointer is None
 
 
-@pytest.mark.parametrize("axis", ["pp", "tp", "ep"])
+@pytest.mark.parametrize("axis", ["tp", "ep"])
 def test_parallel_norm_accumulation_does_not_overflow_half_precision(monkeypatch, axis):
     from llmtuner.accelerator import collectives
 
@@ -2387,7 +2309,7 @@ def test_clip_norm_counts_shared_parameter_across_model_parts_once(
         expert_reduce_layout="storage",
         step=7,
         error_group=expected_group,
-        reduction_meshes=TrainingReductionMeshes(None, None, None, None),
+        reduction_meshes=TrainingReductionMeshes(None, None, None),
         loss_is_finite=torch.ones((), dtype=torch.int32),
     )
     assert len(captured["parameters"]) == (1 if precision == "float32" else 3)
@@ -2423,21 +2345,7 @@ def test_expert_parameter_ids_deduplicate_model_declared_ownership():
     assert gradients.expert_parameter_ids([first, second]) == {id(shared)}
 
 
-def test_pp_norm_without_gradients_uses_parameter_device(monkeypatch):
-    from llmtuner.accelerator import collectives
-
-    parameter = nn.Parameter(torch.empty(1, device="meta"))
-    mesh = SimpleNamespace(get_group=lambda: object())
-
-    def reduce(tensor, *, op, group):
-        assert tensor.device == parameter.device
-
-    monkeypatch.setattr(collectives.dist, "all_reduce", reduce)
-    norm = clip_grad_norm_([parameter], max_norm=0, pp_mesh=mesh)
-    assert norm.device == parameter.device
-
-
-@pytest.mark.parametrize("axis", ["tp", "ep", "pp"])
+@pytest.mark.parametrize("axis", ["tp", "ep"])
 def test_parameterless_norm_uses_mesh_communication_device(monkeypatch, axis):
     from llmtuner.accelerator import collectives
 

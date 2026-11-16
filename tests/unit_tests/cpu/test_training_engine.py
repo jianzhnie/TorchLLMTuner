@@ -10,6 +10,7 @@ from llmtuner.components.loss import cross_entropy_loss
 from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.trainer.runtime.engine import TrainingEngine
+from llmtuner.trainer.runtime.reductions import resolve_training_reduction_meshes
 from llmtuner.trainer.runtime.results import AccumulationResult, StepResult
 
 
@@ -109,19 +110,6 @@ def test_dense_engine_rejects_invalid_part_count_at_construction(part_count):
         TrainingEngine(
             model_parts=[ToyCausalModel() for _ in range(part_count)],
             parallel_dims=None,
-            device=torch.device("cpu"),
-            chunked_loss_num_chunks=1,
-            param_context=nullcontext,
-        )
-
-
-@pytest.mark.parametrize("pipeline_enabled", [False, True])
-def test_engine_rejects_schedule_topology_mismatch(pipeline_enabled):
-    with pytest.raises(ValueError, match="topology and schedule"):
-        TrainingEngine(
-            model_parts=[ToyCausalModel()],
-            parallel_dims=SimpleNamespace(pp_enabled=pipeline_enabled),
-            pp_schedule=None if pipeline_enabled else object(),
             device=torch.device("cpu"),
             chunked_loss_num_chunks=1,
             param_context=nullcontext,
@@ -279,6 +267,119 @@ def test_scheduler_failure_does_not_roll_back_optimizer_or_run_ema() -> None:
         engine.optimizer_step(4)
 
     assert events == ["optimizer", "scheduler"]
+
+
+@pytest.mark.parametrize("max_norm", [0.0, 0.05])
+@pytest.mark.parametrize("collect_metrics", [False, True])
+def test_finish_step_matches_independent_clipped_update(
+    max_norm, collect_metrics, monkeypatch
+):
+    """Unequal target counts, clipping and moments agree without a Trainer."""
+    torch.manual_seed(53)
+    model = ToyCausalModel()
+    reference = deepcopy(model)
+    engine = build_engine(model)
+    engine.max_norm = max_norm
+    engine.optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, foreach=False)
+    engine.lr_scheduler = torch.optim.lr_scheduler.StepLR(engine.optimizer, 1, 0.5)
+    optimizer = torch.optim.AdamW(reference.parameters(), lr=0.01, foreach=False)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, 0.5)
+    tokens = [torch.tensor([0, 3, 6]), torch.tensor([8, 2, 9, 1, 4])]
+    targets = [torch.tensor([-100, 2, -100]), torch.tensor([1, 3, 7, 0, 6])]
+    denominator = torch.tensor(6)
+    engine.begin_step()
+    accumulation = engine.accumulate_results(
+        (
+            StepResult(
+                engine.forward_backward_dense(
+                    inputs, labels, extra_kwargs={}, global_valid_tokens=denominator
+                ),
+                int((labels != -100).sum()),
+                denominator,
+            )
+            for inputs, labels in zip(tokens, targets, strict=True)
+        ),
+        retain_loss=collect_metrics,
+    )
+    loss = sum(
+        cross_entropy_loss(reference(inputs), labels)
+        for inputs, labels in zip(tokens, targets, strict=True)
+    )
+    (loss / denominator).backward()
+    unclipped = [parameter.grad.clone() for parameter in reference.parameters()]
+    norm = torch.nn.utils.clip_grad_norm_(
+        reference.parameters(),
+        max_norm if max_norm > 0 else float("inf"),
+        foreach=True,
+    )
+    observations = []
+
+    def before_clipping():
+        for parameter, expected in zip(model.parameters(), unclipped, strict=True):
+            torch.testing.assert_close(parameter.grad, expected)
+        observations.append("unclipped")
+
+    def routing():
+        assert observations == ["unclipped"]
+        for parameter, expected in zip(
+            model.parameters(), reference.parameters(), strict=True
+        ):
+            torch.testing.assert_close(parameter.grad, expected.grad)
+        observations.append("routing")
+        return {"routing/load": 3.0}
+
+    monkeypatch.setattr(TrainingEngine, "routing_metrics", lambda self: routing())
+    update = engine.finish_step(
+        1,
+        accumulation=accumulation,
+        reduction_meshes=resolve_training_reduction_meshes(None),
+        collect_metrics=collect_metrics,
+        before_gradient_clipping=before_clipping,
+    )
+    optimizer.step()
+    scheduler.step()
+
+    torch.testing.assert_close(update.grad_norm, norm)
+    torch.testing.assert_close(model.state_dict(), reference.state_dict())
+    torch.testing.assert_close(engine.optimizer.state_dict(), optimizer.state_dict())
+    assert engine.lr_scheduler.state_dict() == scheduler.state_dict()
+    assert observations == ["unclipped"] + (["routing"] if collect_metrics else [])
+    assert dict(update.auxiliary_metrics) == (
+        {"routing/load": 3.0} if collect_metrics else {}
+    )
+
+
+@pytest.mark.parametrize("failure", ["loss", "gradient", "hook"])
+def test_finish_step_failure_does_not_advance_training_services(failure):
+    model = ToyCausalModel()
+    original = deepcopy(model.state_dict())
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    if failure == "gradient":
+        next(model.parameters()).grad.fill_(float("inf"))
+    engine = build_engine(model)
+    updates = []
+    engine.optimizer = SimpleNamespace(step=lambda: updates.append("optimizer"))
+    engine.lr_scheduler = SimpleNamespace(step=lambda: updates.append("scheduler"))
+    engine.ema = SimpleNamespace(step=lambda step: updates.append("ema"))
+
+    def before_clipping():
+        if failure == "hook":
+            raise RuntimeError("diagnostic failure")
+
+    with pytest.raises(RuntimeError, match="diagnostic failure|not finite"):
+        engine.finish_step(
+            1,
+            accumulation=AccumulationResult(
+                None, torch.tensor(failure != "loss", dtype=torch.int32)
+            ),
+            reduction_meshes=resolve_training_reduction_meshes(None),
+            collect_metrics=False,
+            before_gradient_clipping=before_clipping,
+        )
+
+    assert updates == []
+    torch.testing.assert_close(model.state_dict(), original, rtol=0, atol=0)
 
 
 def test_engine_accumulation_weights_unequal_valid_target_counts() -> None:

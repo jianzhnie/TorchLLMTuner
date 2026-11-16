@@ -11,7 +11,6 @@ from tests.caps import require_env
 require_env("flex_attention", "spmd_types")
 
 
-from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -37,7 +36,6 @@ from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
 )
 from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
 from llmtuner.parallel.fully_shard_parallel.pattern import set_fsdp_prefetch_windows
-from llmtuner.parallel.fully_shard_parallel.plan import resolve_pipeline_fsdp_configs
 from llmtuner.parallel.replacements import ReplacementMap
 
 _VOCAB = 32
@@ -267,7 +265,6 @@ def test_decoder_fsdp_rejects_unknown_implementation_before_model_access(
             None,
             param_dtype=torch.float32,
             reduce_dtype=torch.float32,
-            pp_enabled=False,
             fsdp_implementation=implementation,
         )
 
@@ -323,44 +320,6 @@ def test_hsdp_cp_mesh_reuses_existing_groups(monkeypatch):
     assert selections == [("dp_shard", "cp"), "dp_replicate"]
 
 
-@pytest.mark.parametrize("tied", [False, True])
-@pytest.mark.parametrize("first_stage", [False, True])
-def test_decoder_fsdp_excludes_pipeline_identity_boundaries(
-    monkeypatch, tied, first_stage
-):
-    model = nn.Module()
-    model.decoder_structure = DecoderStructure(
-        decoder="",
-        embedding="tok_embeddings",
-        blocks="layers",
-        norm="norm",
-        head="lm_head",
-    )
-    model.enable_weight_tying = tied
-    model.tok_embeddings = nn.Embedding(8, 4) if first_stage else nn.Identity()
-    model.norm = nn.Identity() if first_stage else nn.LayerNorm(4)
-    model.lm_head = nn.Identity() if first_stage else nn.Linear(4, 8)
-    model.layers = nn.ModuleList([nn.Linear(4, 4)])
-    calls = []
-    monkeypatch.setattr(
-        apply, "fully_shard", lambda modules, **kwargs: calls.append(modules)
-    )
-    monkeypatch.setattr(apply, "enable_fsdp_symm_mem", lambda *args: None)
-    monkeypatch.setattr(apply, "disable_fsdp_gradient_division", lambda *args: None)
-    apply.apply_fsdp_to_decoder(
-        model,
-        SimpleNamespace(mesh_dim_names=("dp_shard",)),
-        param_dtype=torch.float32,
-        reduce_dtype=torch.float32,
-        pp_enabled=True,
-    )
-    boundary = calls[0] if isinstance(calls[0], list) else [calls[0]]
-    expected = [model.tok_embeddings] if first_stage else [model.norm, model.lm_head]
-    assert boundary == expected
-    assert calls[1:] == [model.layers[0], model]
-    assert all(type(module) is not nn.Identity for module in boundary)
-
-
 def build_model(*, tied: bool = False) -> Qwen3MoeForCausalLM:
     config = build_model_config(
         "qwen3_moe",
@@ -399,7 +358,6 @@ def test_chunked_boundaries_and_actual_aliases_are_owned_by_root(
         SimpleNamespace(mesh_dim_names=("dp_shard",)),
         param_dtype=torch.float32,
         reduce_dtype=torch.float32,
-        pp_enabled=False,
         root_owned_boundaries=True,
     )
     expected_layers = list(model.layers)[1:] if shared_layer else list(model.layers)
@@ -424,7 +382,6 @@ def test_decoder_keeps_a_root_alias_to_a_layer_child_in_the_root_state(monkeypat
         SimpleNamespace(mesh_dim_names=("dp_shard",)),
         param_dtype=torch.float32,
         reduce_dtype=torch.float32,
-        pp_enabled=False,
     )
     assert all(module is not model.layers[0] for module, _ in calls[:-1])
     assert calls[-1][0] == [model.layers[0], model]
@@ -613,7 +570,6 @@ def test_separate_dtype_policy_uses_model_storage_dtype(monkeypatch, dtype):
         Mesh(),
         param_dtype=torch.float32,
         reduce_dtype=torch.float32,
-        pp_enabled=False,
     )
     policies = [options["mp_policy"] for module, options in calls if module is block]
     assert len(policies) == 1
@@ -638,7 +594,6 @@ def test_invalid_separate_parameter_contract_fails_before_sharding(monkeypatch, 
             object(),
             param_dtype=torch.float32,
             reduce_dtype=torch.float32,
-            pp_enabled=False,
         )
     assert model.scale is original
 
@@ -664,7 +619,6 @@ def test_separate_dtype_subtree_rejects_external_parameter_alias(monkeypatch, al
             object(),
             param_dtype=torch.float32,
             reduce_dtype=torch.float32,
-            pp_enabled=False,
         )
     assert model.external is parameter
 
@@ -687,7 +641,6 @@ def test_separate_dtype_nested_declarations_fail_before_sharding(monkeypatch):
             object(),
             param_dtype=torch.float32,
             reduce_dtype=torch.float32,
-            pp_enabled=False,
         )
 
 
@@ -729,7 +682,6 @@ def test_expert_placement_conflict_precedes_separate_dtype_sharding(monkeypatch)
             Mesh(),
             param_dtype=torch.float32,
             reduce_dtype=torch.float32,
-            pp_enabled=False,
         )
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
 
@@ -1368,154 +1320,6 @@ def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
     assert calls[1][1]["mp_policy"] is not override_policy
 
 
-@pytest.mark.parametrize("placeholder", [False, True])
-def test_pipeline_fsdp_rebinds_unit_and_hook_through_retained_alias(placeholder):
-    source = nn.Linear(2, 2)
-    model = nn.ModuleDict({"first": source, "alias": source})
-    part = deepcopy(model)
-    if placeholder:
-        part["first"] = nn.Identity()
-    else:
-        del part["first"]
-    cfg = ParallelConfig(
-        fsdp_config=FSDPConfig(
-            fsdp_apply_modules={
-                "first": {"hook_module": source, "ignored_params": {source.bias}}
-            }
-        )
-    )
-    bound = resolve_pipeline_fsdp_configs(model, [part], cfg)[0].fsdp_config
-    assert set(bound.fsdp_apply_modules) == {"alias"}
-    options = bound.fsdp_apply_modules["alias"]
-    assert options["hook_module"] is part["alias"]
-    assert options["ignored_params"] == {part["alias"].bias}
-    assert cfg.fsdp_config.fsdp_apply_modules["first"]["hook_module"] is source
-
-
-def test_pipeline_fsdp_preserves_ignored_module_through_retained_alias():
-    shared = nn.Linear(2, 2)
-    model = nn.ModuleDict({"first": shared, "alias": shared})
-    part = deepcopy(model)
-    del part["first"]
-    cfg = ParallelConfig(
-        fsdp_config=FSDPConfig(
-            fsdp_apply_modules={"": {}}, fsdp_ignored_modules=["first"]
-        )
-    )
-    bound = resolve_pipeline_fsdp_configs(model, [part], cfg)[0].fsdp_config
-    assert bound.fsdp_ignored_modules == ["alias"]
-
-
-@pytest.mark.parametrize("kind", ["module", "parameter"])
-def test_pipeline_fsdp_rejects_broken_local_alias_ownership(kind):
-    first = nn.Linear(2, 2)
-    second = first if kind == "module" else nn.Linear(2, 2)
-    if kind == "parameter":
-        second.weight = first.weight
-    model = nn.ModuleDict({"first": first, "second": second})
-    part = deepcopy(model)
-    if kind == "module":
-        part["second"] = deepcopy(part["first"])
-        options = {"first": {}}
-    else:
-        part["second"].weight = nn.Parameter(part["second"].weight.detach().clone())
-        options = {"": {"ignored_params": {first.weight}}}
-    cfg = ParallelConfig(fsdp_config=FSDPConfig(fsdp_apply_modules=options))
-    before = tuple(part.parameters())
-    with pytest.raises(ValueError, match=f"{kind} aliases no longer share one owner"):
-        resolve_pipeline_fsdp_configs(model, [part], cfg)
-    assert all(a is b for a, b in zip(before, part.parameters(), strict=True))
-
-
-@pytest.mark.parametrize("pipeline", [False, True])
-@pytest.mark.parametrize("stale", [False, True])
-def test_fsdp_rejects_foreign_or_stale_exclusions_before_rebinding(pipeline, stale):
-    from llmtuner.parallel.fully_shard_parallel.plan import (
-        resolve_pipeline_fsdp_configs,
-        validate_fsdp_pattern_options,
-    )
-
-    model = nn.Sequential(nn.Linear(2, 2))
-    excluded = model[0].weight if stale else nn.Parameter(torch.ones(2, 2))
-    if stale:
-        model[0].weight = nn.Parameter(model[0].weight.detach().clone())
-    parameter = model[0].weight
-    value = parameter.detach().clone()
-    options = {"0": {"ignored_params": {excluded}}}
-    cfg = ParallelConfig(fsdp_config=FSDPConfig(fsdp_apply_modules=options))
-    with pytest.raises(ValueError, match="not registered in the model"):
-        if pipeline:
-            resolve_pipeline_fsdp_configs(model, [model], cfg)
-        else:
-            validate_fsdp_pattern_options(
-                dict(model.named_modules()), options, implementation="native"
-            )
-    assert model[0].weight is parameter
-    torch.testing.assert_close(parameter, value, rtol=0, atol=0)
-    assert options["0"]["ignored_params"] == {excluded}
-
-
-def test_pipeline_exclusions_filter_other_stage_ownership_and_preserve_aliases():
-    import copy
-
-    from llmtuner.parallel.fully_shard_parallel.plan import (
-        resolve_pipeline_fsdp_configs,
-    )
-
-    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
-    model[0].register_parameter("alias", model[0].weight)
-    part = copy.deepcopy(model)
-    part._modules.pop("1")
-    exclusions = {model[0].weight, model[1].weight}
-    cfg = ParallelConfig(
-        fsdp_config=FSDPConfig(fsdp_apply_modules={"0": {"ignored_params": exclusions}})
-    )
-    result = resolve_pipeline_fsdp_configs(model, [part], cfg)
-    local_exclusions = result[0].fsdp_config.fsdp_apply_modules["0"]["ignored_params"]
-    assert local_exclusions == {part[0].weight}
-    assert part[0].alias is part[0].weight
-    assert cfg.fsdp_config.fsdp_apply_modules["0"]["ignored_params"] == exclusions
-
-
-def test_pipeline_patterns_rebind_copied_hooks_and_excluded_parameters():
-    import copy
-
-    from llmtuner.parallel.fully_shard_parallel.plan import (
-        resolve_pipeline_fsdp_configs,
-    )
-
-    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
-    first, second = copy.deepcopy(model), copy.deepcopy(model)
-    first._modules.pop("1")
-    second._modules.pop("0")
-    mesh = object()
-    cfg = ParallelConfig(
-        fsdp_config=FSDPConfig(
-            fsdp_implementation="custom",
-            fsdp_apply_modules={
-                "0": {
-                    "hook_module": model,
-                    "mesh": mesh,
-                    "ignored_params": {model[0].bias},
-                }
-            },
-        )
-    )
-    configs = resolve_pipeline_fsdp_configs(model, [first, second], cfg)
-    options = configs[0].fsdp_config.fsdp_apply_modules["0"]
-    assert options["hook_module"] is first
-    assert options["mesh"] is mesh
-    assert options["ignored_params"] == {first[0].bias}
-    assert configs[1].fsdp_config.fsdp_apply_modules == {"": {}}
-    from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
-
-    _, units, _ = _resolve_pattern_units(
-        tuple(second.named_modules(remove_duplicate=False)), configs[1]
-    )
-    assert units == {"": {}}
-    assert cfg.fsdp_config.fsdp_apply_modules["0"]["hook_module"] is model
-
-
 @pytest.mark.parametrize("recompute", [False, True])
 def test_custom_fsdp_recompute_enters_backward_lifecycle(monkeypatch, recompute):
     require_env("fine_grained_fsdp")
@@ -1542,16 +1346,6 @@ def test_custom_fsdp_recompute_enters_backward_lifecycle(monkeypatch, recompute)
     finally:
         in_checkpoint_recompute.reset(token)
     assert seen == [TrainingState.PRE_BACKWARD if recompute else TrainingState.IDLE]
-
-
-def test_pipeline_patterns_reject_globally_unmatched_units():
-    from llmtuner.parallel.fully_shard_parallel.plan import (
-        resolve_pipeline_fsdp_configs,
-    )
-
-    cfg = ParallelConfig(fsdp_config=FSDPConfig(fsdp_apply_modules={"missing": {}}))
-    with pytest.raises(ValueError, match="matched no module"):
-        resolve_pipeline_fsdp_configs(nn.Sequential(nn.Linear(2, 2)), [], cfg)
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -1676,10 +1470,10 @@ def test_ignored_fsdp_module_excludes_its_descendants():
 
 
 @pytest.mark.parametrize(
-    "policy, pp, expected",
-    [("never", 1, False), ("always", 2, True), ("default", 2, False)],
+    "policy, expected",
+    [("never", False), ("always", True), ("default", True)],
 )
-def test_fsdp_patterns_honor_runtime_policies(monkeypatch, policy, pp, expected):
+def test_fsdp_patterns_honor_runtime_policies(monkeypatch, policy, expected):
     from llmtuner.config import ParallelConfig
     from llmtuner.parallel.fully_shard_parallel import plan
 
@@ -1690,7 +1484,6 @@ def test_fsdp_patterns_honor_runtime_policies(monkeypatch, policy, pp, expected)
         pattern, "set_fsdp_prefetch_windows", lambda *args, **kwargs: None
     )
     cfg = ParallelConfig(
-        pipeline_parallel_size=pp,
         fsdp_config=FSDPConfig(
             fsdp_apply_modules={"0": {}},
             fsdp_reshard_after_forward=policy,

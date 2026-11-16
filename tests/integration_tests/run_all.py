@@ -136,11 +136,9 @@ def main() -> int:
         cmd = launch_command(script, args.master_port)
         print(f"=== {' '.join(cmd)}", flush=True)
         start = time.monotonic()
-        if script.stem in {"pp_checkpoint_equivalence", "async_snapshot_equivalence"}:
+        if script.stem in {"async_snapshot_equivalence"}:
             # Separate processes must share the same checkpoint and trajectory.
-            with tempfile.TemporaryDirectory(
-                prefix="llmtuner-pp-checkpoint-"
-            ) as folder:
+            with tempfile.TemporaryDirectory(prefix="llmtuner-checkpoint-") as folder:
                 proc = subprocess.run([*cmd, "full", folder], cwd=REPO_ROOT, env=env)
                 if proc.returncode == 0:
                     proc = subprocess.run(

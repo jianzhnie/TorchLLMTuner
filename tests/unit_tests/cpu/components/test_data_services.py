@@ -37,7 +37,7 @@ def test_validation_loader_uses_explicit_batch_ownership(monkeypatch, steps):
         requested_axes.append((axis, include_singleton_axes))
         return SimpleNamespace(get_local_rank=lambda: 1, size=lambda: 2)
 
-    topology = SimpleNamespace(pp_enabled=True, get_optional_mesh=mesh)
+    topology = SimpleNamespace(get_optional_mesh=mesh)
     calls = []
     loader = object()
 
@@ -51,7 +51,7 @@ def test_validation_loader_uses_explicit_batch_ownership(monkeypatch, steps):
         validation_runtime.create_validation_dataloader(cfg, topology, validation)
         is loader
     )
-    assert requested_axes == [("batch", True)]
+    assert requested_axes == [("dp", True)]
     assert calls == [
         (
             cfg,

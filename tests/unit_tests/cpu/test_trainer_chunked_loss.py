@@ -15,7 +15,7 @@ from copy import deepcopy
 
 from tests.caps import require_env
 
-require_env("dtensor", "pipelining", "spmd_types")
+require_env("dtensor", "spmd_types")
 
 
 import pytest

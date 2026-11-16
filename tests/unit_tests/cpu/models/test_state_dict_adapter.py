@@ -61,38 +61,6 @@ def test_composite_checkpoint_uses_text_weight_ties(text_tied):
             adapter.to_hf(imported)
 
 
-@pytest.mark.parametrize("complete", [False, True])
-def test_hf_index_checks_global_pipeline_keys(monkeypatch, complete):
-    import llmtuner.components.checkpointer.model_state as adapter_module
-
-    adapter = ModelStateDictAdapter(SimpleNamespace(tie_word_embeddings=False), None)
-    adapter._hf_keys = {"model.layers.0.weight", "model.layers.1.weight"}
-    local_weight = torch.randn(2, 2)
-    local = {"model.layers.0.weight": local_weight}
-    # This unit test supplies only the key-gather result, not a process group.
-    # Real error coordination is exercised by hf_adapter_coordination.py.
-    from contextlib import nullcontext
-
-    monkeypatch.setattr(
-        adapter_module, "synchronize_local_errors", lambda phase, **kw: nullcontext()
-    )
-    monkeypatch.setattr(adapter_module.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(adapter_module.dist, "get_world_size", lambda group=None: 2)
-
-    def gather(outputs, keys, *, group=None):
-        outputs[0] = keys
-        outputs[1] = {"model.layers.1.weight"} if complete else set()
-
-    monkeypatch.setattr(adapter_module.dist, "all_gather_object", gather)
-    if complete:
-        exported = adapter.to_hf(local)
-        assert set(exported) == {"model.layers.0.weight"}
-        assert exported["model.layers.0.weight"] is local_weight
-    else:
-        with pytest.raises(ValueError, match="missing=.*model.layers.1.weight"):
-            adapter.to_hf(local)
-
-
 def test_hf_index_still_rejects_missing_keys_without_distributed():
     adapter = ModelStateDictAdapter(SimpleNamespace(tie_word_embeddings=False), None)
     adapter._hf_keys = {"model.layers.0.weight", "model.layers.1.weight"}

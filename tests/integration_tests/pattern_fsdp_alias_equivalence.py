@@ -83,7 +83,6 @@ def main():
                 mesh,
                 param_dtype=torch.float32,
                 reduce_dtype=torch.float32,
-                pp_enabled=False,
             )
             assert model.external is model.layers[0][0]
             # Native fully_shard collapses ancestor/descendant groups to the

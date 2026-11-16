@@ -33,7 +33,6 @@ from llmtuner.config import (
     ModelConfig,
     TrainingConfig,
 )
-from llmtuner.config.parallel_config import PipelineParallelConfig
 from llmtuner.datasets import (
     DatasetConcat,
     DatasetMix,
@@ -1735,104 +1734,6 @@ def test_dataloader_arguments_build_a_grain_loader_over_a_local_corpus(
     loader.close()
 
 
-@pytest.mark.parametrize("packing", ["concat_then_split", "first_fit"])
-@pytest.mark.parametrize("max_num_documents", [None, 1])
-def test_pipeline_loader_matches_independently_packed_microbatches(
-    tmp_path, corpus, packing, max_num_documents
-):
-    from llmtuner.config import ParallelConfig
-
-    tokenizer_path = str(tmp_path / "tokenizer")
-    write_tokenizer(tokenizer_path)
-    cfg = _loader_config(
-        DataloaderConfig(
-            dataset="local_jsonl",
-            tokenizer_path=tokenizer_path,
-            dataset_path=corpus,
-            packing=packing,
-            max_num_documents=max_num_documents,
-            shuffle=False,
-        )
-    )
-    reference = build_dataloader(
-        cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16
-    )
-    cfg.parallel = ParallelConfig(
-        pipeline_parallel_size=2,
-        pp_config=PipelineParallelConfig(num_pp_microbatches=2),
-    )
-    pipeline = build_dataloader(
-        cfg, dp_rank=0, dp_world_size=1, num_tokens_per_batch=32
-    )
-    try:
-        for _ in range(3):
-            batch = next(iter(pipeline))
-            expected = [next(iter(reference)) for _ in range(2)]
-            assert batch["input"].shape == (2, 16)
-            assert batch["num_valid_tokens"] == sum(
-                row["num_valid_tokens"] for row in expected
-            )
-            for index, row in enumerate(expected):
-                for field in ("input", "labels", "positions", "padding_mask"):
-                    torch.testing.assert_close(batch[field][index], row[field])
-                if max_num_documents == 1:
-                    positions = batch["positions"][index][~batch["padding_mask"][index]]
-                    assert int((positions == 0).sum()) <= 1
-        state = pipeline.state_dict()
-        incompatible = {
-            **state,
-            "batch_layout": {**state["batch_layout"], "num_rows_per_batch": 4},
-        }
-        expected_next = next(iter(pipeline))
-        with pytest.raises(ValueError, match="changing dataloader batch layout"):
-            pipeline.load_state_dict(incompatible)
-        pipeline.load_state_dict(state)
-        resumed = next(iter(pipeline))
-        for field in ("input", "labels", "positions", "padding_mask"):
-            torch.testing.assert_close(resumed[field], expected_next[field])
-    finally:
-        reference.close()
-        pipeline.close()
-
-
-@pytest.mark.parametrize("max_context_length", [3, 16])
-@pytest.mark.parametrize("num_microbatches", [2, 4])
-def test_pipeline_collator_pads_a_finite_partial_schedule_without_repeating_tokens(
-    tokenizer,
-    max_context_length,
-    num_microbatches,
-):
-    from dataclasses import replace
-
-    from llmtuner.datasets.collators import PipelineTextCollator
-
-    context = replace(
-        make_context(tokenizer),
-        num_tokens_per_batch=8 * num_microbatches,
-        max_context_length=max_context_length,
-    )
-    collator = PipelineTextCollator(context=context, num_microbatches=num_microbatches)
-    row = TextSequence(
-        input_ids=np.asarray([1, 2, 3]), labels=np.asarray([2, 3, IGNORE_INDEX])
-    )
-    batch = collator([row])
-    assert batch["input"].shape == (num_microbatches, 8)
-    assert batch["num_valid_tokens"] == 2
-    assert batch["input"][0, :3].tolist() == [1, 2, 3]
-    assert batch["padding_mask"][1:].all()
-    assert (batch["labels"][1:] == IGNORE_INDEX).all()
-    assert batch["input"][1:].eq(0).all()
-    torch.testing.assert_close(
-        batch["positions"][1], torch.arange(8) % max_context_length
-    )
-    assert int((~batch["padding_mask"]).sum()) == 3
-    np.testing.assert_array_equal(row.labels, [2, 3, IGNORE_INDEX])
-    # Reusing the empty source batch must not alias the stacked output rows.
-    batch["input"][1].fill_(9)
-    assert batch["input"][2:].eq(0).all()
-    assert batch["input"][0, :3].tolist() == [1, 2, 3]
-
-
 @pytest.mark.parametrize(
     ("selector", "expected"),
     [
@@ -2355,27 +2256,6 @@ def test_loader_checks_iteration_before_loading_assets(
             num_tokens_per_batch=16,
             repeat=repeat,
         )
-
-
-def test_loader_checks_pipeline_budget_before_loading_tokenizer(monkeypatch):
-    from types import SimpleNamespace
-
-    from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
-    from llmtuner.datasets.loader_builder import build_dataloader
-
-    def unexpected_tokenizer(*args, **kwargs):
-        pytest.fail("invalid pipeline token budget must fail before asset loading")
-
-    monkeypatch.setattr(HuggingFaceTokenizer, "__init__", unexpected_tokenizer)
-    config = SimpleNamespace(
-        dataloader=SimpleNamespace(dataset="local_jsonl"),
-        max_seq_len=16,
-        parallel=SimpleNamespace(
-            pipeline_parallel_size=2, pp_config=SimpleNamespace(num_pp_microbatches=3)
-        ),
-    )
-    with pytest.raises(ValueError, match="divisible by num_pp_microbatches"):
-        build_dataloader(config, dp_rank=0, dp_world_size=1, num_tokens_per_batch=16)
 
 
 @pytest.mark.parametrize("state", [None, {}, {"epoch": 0}, {"epoch": 0, "hf": None}])

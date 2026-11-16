@@ -106,11 +106,11 @@ def main():
     if device_type != "cpu":
         raise RuntimeError("This CLI checkpoint check requires a CPU-only environment")
     modes = set(sys.argv[1:])
-    if modes - {"dp2", "pp2", "custom", "async", "ac", "profile", "seed", "first_fit"}:
+    if modes - {"dp2", "custom", "async", "ac", "profile", "seed", "first_fit"}:
         raise ValueError(f"Unknown options: {sorted(modes)}")
-    world_size = 4 if "pp2" in modes else 2 if "dp2" in modes else 1
+    world_size = 2 if "dp2" in modes else 1
     dp_size = 2 if world_size > 1 else 1
-    global_batch = 8 if "pp2" in modes else 2
+    global_batch = 2
     root = Path(mkdtemp(prefix="llmtuner-cli-resume-"))
     print(f"Artifacts: {root}", flush=True)
     command = [sys.executable, "-m", "llmtuner"]
@@ -119,7 +119,7 @@ def main():
         "vocab_size": 32,
         "hidden_size": 16,
         "intermediate_size": 32,
-        "num_hidden_layers": 6 if "pp2" in modes else 2,
+        "num_hidden_layers": 2,
         "num_attention_heads": 2,
         "num_key_value_heads": 2,
         "max_seq_len": 8,
@@ -157,12 +157,6 @@ def main():
         )
     if world_size > 1:
         options["data_parallel_shard_size"] = dp_size
-    if "pp2" in modes:
-        options.update(
-            pipeline_parallel_size=2,
-            pipeline_parallel_schedule="Interleaved1F1B",
-            num_pp_microbatches=4,
-        )
     if "custom" in modes:
         options["fsdp_implementation"] = "custom"
     if "async" in modes:
@@ -183,9 +177,6 @@ def main():
         for name, value in options.items():
             if name not in {
                 "data_parallel_shard_size",
-                "pipeline_parallel_size",
-                "pipeline_parallel_schedule",
-                "num_pp_microbatches",
             }:
                 seed_command.extend((f"--{name}", str(value)))
         with (root / "seed.log").open("w") as log:

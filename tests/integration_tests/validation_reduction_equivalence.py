@@ -83,7 +83,6 @@ def main():
         for axis in ("cp", "tp"):
             mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", axis))
             topology = SimpleNamespace(
-                pp_enabled=False,
                 spmd_dense_mesh=lambda mesh=mesh: mesh,
                 spmd_sparse_mesh=lambda: None,
                 dp_cp_enabled=True,

@@ -131,7 +131,6 @@ def test_rows_reject_with_their_entry_type() -> None:
             (),
             "infinite synthetic",
         ),
-        (compatibility.chunked_loss_pp, (2, 2), "chunked_loss_num_chunks=2"),
         (compatibility.ep_hf_initial_load, (2,), "initial_load_in_hf"),
         (compatibility.chunked_loss_validation, (2,), "chunked_loss_num_chunks=2"),
         (compatibility.chunked_loss_fsdp, (2,), "chunked_loss_num_chunks=2"),
@@ -145,7 +144,6 @@ def test_rows_reject_with_their_entry_type() -> None:
         (compatibility.quantile_no_group_limit, (_Block(),), "group-limited"),
         (compatibility.shared_expert_gate, (_Block(),), "shared_expert_gate"),
         (compatibility.shared_expert_tp_ep, (_Block(),), "tp x ep"),
-        (compatibility.pp_packed_microbatch_split, (2,), "packed"),
     ]
     assert len(cases) == len(compatibility.ENTRIES)
     for fn, args, match in cases:

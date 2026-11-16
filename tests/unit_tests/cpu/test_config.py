@@ -13,15 +13,10 @@ test cannot pass by the constructor rejecting everything.
 
 from __future__ import annotations
 
-from tests.caps import require_env, skip_without
-
 # ``ParallelConfig.__post_init__`` imports ``torch.distributed.pipelining`` to
 # validate the schedule name, so *every* config construction needs it -- that,
 # not DTensor, is this module's hard dependency. The two tests that also read
 # the checkpointer's state keys carry their own ``dcp`` guard below.
-require_env("pipelining")
-
-
 import re
 import subprocess
 import sys
@@ -50,9 +45,9 @@ from llmtuner.config.cli_config import PARSER_GROUPS, PROGRAMMATIC_ONLY, cli_vie
 from llmtuner.config.parallel_config import (
     ContextParallelConfig,
     FSDPConfig,
-    PipelineParallelConfig,
     TensorParallelConfig,
 )
+from tests.caps import skip_without
 
 
 def test_cli_view_rejects_class_variables_in_hidden_fields(monkeypatch):
@@ -117,7 +112,6 @@ def test_cli_config_parsing_does_not_require_training_engine():
     [
         "data_parallel_replicate_size",
         "tensor_parallel_size",
-        "pipeline_parallel_size",
         "context_parallel_kv_allgather_size",
         "expert_parallel_size",
     ],
@@ -165,26 +159,6 @@ def test_tp_config_accepts_distinct_pattern_styles() -> None:
 def test_dp_shard_requires_an_integer(value) -> None:
     with pytest.raises(ConfigError, match="data_parallel_shard_size"):
         ParallelConfig(data_parallel_shard_size=value)
-
-
-@pytest.mark.parametrize(
-    "field",
-    [
-        "fsdp_forward_prefetch_count",
-        "fsdp_backward_prefetch_count",
-        "train_timeout_seconds",
-    ],
-)
-@pytest.mark.parametrize("value", [True, 1.5, float("nan"), "2", None, -1])
-def test_parallel_runtime_counts_require_valid_integers(field, value) -> None:
-    with pytest.raises(ConfigError, match=field):
-        (
-            FSDPConfig(**{field: value})
-            if field.startswith("fsdp_")
-            else PipelineParallelConfig(**{field: value})
-            if field == "num_pp_microbatches"
-            else ParallelConfig(**{field: value})
-        )
 
 
 def test_fsdp_prefetch_allows_zero_and_explicit_windows() -> None:
@@ -338,14 +312,6 @@ def test_symmetric_memory_is_rejected_off_a_supported_device() -> None:
     """On a machine without the capability there is no silent fallback to catch."""
     with pytest.raises(ValueError, match="compute capability 9.0"):
         ParallelConfig(fsdp_config=FSDPConfig(enable_fsdp_symm_mem=True))
-
-
-def test_an_unknown_pipeline_schedule_is_rejected() -> None:
-    """``get_schedule_class`` is the authority; the error names the bad value."""
-    with pytest.raises(ValueError, match="Invalid parallel.pipeline_parallel_schedule"):
-        ParallelConfig(
-            pp_config=PipelineParallelConfig(pipeline_parallel_schedule="NotASchedule")
-        )
 
 
 # -- LRSchedulerConfig -------------------------------------------------------
@@ -667,13 +633,6 @@ def test_optimizer_scalar_ranges() -> None:
     with pytest.raises(ConfigError, match="eps"):
         OptimizerConfig(eps=0.0)
     OptimizerConfig(learning_rate=0.0)  # legal: a frozen run is a choice
-
-
-def test_num_pp_microbatches_and_gc_freq_have_floors() -> None:
-    with pytest.raises(ConfigError, match="num_pp_microbatches"):
-        ParallelConfig(pp_config=PipelineParallelConfig(num_pp_microbatches=0))
-    with pytest.raises(ConfigError, match="gc_freq"):
-        TrainingConfig(gc_freq=0)
 
 
 def test_profiler_and_dataloader_scalars_have_floors() -> None:
@@ -1002,30 +961,6 @@ def test_validation_config_rejects_non_integer_step_controls(field, value):
 
     with pytest.raises(ConfigError, match=f"validation.{field}"):
         ValidationConfig(**{field: value})
-
-
-@pytest.mark.parametrize(
-    "field",
-    [
-        "tensor_parallel_size",
-        "pipeline_parallel_size",
-        "num_pp_microbatches",
-        "context_parallel_kcp_size",
-        "context_parallel_ulysses_size",
-        "context_parallel_kv_allgather_size",
-        "expert_parallel_size",
-    ],
-)
-@pytest.mark.parametrize("value", [True, 1.5, "2", None])
-def test_parallel_integer_degrees_reject_non_integer_values(field, value):
-    with pytest.raises(ConfigError, match=f"parallel.{field}"):
-        (
-            FSDPConfig(**{field: value})
-            if field.startswith("fsdp_")
-            else PipelineParallelConfig(**{field: value})
-            if field == "num_pp_microbatches"
-            else ParallelConfig(**{field: value})
-        )
 
 
 @pytest.mark.parametrize(

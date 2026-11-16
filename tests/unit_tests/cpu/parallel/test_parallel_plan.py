@@ -1,6 +1,5 @@
 """The minimal immutable plan shared by resolution and execution."""
 
-from copy import deepcopy
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -9,7 +8,6 @@ from torch import nn
 
 from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel import ParallelPlan, PlanTarget
-from llmtuner.parallel.pipeline_parallel.ownership import PipelineOwnership
 from llmtuner.parallel.plan import snapshot_model_bindings
 
 
@@ -423,61 +421,46 @@ def test_plan_accepts_unchanged_bound_forward_and_inplace_weight_update():
     plan.validate_binding(model)
 
 
-def test_pipeline_uses_resolved_parameter_alias_snapshots() -> None:
-    whole = nn.Module()
-    whole.first = nn.Parameter(torch.empty(2))
-    whole.second = whole.first
-    local = deepcopy(whole)
+@pytest.mark.parametrize("replacement", ["instance", "class", "receiver"])
+def test_targeted_plan_rejects_changed_nested_forward(monkeypatch, replacement):
+    """A live target can keep its identity while a nested operator changes math."""
 
-    def plan(model):
-        return ParallelPlan(
-            stage="tp",
-            targets=(),
-            degree=2,
-            implementation="functional",
-            **snapshot_model_bindings(model),
-        )
+    class Projection(nn.Linear):
+        pass
 
-    PipelineOwnership(plan(whole), plan(local)).validate_aliases()
-    local.second = nn.Parameter(torch.empty(2))
-    with pytest.raises(ValueError, match="Pipeline parameter alias ownership changed"):
-        PipelineOwnership(plan(whole), plan(local)).validate_aliases()
+    model = nn.Sequential(nn.Sequential(Projection(3, 4)))
+    plan = ParallelPlan(
+        "ep",
+        (PlanTarget("0", "moe", model[0]),),
+        2,
+        "alltoall",
+        **snapshot_model_bindings(model),
+    )
+    parameters = tuple(model.parameters())
+    rng = torch.get_rng_state().clone()
+    if replacement == "instance":
+        monkeypatch.setattr(model[0][0], "forward", lambda inputs: inputs)
+    elif replacement == "class":
+        monkeypatch.setattr(Projection, "forward", lambda self, inputs: inputs)
+    else:
+        monkeypatch.setattr(model[0][0], "forward", model.forward)
 
+    with pytest.raises(ValueError, match="Stale plan forward binding: 0.0"):
+        plan.validate_binding(model)
 
-@pytest.mark.parametrize("initially_shared", [False, True])
-def test_pipeline_rejects_changed_parameterless_module_aliases(initially_shared):
-    whole = nn.ModuleDict({"first": nn.ReLU(), "second": nn.ReLU()})
-    if initially_shared:
-        whole["second"] = whole["first"]
-    local = deepcopy(whole)
-    local["second"] = nn.ReLU() if initially_shared else local["first"]
-
-    def plan(model):
-        return ParallelPlan(
-            stage="cp",
-            targets=(),
-            degree=2,
-            implementation="test",
-            **snapshot_model_bindings(model),
-        )
-
-    with pytest.raises(ValueError, match="module alias ownership"):
-        PipelineOwnership(plan(whole), plan(local)).validate_aliases()
+    assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert torch.equal(torch.get_rng_state(), rng)
 
 
-def test_pipeline_module_alias_projection_excludes_removed_stage_placeholders():
-    shared = nn.ReLU()
-    whole = nn.ModuleDict({"first": shared, "second": shared, "removed": shared})
-    local = deepcopy(whole)
-    local["removed"] = nn.Identity()
-
-    def plan(model):
-        return ParallelPlan(
-            stage="cp",
-            targets=(),
-            degree=2,
-            implementation="test",
-            **snapshot_model_bindings(model),
-        )
-
-    PipelineOwnership(plan(whole), plan(local)).validate_aliases()
+def test_targeted_plan_accepts_nested_inplace_parameter_update():
+    model = nn.Sequential(nn.Sequential(nn.Linear(3, 4)))
+    plan = ParallelPlan(
+        "tp",
+        (PlanTarget("0", "dense", model[0]),),
+        2,
+        "native",
+        **snapshot_model_bindings(model),
+    )
+    with torch.no_grad():
+        model[0][0].weight.add_(1)
+    plan.validate_binding(model)

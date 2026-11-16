@@ -502,7 +502,6 @@ def build_candidate_30b_config(
             ],
             tensor_parallel_size=baseline["parallelism"]["tensor_parallel_degree"],
             expert_parallel_size=baseline["parallelism"]["expert_parallel_degree"],
-            pipeline_parallel_size=1,
             context_parallel_kv_allgather_size=1,
             fsdp_config=FSDPConfig(
                 fsdp_reduce_dtype="float32",

@@ -16,7 +16,7 @@ from tests.integration_tests.harness import init_distributed
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pp-size", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--pp-size", type=int, choices=(1,), default=1)
     args = parser.parse_args()
     init_distributed()
     module = importlib.import_module(
@@ -29,7 +29,6 @@ def main():
         rank = dist.get_rank()
         cfg = ParallelConfig(
             data_parallel_shard_size=2,
-            pipeline_parallel_size=args.pp_size,
             fsdp_config=FSDPConfig(fsdp_implementation="custom"),
         )
         dims = ParallelTopology.from_config(cfg, world_size=world_size)

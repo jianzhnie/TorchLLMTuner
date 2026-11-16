@@ -35,7 +35,7 @@ def main() -> None:
     torch.manual_seed(7)
     model = TokenModel(16, 8).to(device)
     topology = ParallelTopology(
-        dp_replicate=1, dp_shard=1, cp=1, tp=world, pp=1, ep=1, world_size=world
+        dp_replicate=1, dp_shard=1, cp=1, tp=world, ep=1, world_size=world
     )
     model = apply_tp(
         model,

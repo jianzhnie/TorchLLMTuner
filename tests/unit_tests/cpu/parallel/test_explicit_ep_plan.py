@@ -12,7 +12,6 @@ from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.aux_loss import AuxLoss
 from llmtuner.models.common.moe import layout
-from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.models.qwen.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 from llmtuner.parallel.expert_parallel import model_replacement
@@ -710,18 +709,6 @@ def test_ep_entry_preserves_target_validation_for_partial_plan(
         layer.mlp is not old
         for layer, old in zip(model.layers, old_blocks, strict=True)
     )
-
-
-def test_ep_decoder_binding_requires_only_pp_local_blocks():
-    holder = torch.nn.Module()
-    block = torch.nn.Module()
-    block.moe_block_name = None
-    holder.blocks = torch.nn.ModuleList([block])
-    holder.decoder_structure = DecoderStructure(
-        decoder="", embedding="embedding", blocks="blocks", norm="norm", head="head"
-    )
-    object.__setattr__(holder, "layers", torch.nn.ModuleList())
-    assert tuple(ep_plan.decoder_layers_for_ep(holder)) == (block,)
 
 
 @pytest.mark.parametrize("invalid", ["missing_binding", "layout"])

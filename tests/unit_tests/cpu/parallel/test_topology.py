@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env("spmd_types", "pipelining")
+require_env("spmd_types")
 
 
 import pytest
@@ -29,7 +29,7 @@ from llmtuner.config import LLMTunerConfig, ParallelConfig
 from llmtuner.parallel.topology import ParallelTopology, resolve_parallel_topology
 
 
-@pytest.mark.parametrize("field", ["dp_replicate", "dp_shard", "cp", "tp", "pp", "ep"])
+@pytest.mark.parametrize("field", ["dp_replicate", "dp_shard", "cp", "tp", "ep"])
 @pytest.mark.parametrize("value", [True, 1.0, 1.5, "2"])
 def test_topology_degrees_require_integer_values(field, value):
     values = dict(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1)
@@ -46,7 +46,6 @@ def test_topology_world_size_requires_integer_value(value):
             dp_shard=1,
             cp=1,
             tp=1,
-            pp=1,
             ep=1,
             world_size=value,
         )
@@ -59,7 +58,7 @@ def _config(**parallel_kw) -> LLMTunerConfig:
 @pytest.mark.parametrize("axes", [[], ["tp", "tp"], ["cp", "tp", "cp"]])
 def test_mesh_query_rejects_empty_or_duplicate_axes_before_initialization(axes):
     topology = ParallelTopology(
-        dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1
+        dp_replicate=1, dp_shard=1, cp=1, tp=1, ep=1, world_size=1
     )
     with pytest.raises(ValueError, match="nonempty and unique"):
         topology.get_optional_mesh(axes)
@@ -82,7 +81,7 @@ def test_failed_mesh_build_does_not_publish_partial_caches(
     single_rank_group, monkeypatch
 ):
     topology = ParallelTopology(
-        dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1
+        dp_replicate=1, dp_shard=1, cp=1, tp=1, ep=1, world_size=1
     )
     with monkeypatch.context() as patch:
 
@@ -163,7 +162,7 @@ def test_a_non_positive_size_is_rejected() -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("dp_replicate", 0), ("cp", 0), ("tp", 0), ("pp", 0), ("ep", 0)],
+    [("dp_replicate", 0), ("cp", 0), ("tp", 0), ("ep", 0)],
 )
 def test_every_fixed_degree_must_be_positive(field: str, value: int) -> None:
     with pytest.raises(ValueError, match=rf"{field} must be >= 1"):
@@ -339,10 +338,6 @@ def test_resolve_parallel_topology_rejects_parallel_degrees_at_world_size_1() ->
     with pytest.raises(ValueError, match="world_size=1"):
         resolve_parallel_topology(cfg, world_size=1)
 
-    cfg = _config(pipeline_parallel_size=2)
-    with pytest.raises(ValueError, match="world_size=1"):
-        resolve_parallel_topology(cfg, world_size=1)
-
 
 def test_derive_dp_matches_parallel_dims_resolution() -> None:
     """The config helper and the torchtitan-shaped class must agree.
@@ -423,7 +418,7 @@ def test_topology_snapshot_keeps_resolved_degrees_without_mesh_ownership():
     from llmtuner.parallel.topology import ParallelTopologySnapshot
 
     topology = ParallelTopology(
-        dp_replicate=1, dp_shard=-1, cp=2, tp=2, pp=1, ep=2, world_size=8
+        dp_replicate=1, dp_shard=-1, cp=2, tp=2, ep=2, world_size=8
     )
     snapshot = ParallelTopologySnapshot.capture(topology)
     assert snapshot.dp_shard == 2

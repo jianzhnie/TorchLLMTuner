@@ -100,7 +100,7 @@ def main() -> None:
     half = SEQ // world
 
     parallel_dims = ParallelTopology(
-        dp_replicate=1, dp_shard=1, cp=1, tp=world, pp=1, ep=1, world_size=world
+        dp_replicate=1, dp_shard=1, cp=1, tp=world, ep=1, world_size=world
     )
     mesh = build_device_mesh(parallel_dims)
     cfg = ParallelConfig(tensor_parallel_size=world)

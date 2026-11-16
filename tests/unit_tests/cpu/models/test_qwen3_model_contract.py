@@ -11,7 +11,6 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 )
 
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
-from llmtuner.parallel.expert_parallel.plan import resolve_ep_plan
 
 
 def model_config(**kwargs):
@@ -188,22 +187,3 @@ def test_parallel_contract_checks_norm_and_vocabulary_storage(device, target):
         model.validate_parallel(tp_degree=1, ep_degree=2)
     assert torch.equal(torch.get_rng_state(), rng)
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
-
-
-@pytest.mark.parametrize("first,last", [(True, False), (False, False), (False, True)])
-def test_parallel_contract_validates_only_pipeline_owned_vocabulary(first, last):
-    model = Qwen3MoeForCausalLM(model_config(tie_word_embeddings=False))
-    model.configure_pipeline_stage(first=first, last=last)
-    if not first:
-        model.model.embed_tokens = nn.Identity()
-    if not last:
-        model.model.norm = nn.Identity()
-        model.lm_head = nn.Identity()
-    model.validate_parallel(tp_degree=1, ep_degree=2)
-    plan = resolve_ep_plan(model, degree=2)
-    assert plan.targets and all(target.module is not None for target in plan.targets)
-    if first or last:
-        owned = model.tok_embeddings if first else model.lm_head
-        owned.weight = nn.Parameter(owned.weight[:-1])
-        with pytest.raises(ValueError, match="storage differs from declared geometry"):
-            model.validate_parallel(tp_degree=1, ep_degree=2)

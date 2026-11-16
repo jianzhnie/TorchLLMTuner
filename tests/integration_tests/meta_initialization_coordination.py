@@ -36,7 +36,7 @@ def main():
             else (args.implementation,)
         )
         world_size = dist.get_world_size()
-        assert world_size in (2, 4)
+        assert world_size == 2
         original = assembly.materialize_meta_model
         for implementation in implementations:
             for failing_rank in range(world_size):
@@ -84,12 +84,6 @@ def main():
                             num_experts_per_tok=2,
                             moe_intermediate_size=8,
                         )
-                        if world_size == 4:
-                            cfg.parallel.pipeline_parallel_size = 2
-                            cfg.parallel.pp_config.pipeline_parallel_schedule = (
-                                "Interleaved1F1B"
-                            )
-                            cfg.parallel.pp_config.num_pp_microbatches = 4
                         if compiled:
                             cfg.training.compile = True
                             cfg.training.compile_config = CompileConfig(

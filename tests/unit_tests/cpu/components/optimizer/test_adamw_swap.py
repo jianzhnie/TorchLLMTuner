@@ -435,7 +435,6 @@ def test_cpu_fused_slices_match_native_fused(dtype):
 @pytest.mark.parametrize(
     "degree_name",
     [
-        "pipeline_parallel_size",
         "context_parallel_ulysses_size",
         "tensor_parallel_size",
         "expert_parallel_size",

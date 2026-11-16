@@ -63,7 +63,6 @@ def main() -> None:
             mesh,
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
-            pp_enabled=False,
         )
         disable_fsdp_gradient_division(model)
         assert set(model.state_dict()) == names

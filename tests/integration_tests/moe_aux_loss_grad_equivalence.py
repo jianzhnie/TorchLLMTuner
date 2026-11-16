@@ -88,7 +88,7 @@ def main() -> None:
     assert world == 2, f"this check assumes 2 ranks, got {world}"
 
     parallel_dims = ParallelTopology(
-        dp_replicate=1, dp_shard=-1, cp=2, tp=1, pp=1, ep=1, world_size=world
+        dp_replicate=1, dp_shard=-1, cp=2, tp=1, ep=1, world_size=world
     )
     parallel_dims.build_device_mesh()
 

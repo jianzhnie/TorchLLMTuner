@@ -13,7 +13,6 @@ ALL_NAMES = [
     "symm_mem",
     "functorch_activation_memory_budget",
     "dynamo_lru_cache",
-    "pipelining_microbatch_drivers",
     "fsdp_per_param_mesh",
     "fsdp_unshard_context",
     "torch_grouped_mm",
@@ -31,16 +30,20 @@ def test_registry_covers_the_expected_names() -> None:
     assert sorted(CAPABILITIES) == sorted(ALL_NAMES)
 
 
-def test_pipeline_probe_tolerates_missing_eval(monkeypatch) -> None:
-    import torch.distributed.pipelining.schedules as schedules
-
-    monkeypatch.delattr(schedules._PipelineSchedule, "eval", raising=False)
-    assert capabilities._pipelining_has_eval() is False
-
-
 def test_every_entry_probes_a_bool() -> None:
     for name in ALL_NAMES:
         assert isinstance(has(name), bool), name
+
+
+def test_ascendc_probe_reports_unavailable_device(monkeypatch):
+    def import_module(name):
+        assert name == "torch_npu._inductor.ascendc"
+        raise RuntimeError("device unavailable during SoC detection")
+
+    monkeypatch.setattr(capabilities.importlib, "import_module", import_module)
+    assert capabilities.npu_ascendc_codegen() is False
+    with pytest.raises(RuntimeError, match="device unavailable"):
+        capabilities.importable("torch_npu._inductor.ascendc")()
 
 
 def test_unknown_name_raises_immediately() -> None:
@@ -122,17 +125,6 @@ def test_grouped_mm_probe_uses_training_device_and_expert_weight_layout(
     monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising=False)
     assert capabilities.grouped_mm_runs()
     assert len(calls) == 1
-
-
-@pytest.mark.parametrize("attribute", ["pipeline_schedules", "fully_shard_module"])
-def test_optional_parallel_probe_tolerates_missing_module(monkeypatch, attribute):
-    monkeypatch.setattr(capabilities, attribute, None)
-    probe = (
-        capabilities._pipelining_has_eval
-        if attribute == "pipeline_schedules"
-        else capabilities._fsdp_unshard_is_a_context_manager
-    )
-    assert probe() is False
 
 
 def test_is_compiling_tolerates_missing_compiler_namespace(monkeypatch):

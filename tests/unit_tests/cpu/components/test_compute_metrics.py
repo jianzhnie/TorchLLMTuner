@@ -5,7 +5,7 @@ import pytest
 from llmtuner.components.metrics import compute_utilization, token_throughput
 
 
-@pytest.mark.parametrize("dp,tp,cp,pp", [(8, 1, 1, 1), (2, 2, 1, 2), (1, 2, 2, 2)])
+@pytest.mark.parametrize("dp,tp,cp,pp", [(8, 1, 1, 1), (2, 2, 1, 1), (1, 2, 2, 1)])
 def test_global_and_per_device_utilization_agree(dp, tp, cp, pp):
     global_tokens = 8 * 4096 * 4
     seconds = 2.0

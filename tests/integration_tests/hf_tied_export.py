@@ -46,7 +46,6 @@ def main() -> None:
             dp_shard=2,
             cp=1,
             tp=args.tp_size,
-            pp=1,
             ep=1,
             world_size=dist.get_world_size(),
         )

@@ -12,7 +12,7 @@ checks real four-rank CPU/Gloo DP x CP and DP x TP reduction semantics.
 from __future__ import annotations
 
 import random
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -270,16 +270,6 @@ def test_validation_defaults_to_off() -> None:
 # -- build-time feasibility ---------------------------------------------------
 
 
-def test_feasibility_accepts_pipeline_parallelism() -> None:
-    """PP x validation composes since 2026-10-02: the schedule's eval driver
-    (upstream Validator's seam) drives the pass; see pipeline.run_pipeline_eval."""
-    check_validation_feasibility(
-        ValidationConfig(),
-        dp_world_size=1,
-        training_dataset="local_jsonl",
-    )
-
-
 def test_feasibility_rejects_steps_neg1_when_dp_gt_1() -> None:
     with pytest.raises(ValueError, match="validation collectives"):
         check_validation_feasibility(
@@ -404,73 +394,6 @@ class _FakePPSchedule:
         assert losses is not None
         n = len(target_mbs)
         losses.extend(torch.tensor(self.per_mb_loss) for _ in range(n))
-
-
-def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Under PP the pass runs the schedule's eval driver, with the loss
-    denominator pinned to 1 so the division happens once at the end."""
-    Trainer = _trainer_cls()
-    import llmtuner.trainer.runtime.validation as validate_mod
-
-    batches = [_batch(2), _batch(2)]
-    loader = _ListLoader(batches)
-    trainer = Trainer.__new__(Trainer)
-    cfg = LLMTunerConfig()
-    cfg.training.validation_config = ValidationConfig(steps=-1)
-    trainer.cfg = cfg
-    trainer.device = torch.device("cpu")
-
-    class _Dims:
-        pp_enabled = True
-        dp_cp_enabled = False
-        tp_enabled = False
-
-        def get_optional_mesh(self, name, **kwargs):
-            if name == "batch":
-                return SimpleNamespace(get_local_rank=lambda: 0, size=lambda: 1)
-            return None
-
-    trainer.parallel_dims = _Dims()
-    trainer.model = None
-    trainer.model_parts = [_EchoModel()]
-    trainer.checkpointer = None
-    trainer.training_engine = TrainingEngine(
-        model_parts=trainer.model_parts,
-        parallel_dims=trainer.parallel_dims,
-        device=trainer.device,
-        chunked_loss_num_chunks=1,
-        param_context=trainer.param_context,
-        pp_schedule=_FakePPSchedule(per_mb_loss=6.0),
-        pp_has_first_stage=True,
-        pp_has_last_stage=True,
-        pp_num_microbatches=cfg.parallel.pp_config.num_pp_microbatches,
-    )
-    logged: dict[str, Any] = {}
-    trainer.metrics = SimpleNamespace(
-        add_tokens=lambda n: None,
-        log_validation=lambda loss, step: logged.update(loss=loss, step=step),
-    )
-    monkeypatch.setattr(validate_mod, "build_rank_dataloader", lambda *a, **k: loader)
-    monkeypatch.setattr(
-        "llmtuner.trainer.runtime.pipeline.spmd_context", lambda dims: nullcontext()
-    )
-
-    trainer.validate(step=3)
-
-    # Two batches, each split into num_pp_microbatches microbatches (default 1).
-    assert len(trainer.training_engine.pp_schedule.eval_calls) == 2
-    call = trainer.training_engine.pp_schedule.eval_calls[0]
-    assert call["arg_mbs"] is not None and call["target_mbs"] is not None
-    # Denominator pinned to 1 during eval.
-    assert (
-        float(trainer.training_engine.pp_schedule._loss_fn.global_valid_tokens) == 1.0
-    )
-    # Raw sums: 6.0 per microbatch x 1 microbatch x 2 batches, over 4 valid
-    # tokens (2 per batch).
-    assert logged["loss"] == pytest.approx(6.0 * 2 / 4)
-    assert logged["step"] == 3
 
 
 def test_validate_positive_steps_bounds_the_pass(
@@ -740,86 +663,7 @@ def test_validation_preserves_forward_error_when_close_fails(
     assert model.training
 
 
-@pytest.mark.parametrize("rows", [0, 1, 3])
-@pytest.mark.parametrize("packed_dict", [False, True])
-def test_pipeline_microbatch_split_rejects_incomplete_rows(rows, packed_dict):
-    from llmtuner.datasets.contracts import Batch
-    from llmtuner.trainer.runtime.pipeline import split_pipeline_microbatches
-
-    inputs = torch.ones(rows, SEQ_LEN, dtype=torch.long)
-    labels = inputs.clone()
-    batch = (
-        {"input": inputs, "labels": labels}
-        if packed_dict
-        else Batch(input_ids=inputs, labels=labels)
-    )
-    with pytest.raises(ValueError, match="Pipeline batch"):
-        split_pipeline_microbatches(batch, num_microbatches=2)
-
-
-@pytest.mark.parametrize("iteration_fails", [False, True])
-@pytest.mark.parametrize("report_error", [None, OSError, KeyboardInterrupt, SystemExit])
-def test_pipeline_validation_cleanup_preserves_iteration_error(
-    monkeypatch, iteration_fails, report_error
-):
-    import llmtuner.trainer.runtime.validation as validation_module
-
-    if report_error is not None:
-
-        def report(*args, **kwargs):
-            raise report_error("pipeline validation cleanup logger failed")
-
-        monkeypatch.setattr(
-            validation_module,
-            "get_logger",
-            lambda name: SimpleNamespace(exception=report),
-        )
-
-    original = ValueError("iteration failed")
-    closed = []
-
-    class Loader:
-        def __iter__(self):
-            if iteration_fails:
-                raise original
-            return iter([])
-
-        def close(self):
-            closed.append(True)
-            raise RuntimeError("close failed")
-
-    monkeypatch.setattr(
-        validation_module, "resolve_loss_reduction_meshes", lambda dims: (None, None)
-    )
-    monkeypatch.setattr(
-        validation_module, "create_validation_dataloader", lambda *args: Loader()
-    )
-    trainer = SimpleNamespace(
-        error_group=None,
-        cfg=None,
-        parallel_dims=SimpleNamespace(pp_enabled=True),
-        device=torch.device("cpu"),
-    )
-    with pytest.raises(
-        ValueError if iteration_fails else RuntimeError,
-        match="iteration failed" if iteration_fails else "close failed",
-    ) as caught:
-        validation_module.run_validation_loop(
-            trainer,
-            loader_resources=ValidationDataLoaderResources(),
-            cfg=trainer.cfg,
-            metrics=None,
-            token_counter=lambda batch: 0,
-            validation=ValidationConfig(),
-            step=1,
-        )
-    if iteration_fails:
-        assert caught.value is original
-    assert closed == [True]
-
-
-@pytest.mark.parametrize("pipeline", [False, True])
-def test_validation_closes_loader_after_token_allocation_failure(monkeypatch, pipeline):
+def test_validation_closes_loader_after_token_allocation_failure(monkeypatch):
     import llmtuner.trainer.runtime.validation as validation_module
 
     original = RuntimeError("token allocation failed")
@@ -843,7 +687,7 @@ def test_validation_closes_loader_after_token_allocation_failure(monkeypatch, pi
     trainer = SimpleNamespace(
         error_group=None,
         cfg=None,
-        parallel_dims=SimpleNamespace(pp_enabled=pipeline),
+        parallel_dims=None,
         device=torch.device("cpu"),
     )
     with pytest.raises(RuntimeError, match="token allocation failed") as caught:

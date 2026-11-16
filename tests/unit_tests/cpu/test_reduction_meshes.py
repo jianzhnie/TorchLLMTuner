@@ -14,13 +14,12 @@ from llmtuner.trainer.runtime.reductions import (
 
 
 class Topology:
-    def __init__(self, *, dp, cp, tp, pp):
+    def __init__(self, *, dp, cp, tp):
         self.cp_enabled = cp
         self.tp_enabled = tp
         self.dp_cp_enabled = dp or cp
         self.meshes = {
             "dp": object() if dp else None,
-            "pp": object() if pp else None,
             "loss": object() if dp or cp or tp else None,
             "cp": object() if cp else None,
             "tp": object() if tp else None,
@@ -33,15 +32,14 @@ class Topology:
         return self.meshes[axes]
 
 
-@pytest.mark.parametrize("dp,cp,tp,pp", product([False, True], repeat=4))
-def test_training_and_validation_choose_the_same_loss_meshes(dp, cp, tp, pp):
-    topology = Topology(dp=dp, cp=cp, tp=tp, pp=pp)
+@pytest.mark.parametrize("dp,cp,tp", product([False, True], repeat=3))
+def test_training_and_validation_choose_the_same_loss_meshes(dp, cp, tp):
+    topology = Topology(dp=dp, cp=cp, tp=tp)
     meshes = resolve_training_reduction_meshes(topology)
     token_mesh, loss_mesh = resolve_loss_reduction_meshes(topology)
 
     assert meshes.dp_mesh is token_mesh is topology.meshes["dp"]
     assert meshes.loss_mesh is loss_mesh is topology.meshes["loss"]
-    assert meshes.pp_mesh is topology.meshes["pp"]
     axes = ("cp", "tp") if cp and tp else "cp" if cp else "tp" if tp else None
     if cp and tp:
         topology.meshes[axes]._flatten.assert_called_once_with("sequence_loss")
@@ -53,9 +51,7 @@ def test_training_and_validation_choose_the_same_loss_meshes(dp, cp, tp, pp):
 def test_single_process_requires_no_meshes():
     assert resolve_loss_reduction_meshes(None) == (None, None)
     meshes = resolve_training_reduction_meshes(None)
-    assert (meshes.dp_mesh, meshes.pp_mesh, meshes.loss_mesh, meshes.sequence_mesh) == (
-        None,
-    ) * 4
+    assert (meshes.dp_mesh, meshes.loss_mesh, meshes.sequence_mesh) == (None,) * 3
 
 
 @pytest.mark.parametrize(
@@ -63,7 +59,7 @@ def test_single_process_requires_no_meshes():
     [(1, 1, 24), (2, 1, 12), (1, 3, 8), (2, 3, 4)],
 )
 def test_logical_token_count_removes_sequence_replicas(cp, tp, expected):
-    topology = SimpleNamespace(cp=cp, tp=tp, pp=4, ep=2)
+    topology = SimpleNamespace(cp=cp, tp=tp, ep=2)
 
     assert logical_tokens_per_rank(24, topology) == expected
 

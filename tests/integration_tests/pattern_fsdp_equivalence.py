@@ -275,7 +275,6 @@ def main() -> None:
                         mesh,
                         param_dtype=torch.float32,
                         reduce_dtype=torch.float32,
-                        pp_enabled=False,
                         fsdp_implementation=implementation,
                         forward_prefetch_count=args.prefetch_window,
                         backward_prefetch_count=args.prefetch_window,

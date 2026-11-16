@@ -152,7 +152,6 @@ def _expert_placement(
         dp_mesh,
         param_dtype=torch.float32,
         reduce_dtype=torch.float32,
-        pp_enabled=False,
         ep_degree=ep_size,
         edp_mesh=edp_mesh,
     )

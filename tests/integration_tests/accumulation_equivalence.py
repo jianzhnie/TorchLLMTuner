@@ -38,13 +38,20 @@ def config(accumulation: int) -> LLMTunerConfig:
         raise ValueError("accumulation test requires 2 FSDP or 4 HSDP ranks")
     return LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3",
+            model_name_or_path="qwen3_moe",
             vocab_size=32,
             hidden_size=16,
             intermediate_size=32,
             num_hidden_layers=1,
             num_attention_heads=2,
             num_key_value_heads=2,
+            arch_overrides={
+                "head_dim": 8,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 16,
+                "mlp_only_layers": [0],
+            },
         ),
         parallel=ParallelConfig(
             data_parallel_shard_size=2,
@@ -96,8 +103,8 @@ def main() -> None:
             dist.all_reduce(denominator)
             sums = []
             for batch in batches:
-                inputs, labels, kwargs = combined.preprocess(batch)
-                logits = combined.model(inputs, **kwargs)
+                inputs, labels, kwargs = combined.training_engine.preprocess(batch)
+                logits = combined.model(inputs, **kwargs).logits
                 # Independent cross entropy and denominator, outside train_step.
                 loss = torch.nn.functional.cross_entropy(
                     logits.reshape(-1, 32), labels.reshape(-1), reduction="sum"

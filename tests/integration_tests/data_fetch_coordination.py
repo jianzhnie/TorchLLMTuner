@@ -344,83 +344,6 @@ def main():
                 raise AssertionError("malformed preprocessing was not coordinated")
             dist.barrier()
         print(f"rank={rank}: explicit preprocessing length errors coordinated")
-        from llmtuner.trainer.runtime.pipeline import (
-            prepare_pipeline_inputs,
-            split_pipeline_microbatches,
-        )
-
-        runtime = SimpleNamespace(
-            error_group=dist.group.WORLD,
-            pp_has_first_stage=rank == 0,
-            pp_has_last_stage=rank == 1,
-            pp_microbatches=lambda value: split_pipeline_microbatches(
-                value, num_microbatches=2
-            ),
-            preprocess=trainer.preprocess,
-        )
-        for failing_rank in (0, 1):
-            rows = 3 if rank == failing_rank else 4
-            value = Batch(
-                input_ids=torch.ones(rows, 4, dtype=torch.long),
-                labels=torch.ones(rows, 4, dtype=torch.long),
-            )
-            with patch.object(runtime, "preprocess") as preprocess:
-                try:
-                    prepare_pipeline_inputs(runtime, value)
-                except ValueError as error:
-                    assert rank == failing_rank and "divisible" in str(error)
-                except RuntimeError as error:
-                    assert rank != failing_rank
-                    assert str(error) == (
-                        "Pipeline input splitting failed on another rank"
-                    )
-                else:
-                    raise AssertionError("pipeline split failure was not coordinated")
-                preprocess.assert_not_called()
-            dist.barrier()
-        print(f"rank={rank}: pipeline split errors coordinated before preprocessing")
-        # Exercise the metadata exchange with successful local preparation.
-        # Count mismatches must stop before the per-microbatch coordination loop;
-        # shape/dtype mismatches must stop before schedule P2P communication.
-        pp_mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("pipeline_preflight",))
-        for mismatch in ("count", "shape", "dtype", None):
-            prepared_calls = []
-            width = 5 if mismatch == "shape" and rank == 1 else 4
-            dtype = torch.int32 if mismatch == "dtype" and rank == 1 else torch.long
-            value = Batch(
-                input_ids=torch.ones(2, width, dtype=dtype),
-                labels=torch.ones(2, width, dtype=torch.long),
-            )
-
-            def prepare(value, prepared_calls=prepared_calls):
-                prepared_calls.append(value)
-                return value.input_ids, value.labels, {}
-
-            runtime = SimpleNamespace(
-                error_group=dist.group.WORLD,
-                pp_has_first_stage=rank == 0,
-                pp_has_last_stage=rank == 1,
-                pp_microbatches=lambda value, mismatch=mismatch: (
-                    [value] * (2 if mismatch == "count" and rank == 1 else 1)
-                ),
-                preprocess=prepare,
-                parallel_dims=SimpleNamespace(get_mesh=lambda axis: pp_mesh),
-            )
-            try:
-                prepared = prepare_pipeline_inputs(runtime, value)
-            except ValueError as error:
-                assert mismatch is not None
-                assert "Pipeline ranks disagree" in str(error)
-                assert len(prepared_calls) == (0 if mismatch == "count" else 1)
-            else:
-                assert mismatch is None, "pipeline mismatch reached schedule inputs"
-                assert len(prepared_calls) == 1
-                if rank == 0:
-                    assert prepared.args[0][0] is value.input_ids
-                else:
-                    assert prepared.targets[0] is value.labels
-            dist.barrier()
-        print(f"rank={rank}: pipeline count and geometry preflight coordinated")
         preprocessing_mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("sequence",))
         for axis in ("cp", "tp"):
             trainer.parallel_dims = SimpleNamespace(
@@ -439,7 +362,6 @@ def main():
             print(f"rank={rank}: preprocessing {axis} local slicing passed")
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
         topology = SimpleNamespace(
-            pp_enabled=False,
             dp_cp_enabled=True,
             tp_enabled=False,
             cp_enabled=False,

@@ -11,7 +11,6 @@ from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.training_config import resolve_batch_size_per_rank
 from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.parallel.assembly import ModelPartLayout, ParallelAssembly
-from llmtuner.parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 from llmtuner.trainer.runtime import assembly
 from llmtuner.trainer.runtime import batch as batch_runtime
 from llmtuner.trainer.runtime.builders import TrainingBuilders
@@ -68,11 +67,7 @@ def test_profiler_factory_rejects_context_without_cleanup_owner():
 
 
 def apply_parallelism(model, cfg, monkeypatch, orchestration):
-    parts = (
-        orchestration.model_parts
-        if isinstance(orchestration, PipelineParallelSetup)
-        else [orchestration]
-    )
+    parts = [orchestration]
     layouts = tuple(ModelPartLayout() for _ in parts)
     for part, layout in zip(parts, layouts, strict=True):
         layout.refresh(part)
@@ -89,42 +84,6 @@ def apply_parallelism(model, cfg, monkeypatch, orchestration):
         device=torch.device("cpu"),
         load_initial_weights=False,
     )
-
-
-def test_dense_parallel_assembly_returns_model_without_trainer(monkeypatch) -> None:
-    model = nn.Linear(2, 2)
-
-    result = apply_parallelism(model, LLMTunerConfig(), monkeypatch, model)
-
-    assert result.model is model
-    assert result.model_parts == [model]
-    assert result.pp_schedule is None
-    assert result.pp_loss_sentinel is None
-
-
-def test_pipeline_parallel_assembly_returns_complete_execution_metadata(
-    monkeypatch,
-) -> None:
-    model = nn.Linear(2, 2)
-    schedule = object()
-    setup = PipelineParallelSetup(
-        schedule=schedule,
-        stages=[],
-        model_parts=[model],
-        has_first_stage=True,
-        has_last_stage=False,
-    )
-
-    result = apply_parallelism(model, LLMTunerConfig(), monkeypatch, setup)
-
-    assert result.model is None
-    assert result.model_parts == [model]
-    assert result.pp_schedule is schedule
-    assert result.pp_has_first_stage
-    assert not result.pp_has_last_stage
-    assert result.pp_loss_sentinel.shape == ()
-    assert result.pp_loss_sentinel.dtype == torch.float32
-    assert result.pp_loss_sentinel.device.type == "cpu"
 
 
 def test_meta_assembly_materializes_before_model_initialization(monkeypatch) -> None:
@@ -149,49 +108,12 @@ def test_meta_assembly_materializes_before_model_initialization(monkeypatch) -> 
     assert events == ["materialize", "initialize"]
 
 
-def test_engine_consumes_model_assembly_without_legacy_pp_attributes() -> None:
-    model = nn.Linear(2, 2)
-    model.execution_capabilities = ModelExecutionCapabilities()
-    schedule = object()
-    error_group = object()
-    model_assembly = assembly.ModelAssembly(
-        model=None,
-        model_parts=[model],
-        pp_schedule=schedule,
-        pp_has_first_stage=True,
-        pp_has_last_stage=True,
-    )
-    cfg = LLMTunerConfig()
-    trainer = SimpleNamespace(
-        cfg=cfg,
-        parallel_dims=SimpleNamespace(pp_enabled=True),
-        device=torch.device("cpu"),
-        param_context=lambda: None,
-        loss_sum=lambda logits, labels, **kwargs: logits.sum(),
-    )
-
-    engine = assembly.create_training_engine(
-        cfg,
-        model_assembly=model_assembly,
-        optimizer_stack=assembly.OptimizerStack(None, None, None),
-        parallel_dims=trainer.parallel_dims,
-        device=trainer.device,
-        param_context=trainer.param_context,
-        loss_functions=LossFunctions(cross_entropy_loss, chunked_lm_head_cross_entropy),
-        error_group=error_group,
-    )
-
-    assert engine.model_parts == [model]
-    assert engine.pp_schedule is schedule
-    assert engine.pp_has_first_stage
-    assert engine.pp_has_last_stage
-    assert engine.error_group is error_group
-
-
 def test_optimizer_stack_and_engine_build_without_trainer_attributes() -> None:
     model = nn.Linear(2, 2)
     model.execution_capabilities = ModelExecutionCapabilities()
     cfg = LLMTunerConfig()
+    cfg.training.max_norm = 0.25
+    cfg.training.grad_norm_precision = "parameter"
 
     services = {}
     stack = assembly.build_optimizer_stack(
@@ -205,20 +127,13 @@ def test_optimizer_stack_and_engine_build_without_trainer_attributes() -> None:
         "lr_scheduler": stack.lr_scheduler,
         "ema": stack.ema,
     }
-    trainer = SimpleNamespace(
-        cfg=cfg,
-        parallel_dims=None,
-        device=torch.device("cpu"),
-        param_context=lambda: None,
-        loss_sum=lambda logits, labels, **kwargs: logits.sum(),
-    )
     engine = assembly.create_training_engine(
         cfg,
         model_assembly=assembly.ModelAssembly(model=model, model_parts=[model]),
         optimizer_stack=stack,
-        parallel_dims=trainer.parallel_dims,
-        device=trainer.device,
-        param_context=trainer.param_context,
+        parallel_dims=None,
+        device=torch.device("cpu"),
+        param_context=nullcontext,
         loss_functions=LossFunctions(cross_entropy_loss, chunked_lm_head_cross_entropy),
     )
 
@@ -229,6 +144,11 @@ def test_optimizer_stack_and_engine_build_without_trainer_attributes() -> None:
     assert engine.optimizer is stack.optimizer
     assert engine.lr_scheduler is stack.lr_scheduler
     assert engine.ema is None
+    assert engine.max_norm == 0.25
+    assert engine.grad_norm_precision == "parameter"
+    assert engine.expert_reduce_layout == "storage"
+    cfg.training.max_norm = 8.0
+    assert engine.max_norm == 0.25, "Execution policy is bound during assembly"
 
 
 def test_checkpointer_consumes_explicit_runtime_owners(monkeypatch) -> None:
@@ -279,49 +199,6 @@ def test_checkpointer_consumes_explicit_runtime_owners(monkeypatch) -> None:
     assert captured["states"]["dataloader"] is dataloader
 
 
-def test_engine_factory_uses_explicit_dependencies_without_changing_rng() -> None:
-    model = nn.Linear(2, 2)
-    model.execution_capabilities = ModelExecutionCapabilities()
-    cfg = LLMTunerConfig()
-    cfg.training.chunked_loss_num_chunks = 1
-    cfg.parallel.pp_config.num_pp_microbatches = 2
-    schedule = object()
-    sentinel = torch.zeros(())
-    assembled = assembly.ModelAssembly(
-        model=None,
-        model_parts=[model],
-        pp_schedule=schedule,
-        pp_has_last_stage=True,
-        pp_loss_sentinel=sentinel,
-    )
-    stack = assembly.OptimizerStack(object(), object(), None)
-    rng = torch.get_rng_state().clone()
-    weight = model.weight
-
-    engine = assembly.create_training_engine(
-        cfg,
-        model_assembly=assembled,
-        optimizer_stack=stack,
-        parallel_dims=SimpleNamespace(pp_enabled=True),
-        device=torch.device("cpu"),
-        param_context=nullcontext,
-        loss_functions=LossFunctions(cross_entropy_loss, chunked_lm_head_cross_entropy),
-    )
-
-    assert engine.model_parts is assembled.model_parts
-    assert engine.optimizer is stack.optimizer
-    assert engine.lr_scheduler is stack.lr_scheduler
-    assert engine.loss_sum is cross_entropy_loss
-    assert engine.param_context is nullcontext
-    assert engine.pp_schedule is schedule
-    assert engine.pp_loss_sentinel is sentinel
-    assert engine.pp_has_last_stage
-    assert engine.pp_num_microbatches == 2
-    assert engine.chunked_loss_num_chunks == 1
-    assert model.weight is weight
-    assert torch.equal(torch.get_rng_state(), rng)
-
-
 def test_registered_model_builds_without_trainer_or_process_group() -> None:
     cfg = LLMTunerConfig()
     cfg.model.arch_overrides = {
@@ -367,45 +244,6 @@ def test_registered_model_builds_without_trainer_or_process_group() -> None:
     assert model.lm_head.weight.grad.abs().sum() > 0
 
 
-def test_metrics_factory_uses_explicit_geometry_and_topology(monkeypatch) -> None:
-    captured = {}
-
-    class Metrics:
-        def __init__(self, config, **kwargs):
-            captured["config"] = config
-            captured.update(kwargs)
-
-    monkeypatch.setattr(assembly, "MetricsProcessor", Metrics)
-    monkeypatch.setattr(assembly, "unwrap_text_config", lambda config: config)
-    monkeypatch.setattr(
-        assembly,
-        "flops_per_token",
-        lambda config, *, seq_len: 123 if seq_len == 8 else None,
-    )
-    cfg = LLMTunerConfig()
-    cfg.training.max_seq_len = 8
-    model_config = SimpleNamespace(model_type="qwen3_moe")
-
-    services = {}
-    metrics = assembly.build_metrics_processor(
-        cfg,
-        model_config,
-        parallel_dims=None,
-        num_parameters=101,
-        num_trainable_parameters=89,
-        on_service_acquired=services.__setitem__,
-    )
-
-    assert services == {"metrics": metrics}
-    assert isinstance(metrics, Metrics)
-    assert captured["config"] is cfg.metrics
-    assert captured["parallel_dims"] is None
-    assert captured["num_parameters"] == 101
-    assert captured["num_trainable_parameters"] == 89
-    assert captured["pp_schedule"] == cfg.parallel.pp_config.pipeline_parallel_schedule
-    assert captured["num_flops_per_token"] == 123
-
-
 def test_dataloader_factory_uses_explicit_rank_and_token_budget(monkeypatch) -> None:
     captured = {}
     loader = object()
@@ -431,11 +269,10 @@ def test_dataloader_factory_uses_explicit_rank_and_token_budget(monkeypatch) -> 
     mesh = SimpleNamespace(get_local_rank=lambda: 1, size=lambda: 2)
     axes = []
     topology = SimpleNamespace(
-        pp_enabled=True,
         get_optional_mesh=lambda name, **kwargs: axes.append((name, kwargs)) or mesh,
     )
     assert batch_runtime.resolve_data_parallel_rank(topology) == (1, 2)
-    assert axes == [("batch", {"include_singleton_axes": True})]
+    assert axes == [("dp", {"include_singleton_axes": True})]
     with pytest.raises(ValueError, match="must be divisible"):
         resolve_batch_size_per_rank(cfg.global_batch_size, 3)
 

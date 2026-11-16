@@ -44,9 +44,7 @@ def test_rank_discovery_accepts_intervening_flags_and_both_spellings(tmp_path, c
     assert module._torchrun_args(script) == ["--nproc_per_node=4"]
 
 
-@pytest.mark.parametrize(
-    "script_name", ["pp_checkpoint_equivalence", "async_snapshot_equivalence"]
-)
+@pytest.mark.parametrize("script_name", ["async_snapshot_equivalence"])
 @pytest.mark.parametrize("full_returncode", [0, 1])
 def test_checkpoint_runner_shares_folder_and_stops_on_full_failure(
     monkeypatch, full_returncode, script_name

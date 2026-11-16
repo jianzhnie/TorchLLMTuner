@@ -8,8 +8,6 @@ import torch
 from torch import nn
 
 from llmtuner.models.contracts import DecoderStructure
-from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
-from llmtuner.models.kimi.kimi_k3.latent_attention import KimiLatentAttention
 from llmtuner.parallel.context_parallel import kcp
 
 
@@ -121,44 +119,6 @@ def test_kcp_wrapper_construction_failure_leaves_all_forwards_unchanged(monkeypa
         kcp.apply_kcp(model, mesh, resolved_plan=kcp.resolve_kcp_plan(model, degree=2))
     assert len(calls) == 2
     assert [layer.self_attn.forward for layer in model.layers] == original
-
-
-def test_declared_mla_only_pipeline_part_binds_without_kda(monkeypatch):
-    config = KimiLinearConfig(
-        hidden_size=12,
-        num_attention_heads=4,
-        num_key_value_heads=1,
-        q_lora_rank=4,
-        kv_lora_rank=4,
-        qk_nope_head_dim=3,
-        qk_rope_head_dim=1,
-        v_head_dim=3,
-        mla_use_nope=True,
-    )
-    model = nn.Module()
-    block = nn.Module()
-    block.self_attn = KimiLatentAttention(config, 0)
-    model.layers = nn.ModuleList([block])
-    model.decoder_structure = DecoderStructure(
-        decoder="",
-        embedding="embedding",
-        blocks="layers",
-        norm="norm",
-        head="head",
-        attention="self_attn",
-    )
-    plan = kcp.resolve_kcp_plan(model, degree=2)
-    assert [(target.path, target.layout) for target in plan.targets] == [
-        ("layers.0.self_attn", "mla_ulysses")
-    ]
-    monkeypatch.setattr(
-        kcp, "_kcp_runtime", lambda: pytest.fail("MLA must not require KDA kernels")
-    )
-    installed = object()
-    monkeypatch.setattr(kcp, "kcp_mla_attention", lambda group: installed)
-    mesh = SimpleNamespace(size=lambda: 2, get_group=lambda: object())
-    assert kcp.apply_kcp(model, mesh, resolved_plan=plan) == 0
-    assert block.self_attn._kcp_attention is installed
 
 
 @pytest.mark.parametrize("layout", ["kda_state", "mla_ulysses", None, "standard"])

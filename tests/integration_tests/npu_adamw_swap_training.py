@@ -32,7 +32,6 @@ from llmtuner.config import (
     ModelConfig,
     OptimizerConfig,
     ParallelConfig,
-    PipelineParallelConfig,
     TrainingConfig,
 )
 from llmtuner.trainer.trainer import Trainer
@@ -92,11 +91,7 @@ def train(args) -> None:
             data_parallel_shard_size=world // (args.tp * args.cp * args.pp),
             tensor_parallel_size=args.tp,
             expert_parallel_size=args.ep,
-            pipeline_parallel_size=args.pp,
             context_parallel_ulysses_size=args.cp,
-            pp_config=PipelineParallelConfig(
-                pipeline_parallel_schedule="1F1B", num_pp_microbatches=2
-            ),
             fsdp_config=FSDPConfig(fsdp_cpu_offload=args.cpu_offload and args.swap),
         ),
         optimizer=OptimizerConfig(
@@ -463,7 +458,7 @@ def main() -> None:
         subparser.add_argument("--ep", type=int, default=1)
         subparser.add_argument("--tp", type=int, default=1)
         subparser.add_argument("--cp", type=int, default=1)
-        subparser.add_argument("--pp", type=int, default=1)
+        subparser.add_argument("--pp", type=int, choices=(1,), default=1)
         subparser.add_argument(
             "--async-mode",
             choices=("disabled", "async", "async_with_pinned_mem"),

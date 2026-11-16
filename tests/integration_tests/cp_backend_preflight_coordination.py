@@ -30,7 +30,6 @@ def main() -> None:
         rank = dist.get_rank()
         mesh = init_device_mesh(device.type, (2,), mesh_dim_names=("world",))
         topology = SimpleNamespace(
-            pp_enabled=False,
             get_optional_mesh=lambda name: None,
             build_device_mesh=lambda: mesh,
         )

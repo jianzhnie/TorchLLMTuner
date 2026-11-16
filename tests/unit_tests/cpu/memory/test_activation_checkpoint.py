@@ -66,7 +66,6 @@ from llmtuner.memory.remat_regions import region_names
 from llmtuner.models.configuration import build_model_config
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.parallelize import parallelize_model
-from tests.unit_tests.cpu.parallel.pipeline_stubs import stub_pipeline
 
 _VOCAB = 32
 _HIDDEN = 16
@@ -393,75 +392,6 @@ def test_parallelize_model_threads_selective_ac() -> None:
 
 
 # -- the pp path --------------------------------------------------------------
-
-
-def test_the_pp_path_checkpoints_every_stage_chunk(monkeypatch) -> None:
-    """AC is a stage on the pp path too, applied per chunk.
-
-    Upstream hands ``ac_config`` to each model part's own ``parallelize`` call,
-    so a stage's chunk is checkpointed on the layers it holds. llmtuner used to
-    refuse AC outright when ``pp > 1``; this is that refusal gone.
-    """
-    part = _model()
-    stages, topology, schedule = stub_pipeline(monkeypatch, [part])
-    monkeypatch.setattr(
-        "llmtuner.parallel.parallelize.apply_pp",
-        lambda model, **kwargs: (stages, [part], True, True),
-    )
-    monkeypatch.setattr(
-        "llmtuner.parallel.parallelize.build_pipeline_schedule",
-        lambda schedule_stages, **kwargs: schedule,
-    )
-    monkeypatch.setattr(
-        "llmtuner.parallel.parallelize.apply_fsdp",
-        lambda model, cfg, parallel_dims, chunked_loss_num_chunks: model,
-    )
-
-    setup = parallelize_model(
-        _model(),
-        cfg=ParallelConfig(),
-        mesh=None,
-        parallel_dims=topology,
-        activation_checkpoint="full",
-        global_batch_size=2,
-    ).execution
-
-    assert all(
-        isinstance(layer, CheckpointWrapper) for layer in setup.model_parts[0].layers
-    )
-    # ``stage.submod`` is rebound when a transform replaces the chunk, so the
-    # schedule runs the checkpointed layers and not the pre-wrap module.
-    assert setup.stages[0].submod is setup.model_parts[0]
-
-
-def test_the_pp_path_is_a_no_op_when_ac_is_off(monkeypatch) -> None:
-    """The other half of the refusal: mode 'none' still assembles, unwrapped."""
-    part = _model()
-    stages, topology, schedule = stub_pipeline(monkeypatch, [part])
-    monkeypatch.setattr(
-        "llmtuner.parallel.parallelize.apply_pp",
-        lambda model, **kwargs: (stages, [part], True, True),
-    )
-    monkeypatch.setattr(
-        "llmtuner.parallel.parallelize.build_pipeline_schedule",
-        lambda schedule_stages, **kwargs: schedule,
-    )
-    monkeypatch.setattr(
-        "llmtuner.parallel.parallelize.apply_fsdp",
-        lambda model, cfg, parallel_dims, chunked_loss_num_chunks: model,
-    )
-
-    setup = parallelize_model(
-        _model(),
-        cfg=ParallelConfig(),
-        mesh=None,
-        parallel_dims=topology,
-        global_batch_size=2,
-    ).execution
-
-    assert not any(
-        isinstance(layer, CheckpointWrapper) for layer in setup.model_parts[0].layers
-    )
 
 
 # -- the dynamo cache workaround ----------------------------------------------

@@ -180,10 +180,7 @@ def test_configured_tp_pattern_typo_is_not_hidden_by_valid_model_plan(field):
     assert model[0] is original
 
 
-@pytest.mark.parametrize("pipeline_size", [1, 2])
-def test_tp_overlapping_overrides_reject_conflicting_styles_before_mutation(
-    pipeline_size,
-):
+def test_tp_overlapping_overrides_reject_conflicting_styles_before_mutation():
     from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
 
     model = nn.Sequential(nn.Linear(4, 4, bias=False))
@@ -192,7 +189,6 @@ def test_tp_overlapping_overrides_reject_conflicting_styles_before_mutation(
     state = weight.detach().clone()
     cfg = ParallelConfig(
         tensor_parallel_size=2,
-        pipeline_parallel_size=pipeline_size,
         tp_config=TensorParallelConfig(
             tp_colwise_modules=["*"], tp_rowwise_modules=["0"]
         ),
@@ -214,20 +210,6 @@ def test_tp_overlapping_overrides_allow_the_same_style():
     )
     targets, _ = resolve_tp_targets(model, cfg=cfg, plan={"0": "rowwise"})
     assert len(targets) == 1
-    assert targets[0][2].kind == "colwise"
-
-
-def test_pipeline_part_permits_override_owned_by_another_stage():
-    from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_targets
-
-    part = nn.Sequential(nn.Linear(4, 4, bias=False))
-    cfg = ParallelConfig(
-        tensor_parallel_size=2,
-        pipeline_parallel_size=2,
-        tp_config=TensorParallelConfig(tp_rowwise_modules=["other_stage.projection"]),
-    )
-    targets, _ = resolve_tp_targets(part, cfg=cfg, plan={"0": "colwise"})
-    assert targets[0][0] == "0"
     assert targets[0][2].kind == "colwise"
 
 

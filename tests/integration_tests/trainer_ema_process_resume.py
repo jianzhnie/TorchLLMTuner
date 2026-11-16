@@ -143,13 +143,7 @@ def worker(
             str(folder),
         ]
     )
-    pp_size = 2 if (root / "pp2").exists() else 1
-    if pp_size > 1:
-        config.model.num_hidden_layers = 6
-        config.training.global_batch_size = 8
-        config.parallel.pipeline_parallel_size = pp_size
-        config.parallel.pp_config.pipeline_parallel_schedule = "Interleaved1F1B"
-        config.parallel.pp_config.num_pp_microbatches = 4
+    pp_size = 1
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     if moe_enabled:
@@ -230,13 +224,6 @@ def worker(
             assert all(
                 isinstance(block.router, QuantileBalancedTopKRouter)
                 for block in quantile_layers
-            )
-        if pp_size > 1:
-            assert trainer.parallel_dims.pp == 2
-            assert len(trainer.model_parts) == 2
-            assert (
-                trainer.training_engine.pp_schedule.__class__.__name__
-                == "ScheduleInterleaved1F1B"
             )
         # A pre-validation snapshot must own its storage: otherwise an in-place
         # model update could also mutate the expected value and hide a failure.
@@ -449,18 +436,13 @@ def main():
         "ep2",
         "tp2",
         "quantile",
-        "pp2",
     }
     if {"dp2", "dp4"} <= set(sys.argv[1:]):
         raise ValueError("Choose only one data parallel size")
     world_size = 4 if "dp4" in sys.argv[1:] else 2 if "dp2" in sys.argv[1:] else 1
     if "ep2" in sys.argv[1:] and ("moe" not in sys.argv[1:] or world_size < 2):
         raise ValueError("ep2 requires moe and dp2 or dp4")
-    pp_size = 2 if "pp2" in sys.argv[1:] else 1
-    if pp_size > 1 and (
-        world_size != 4 or {"moe", "tp2", "ep2", "quantile"} & set(sys.argv[1:])
-    ):
-        raise ValueError("pp2 requires dp4 and a dense model without tp2/ep2")
+    pp_size = 1
     ep_size = 2 if "ep2" in sys.argv[1:] else 1
     if "quantile" in sys.argv[1:] and (
         "moe" not in sys.argv[1:] or "tp2" in sys.argv[1:] or ep_size != 2
@@ -477,8 +459,6 @@ def main():
     corpus = bool({"corpus", "first_fit"} & set(sys.argv[1:]))
     async_mode = "async" if "async" in sys.argv[1:] else "disabled"
     root = Path(mkdtemp(prefix="llmtuner-ema-process-resume-"))
-    if pp_size > 1:
-        (root / "pp2").touch()
     if "first_fit" in sys.argv[1:]:
         (root / "first_fit").touch()
     if corpus:
@@ -557,6 +537,7 @@ def main():
             assert len(biases) == 2 and all(torch.count_nonzero(b) for b in biases)
             assert not any("required_bias_histogram" in key for key in initial["model"])
         assert set(initial) == {
+            "checkpoint_format",
             "model",
             "optimizer",
             "lr_scheduler",

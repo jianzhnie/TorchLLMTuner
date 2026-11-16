@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from tests.caps import require_env
 
-require_env("pipelining", "flex_attention")
+require_env("flex_attention")
 
 
 import logging
@@ -21,7 +21,6 @@ from llmtuner.components import metrics as metrics_module
 from llmtuner.components.metrics import (
     DeviceMemoryMonitor,
     MetricsProcessor,
-    get_metrics_rank,
 )
 from llmtuner.config import (
     MetricsConfig as Config,
@@ -213,7 +212,7 @@ def test_throughput_is_not_divided_without_parallel_dims() -> None:
         (4, 2, 1, 1, 1),
         (4, 2, 4, 1, 1),
         (8, 1, 8, 1, 1),
-        (1, 2, 2, 2, 2),
+        (2, 2, 2, 2, 1),
     ],
 )
 def test_real_topologies_report_the_same_global_work_per_device(
@@ -225,7 +224,6 @@ def test_real_topologies_report_the_same_global_work_per_device(
         tp=tp,
         ep=ep,
         cp=cp,
-        pp=pp,
         world_size=8,
     )
     processor = MetricsProcessor(
@@ -530,7 +528,7 @@ def test_a_processor_with_nothing_enabled_logs_to_a_no_op() -> None:
     assert isinstance(processor.logger, BaseLogger)
 
 
-def test_only_the_metrics_rank_records_unless_all_ranks_are_asked_for() -> None:
+def test_only_rank_zero_records_unless_all_ranks_are_asked_for(monkeypatch) -> None:
     require_env("tensorboard")
     processor = MetricsProcessor(
         Config(enable_tensorboard=True),
@@ -540,12 +538,13 @@ def test_only_the_metrics_rank_records_unless_all_ranks_are_asked_for() -> None:
     # Single process, metrics rank 0, so this rank does record.
     assert isinstance(processor.logger, LoggerContainer)
 
+    monkeypatch.setattr(metrics_module, "get_distributed_rank", lambda: 1)
     off_rank = MetricsProcessor(
         Config(enable_tensorboard=True),
-        parallel_dims=_FakeParallelTopology(pp=2, world_size=4),
+        parallel_dims=_FakeParallelTopology(pp=1, world_size=4),
         num_flops_per_token=0,
     )
-    # Metrics rank is 2 under pp=2; this process is rank 0, so it does not.
+    # The non-writer rank retains a no-op sink.
     assert isinstance(off_rank.logger, BaseLogger)
     assert not isinstance(off_rank.logger, LoggerContainer)
 
@@ -689,26 +688,6 @@ def test_gib_is_binary_gigabytes() -> None:
 
 
 # -- metrics rank -------------------------------------------------------------
-
-
-def test_metrics_rank_is_zero_without_pipeline_parallelism() -> None:
-    assert (
-        get_metrics_rank(parallel_dims=_FakeParallelTopology(), pp_schedule="1F1B") == 0
-    )
-
-
-def test_metrics_rank_is_the_first_rank_of_the_last_stage() -> None:
-    """The loss only exists on the last stage, so that is the rank that reports."""
-    dims = _FakeParallelTopology(pp=4, world_size=16)
-
-    assert get_metrics_rank(parallel_dims=dims, pp_schedule="1F1B") == 12
-
-
-def test_metrics_rank_is_zero_for_a_v_block_schedule() -> None:
-    """ZBV returns loss on rank 0 regardless of how many stages there are."""
-    dims = _FakeParallelTopology(pp=4, world_size=16)
-
-    assert get_metrics_rank(parallel_dims=dims, pp_schedule="ZBVZeroBubble") == 0
 
 
 # -- colour -------------------------------------------------------------------

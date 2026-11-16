@@ -85,51 +85,6 @@ def test_versioned_restore_cannot_use_legacy_missing_metadata_fallback(
         dcp.load(destination, checkpoint_id=tmp_path, planner=CheckpointLoadPlanner())
 
 
-def test_model_contract_capture_ignores_duplicate_pipeline_parts():
-    from types import SimpleNamespace
-
-    from torch import nn
-
-    from llmtuner.models.execution import ModelExecutionCapabilities
-
-    model = nn.Module()
-    model.execution_capabilities = ModelExecutionCapabilities(
-        hidden_states=True, hidden_size=8
-    )
-    model.vocab_size = 32
-    model.config = SimpleNamespace(model_type="declared_decoder")
-    single = CheckpointFormatState.capture([model])
-    duplicated = CheckpointFormatState.capture([model, model])
-    single.validate_state_dict(duplicated.state_dict())
-    model.vocab_size = 64
-    changed = CheckpointFormatState.capture([model])
-    with pytest.raises(ValueError, match="model execution contracts differ"):
-        changed.validate_state_dict(single.state_dict())
-
-
-def test_contract_capture_includes_remote_pipeline_declarations(monkeypatch):
-    from torch import nn
-
-    from llmtuner.components.checkpointer.core import format_state
-    from llmtuner.models.execution import ModelExecutionCapabilities
-
-    first, last = nn.Module(), nn.Module()
-    first.execution_capabilities = ModelExecutionCapabilities(logits=False)
-    last.execution_capabilities = ModelExecutionCapabilities()
-    expected = CheckpointFormatState.capture([first, last]).state_dict()
-    remote = CheckpointFormatState.capture([last]).state_dict()["model_contracts"]
-
-    import json
-
-    monkeypatch.setattr(format_state, "get_world_size", lambda: 2)
-
-    def gather(peers, local):
-        peers[:] = [local, (json.loads(remote), None)]
-
-    monkeypatch.setattr(format_state.dist, "all_gather_object", gather)
-    assert CheckpointFormatState.capture([first]).state_dict() == expected
-
-
 def test_model_configuration_is_snapshotted_and_validated_before_restore():
     from torch import nn
 

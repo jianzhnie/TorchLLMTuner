@@ -71,7 +71,6 @@ def main():
             mesh,
             param_dtype=torch.float32,
             reduce_dtype=torch.float32,
-            pp_enabled=False,
             forward_prefetch_count=args.prefetch,
             backward_prefetch_count=args.prefetch,
         )

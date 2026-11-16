@@ -58,7 +58,7 @@ def test_rng_checkpoint_empty_state_rejects_before_changing_streams():
     assert torch.equal(torch.get_rng_state(), before)
 
 
-@pytest.mark.parametrize("changed_axis", ["tp", "pp", "ep", "cp", "cp_kv"])
+@pytest.mark.parametrize("changed_axis", ["tp", "ep", "cp", "cp_kv"])
 def test_rng_restore_rejects_changed_parallel_degrees(changed_axis, monkeypatch):
     from types import SimpleNamespace
 
@@ -73,7 +73,7 @@ def test_rng_restore_rejects_changed_parallel_degrees(changed_axis, monkeypatch)
     saved = state.state_dict()
     # Capture ownership: editing the caller's topology cannot edit the payload.
     setattr(topology, changed_axis, 2)
-    if changed_axis in {"tp", "pp", "cp", "cp_kv"}:
+    if changed_axis in {"tp", "cp", "cp_kv"}:
         topology.dp_shard = 1
     if changed_axis == "cp_kv":
         topology.cp = 2
@@ -187,7 +187,7 @@ def test_rng_checkpoint_rejects_non_dictionary_payload(payload):
 
 
 @pytest.mark.parametrize(
-    "axis", ["dp_replicate", "dp_shard", "cp", "tp", "pp", "ep", "cp_kv", "cp_ulysses"]
+    "axis", ["dp_replicate", "dp_shard", "cp", "tp", "ep", "cp_kv", "cp_ulysses"]
 )
 @pytest.mark.parametrize("value", [True, 1.0])
 def test_rng_checkpoint_rejects_noninteger_parallel_degree(axis, value):

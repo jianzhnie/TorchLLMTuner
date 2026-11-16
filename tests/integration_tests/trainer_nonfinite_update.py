@@ -6,6 +6,7 @@ Add cp2 with four ranks for real DeepSeek V4 HCA CP2, without attention mocks.
 Add pp2 with four ranks for DP2 x PP2 using the real 1F1B schedule.
 Uses the real Trainer, synthetic loader, model forward/backward and optimizers.
 Only the returned loss or one post-backward local gradient is corrupted.
+Rank-local diagnostic hook failures must also stop every update before clipping.
 """
 
 import sys
@@ -41,7 +42,9 @@ def main():
         tp_size = 2 if "tp2" in sys.argv else 1
         ep_size = 2 if "ep2" in sys.argv else 1
         cp_size = 2 if "cp2" in sys.argv else 1
-        pp_size = 2 if "pp2" in sys.argv else 1
+        if "pp2" in sys.argv:
+            raise ValueError("PP tests moved to experiments/pipeline_parallel")
+        pp_size = 1
         if cp_size > 1 and (tp_size > 1 or ep_size > 1 or pp_size > 1):
             raise ValueError("The HCA CP scenario requires TP1, EP1 and PP1")
         moe_enabled = tp_size > 1 or ep_size > 1 or cp_size > 1
@@ -50,7 +53,7 @@ def main():
             config = parse_config(
                 [
                     "--model_name_or_path",
-                    "qwen3",
+                    "qwen3_moe",
                     "--vocab_size",
                     "32",
                     "--hidden_size",
@@ -86,9 +89,13 @@ def main():
             config.parallel.data_parallel_shard_size = 2
             config.parallel.tensor_parallel_size = tp_size
             config.parallel.expert_parallel_size = ep_size
-            config.parallel.pipeline_parallel_size = pp_size
-            if pp_size > 1:
-                config.parallel.pp_config.num_pp_microbatches = 4
+            config.model.arch_overrides.update(
+                head_dim=8,
+                num_experts=4,
+                num_experts_per_tok=2,
+                moe_intermediate_size=16,
+                mlp_only_layers=[0, 1],
+            )
             if moe_enabled and cp_size == 1:
                 config.model.model_name_or_path = "qwen3_moe"
                 config.model.experts_implementation = "eager"
@@ -97,6 +104,7 @@ def main():
                     num_experts_per_tok=2,
                     moe_intermediate_size=16,
                     router_aux_loss_coef=0.03,
+                    mlp_only_layers=[],
                 )
                 config.parallel.ep_config.fixed_router = True
                 config.parallel.ep_config.router_aux_loss_coef = 0.03
@@ -221,6 +229,32 @@ def main():
                         for key in before["model"]
                     )
                     dist.barrier()
+            for failing_rank in range(dist.get_world_size()):
+                trainer.step += 1
+                before = update_state(trainer)
+
+                def fail_diagnostic(failing_rank=failing_rank):
+                    if dist.get_rank() == failing_rank:
+                        raise RuntimeError("Injected diagnostic hook failure")
+
+                with patch.object(trainer, "before_gradient_clipping", fail_diagnostic):
+                    try:
+                        trainer.train_step(
+                            trainer.batch_generator(trainer.data_iterator())
+                        )
+                    except RuntimeError as error:
+                        expected = (
+                            "Injected diagnostic hook failure"
+                            if dist.get_rank() == failing_rank
+                            else "Before gradient clipping hook failed on another rank"
+                        )
+                        assert expected in str(error), str(error)
+                    else:
+                        raise AssertionError("Diagnostic failure updated parameters")
+                assert_state_equal(update_state(trainer), before)
+                dist.barrier()
+                trainer.train_step(trainer.batch_generator(trainer.data_iterator()))
+                assert trainer.lr_scheduler.state_dict()["last_epoch"] == trainer.step
             if config.training.compile:
                 assert torch._dynamo.utils.counters["stats"]["unique_graphs"] > 0
             if dist.get_rank() == 0:
