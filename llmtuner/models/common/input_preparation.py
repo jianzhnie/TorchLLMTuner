@@ -24,7 +24,7 @@ from ...parallel.context_parallel.input_sharding import (
     shard_padding_mask_for_cp,
 )
 from ...parallel.topology import ParallelTopology
-from .attention.masks import build_dense_attention_mask
+from .attention import build_dense_attention_mask
 from .targets import next_token_targets
 
 __all__ = ["prepare_text_inputs", "restore_text_batch_rows"]
@@ -132,50 +132,43 @@ def prepare_text_inputs(
         # shard. Never turn declared packed attention into plain causal math.
         raise ValueError("Packed text input requires positions for document boundaries")
     tokens = batch.input_ids if isinstance(batch, Batch) else batch["input"]
+    cp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("cp")
+    tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
     multirow = preserve_batch_rows and tokens.ndim == 2 and tokens.shape[0] > 1
-    if (
-        multirow
-        and parallel_dims is not None
-        and any(
-            parallel_dims.get_optional_mesh(axis) is not None for axis in ("cp", "tp")
-        )
-    ):
+    if multirow and (cp_mesh is not None or tp_mesh is not None):
         raise UnsupportedCombinationError(
             "Multirow text input requires row-aware CP/TP sharding"
         )
     extra: dict[str, Any] = {}
-    if parallel_dims is not None:
-        cp_mesh = parallel_dims.get_optional_mesh("cp")
-        if cp_mesh is not None:
-            if packed:
-                raise UnsupportedCombinationError(
-                    "Packed CP input preparation requires a model-specific "
-                    "full-sequence mask contract; the generic explicit text "
-                    "adapter refuses to build an incorrect local mask."
-                )
-            if positions is None:
-                positions = torch.arange(inputs.numel(), device=inputs.device)
-            inputs, labels, positions = shard_batch_for_cp(
-                inputs,
-                labels,
-                positions,
+    if cp_mesh is not None:
+        if packed:
+            raise UnsupportedCombinationError(
+                "Packed CP input preparation requires a model-specific "
+                "full-sequence mask contract; the generic explicit text "
+                "adapter refuses to build an incorrect local mask."
+            )
+        if positions is None:
+            positions = torch.arange(inputs.numel(), device=inputs.device)
+        inputs, labels, positions = shard_batch_for_cp(
+            inputs,
+            labels,
+            positions,
+            cp_mesh,
+            cp_load_balancer,
+        )
+        if padding_mask is not None:
+            padding_mask = shard_padding_mask_for_cp(
+                padding_mask,
                 cp_mesh,
                 cp_load_balancer,
             )
-            if padding_mask is not None:
-                padding_mask = shard_padding_mask_for_cp(
-                    padding_mask,
-                    cp_mesh,
-                    cp_load_balancer,
-                )
-        tp_mesh = parallel_dims.get_optional_mesh("tp")
-        if tp_mesh is not None:
-            if positions is None:
-                positions = torch.arange(inputs.numel(), device=inputs.device)
-            inputs, labels = shard_batch_for_tp(inputs, labels, tp_mesh)
-            # TP attention gathers the residual sequence before QKV. Positions
-            # and padding describe that gathered sequence, unlike local input
-            # IDs and loss targets. CP has already selected its own sequence.
+    if tp_mesh is not None:
+        if positions is None:
+            positions = torch.arange(inputs.numel(), device=inputs.device)
+        inputs, labels = shard_batch_for_tp(inputs, labels, tp_mesh)
+        # TP attention gathers the residual sequence before QKV. Positions
+        # and padding describe that gathered sequence, unlike local input
+        # IDs and loss targets. CP has already selected its own sequence.
     if positions is not None:
         extra["positions"] = positions
     if padding_mask is not None:
@@ -187,20 +180,11 @@ def prepare_text_inputs(
             if name in extra:
                 extra[name] = extra[name].reshape(rows, width)
     if packed:
-        if multirow:
-            # Build B independent S*S masks, not a (B*S)*(B*S) temporary.
-            # Row-local document numbering has the same equality semantics.
-            mask = torch.cat(
-                [
-                    build_dense_attention_mask(row, dtype=mask_dtype, block_causal=True)
-                    for row in positions.reshape(rows, width)
-                ],
-                dim=0,
-            )
-        else:
-            mask = build_dense_attention_mask(
-                positions, dtype=mask_dtype, block_causal=True
-            )
+        mask = build_dense_attention_mask(
+            positions.reshape(rows, width) if multirow else positions,
+            dtype=mask_dtype,
+            block_causal=True,
+        )
         if padding_mask is not None:
             padding_keys = (
                 padding_mask.reshape(rows, 1, 1, width)

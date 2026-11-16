@@ -30,10 +30,7 @@ from .assembly import ModelPartLayout, ParallelAssembly
 from .compatibility import chunked_loss_fsdp
 from .context_parallel.context_parallel import apply_cp
 from .context_parallel.plan import resolve_cp_plan
-from .execution import (
-    ExecutionLayout,
-    resolve_execution_layout,
-)
+from .execution import resolve_execution_layout
 from .expert_parallel.expert_parallel import apply_ep
 from .expert_parallel.mc2_ops import validate_mc2_world_size
 from .expert_parallel.plan import resolve_ep_plan
@@ -43,10 +40,7 @@ from .fully_shard_parallel.fully_shard_parallel import (
 )
 from .fully_shard_parallel.ownership import FSDPPatternReferences
 from .model_compile import apply_compile, validate_compile_environment
-from .plan import (
-    ParallelPlan,
-    model_bindings_from_plan,
-)
+from .plan import model_bindings_from_plan
 from .stages import STAGE_ORDER
 from .tensor_parallel.tensor_parallel import (
     apply_tp,
@@ -133,9 +127,13 @@ def parallelize_model(
         ):
             validate_compile_environment(compile_config)
 
-    if chunked_loss_num_chunks > 1 and compile and parallel_dims is not None:
-        if parallel_dims.dp_cp_enabled:
-            chunked_loss_fsdp(chunked_loss_num_chunks, compile=True)
+    if (
+        chunked_loss_num_chunks > 1
+        and compile
+        and parallel_dims is not None
+        and parallel_dims.dp_cp_enabled
+    ):
+        chunked_loss_fsdp(chunked_loss_num_chunks, compile=True)
 
     with synchronize_local_errors("Parallel topology snapshot", group=error_group):
         topology_snapshot = (
@@ -143,106 +141,6 @@ def parallelize_model(
             if parallel_dims is not None
             else ParallelTopologySnapshot()
         )
-
-    def apply_stages(
-        part: nn.Module,
-        *,
-        dense_mesh: DeviceMesh | None,
-        tp_mesh: DeviceMesh | None,
-        ep_group: ProcessGroup | None,
-        ep_error_group: ProcessGroup | None,
-        execution_layout: ExecutionLayout,
-        resolved_tp_plan: ParallelPlan | None = None,
-    ) -> ParallelAssembly:
-        """Bind stage options once, then transform the model in declared order."""
-        layout = ModelPartLayout(
-            execution=execution_layout,
-            topology=topology_snapshot,
-        )
-        references = (
-            FSDPPatternReferences(part, cfg, replacements=layout.replacements)
-            if cfg.fsdp_config.fsdp_ignored_modules
-            or any(
-                options.get("hook_module") is not None or options.get("ignored_params")
-                for options in cfg.fsdp_config.fsdp_apply_modules.values()
-            )
-            else None
-        )
-
-        def record_replacements(modules, parameters):
-            if references is not None:
-                references.record_replacements(modules, parameters)
-            else:
-                layout.replacements.record_replacements(modules, parameters)
-
-        activation_swap_enabled = activation_swap and activation_checkpoint != "full"
-        for name in STAGE_ORDER:
-            if name == "compile" and not compile:
-                continue
-            if name == "activation_swap" and not activation_swap_enabled:
-                continue
-            if name == "tp":
-                part = apply_tp(
-                    part,
-                    mesh=dense_mesh,
-                    cfg=cfg,
-                    resolved_plan=resolved_tp_plan,
-                    on_replacement=record_replacements,
-                )
-            elif name == "ep":
-                # TP may have replaced parameters referenced by FSDP options.
-                if references is not None:
-                    references = FSDPPatternReferences(
-                        part, references.bind(part), replacements=layout.replacements
-                    )
-                part = apply_ep(
-                    part,
-                    cfg=cfg,
-                    ep_group=ep_group,
-                    error_group=ep_error_group,
-                    on_replacement=record_replacements,
-                )
-            elif name == "cp":
-                part = apply_cp(part, mesh=dense_mesh, cfg=cfg)
-            elif name == "ac":
-                part = apply_ac(
-                    part,
-                    mode=activation_checkpoint,
-                    selective=selective_ac,
-                    memory_budget=memory_budget_ac,
-                    region=region_ac,
-                    compile_enabled=compile,
-                )
-            elif name == "activation_swap":
-                part = apply_activation_swap(
-                    part,
-                    sync_release=activation_swap_sync_release,
-                    max_host_bytes=activation_swap_max_host_bytes,
-                )
-            elif name == "compile":
-                part = apply_compile(
-                    part, compile_config=compile_config, tp_mesh=tp_mesh
-                )
-            elif name == "fsdp":
-                layout.parameter_bindings = dict(
-                    part.named_parameters(remove_duplicate=False)
-                )
-                part = apply_fsdp(
-                    part,
-                    cfg=cfg if references is None else references.bind(part),
-                    parallel_dims=parallel_dims,
-                    chunked_loss_num_chunks=chunked_loss_num_chunks,
-                )
-            else:
-                raise ValueError(f"Unknown parallel assembly stage: {name!r}")
-            if on_model_acquired is not None:
-                on_model_acquired(part)
-        with synchronize_local_errors(
-            "Transformed model layout validation", group=error_group
-        ):
-            execution_layout.validate_model(part)
-            layout.refresh(part)
-        return ParallelAssembly(part, (layout,))
 
     # EP groups come from the sparse mesh.
     ep_group = None
@@ -271,7 +169,6 @@ def parallelize_model(
     if cp_error_group is None and cfg.cp_size > 1 and parallel_dims is not None:
         cp_error_group = parallel_dims.build_device_mesh().get_group()
     global_bindings = None
-    global_cp_plan = None
     if cfg.cp_size > 1:
         with (
             synchronize_local_errors("CP backend validation", group=cp_error_group)
@@ -281,10 +178,8 @@ def parallelize_model(
             # Metadata-only preflight. Later stages resolve current bindings
             # after TP/EP establish the actual local instance.
             global_cp_plan = resolve_cp_plan(model, cfg=cfg)
-            if global_cp_plan is not None:
-                global_bindings = model_bindings_from_plan(global_cp_plan)
+            global_bindings = model_bindings_from_plan(global_cp_plan)
 
-    global_ep_plan = None
     if cfg.ep_size > 1 or cfg.ep_config.fixed_router:
         # Reject invalid expert layouts before TP replaces parameters.
         # This is metadata-only; the execution stage
@@ -305,8 +200,7 @@ def parallelize_model(
                 has_ep_group=ep_group is not None,
                 bindings=global_bindings,
             )
-            if global_ep_plan is not None:
-                global_bindings = model_bindings_from_plan(global_ep_plan)
+            global_bindings = model_bindings_from_plan(global_ep_plan)
 
     resolved_tp_plan = None
     if cfg.tp_size > 1 and mesh is not None:
@@ -326,12 +220,93 @@ def parallelize_model(
             compile_enabled=compile,
             activation_swap=activation_swap and activation_checkpoint != "full",
         )
-    return apply_stages(
-        model,
-        dense_mesh=mesh,
-        resolved_tp_plan=resolved_tp_plan,
-        tp_mesh=tp_mesh,
-        ep_group=ep_group,
-        ep_error_group=ep_error_group,
-        execution_layout=execution_layout,
+    part = model
+    layout = ModelPartLayout(
+        execution=execution_layout,
+        topology=topology_snapshot,
     )
+    references = (
+        FSDPPatternReferences(part, cfg, replacements=layout.replacements)
+        if cfg.fsdp_config.fsdp_ignored_modules
+        or any(
+            options.get("hook_module") is not None or options.get("ignored_params")
+            for options in cfg.fsdp_config.fsdp_apply_modules.values()
+        )
+        else None
+    )
+
+    def record_replacements(
+        modules: dict[nn.Module, nn.Module],
+        parameters: dict[nn.Parameter, tuple[nn.Parameter, ...]],
+    ) -> None:
+        if references is not None:
+            references.record_replacements(modules, parameters)
+        else:
+            layout.replacements.record_replacements(modules, parameters)
+
+    activation_swap_enabled = activation_swap and activation_checkpoint != "full"
+    for name in STAGE_ORDER:
+        if name == "compile" and not compile:
+            continue
+        if name == "activation_swap" and not activation_swap_enabled:
+            continue
+        if name == "tp":
+            part = apply_tp(
+                part,
+                mesh=mesh,
+                cfg=cfg,
+                resolved_plan=resolved_tp_plan,
+                on_replacement=record_replacements,
+            )
+        elif name == "ep":
+            # TP may have replaced parameters referenced by FSDP options.
+            if references is not None:
+                references = FSDPPatternReferences(
+                    part, references.bind(part), replacements=layout.replacements
+                )
+            part = apply_ep(
+                part,
+                cfg=cfg,
+                ep_group=ep_group,
+                error_group=ep_error_group,
+                on_replacement=record_replacements,
+            )
+        elif name == "cp":
+            part = apply_cp(part, mesh=mesh, cfg=cfg)
+        elif name == "ac":
+            part = apply_ac(
+                part,
+                mode=activation_checkpoint,
+                selective=selective_ac,
+                memory_budget=memory_budget_ac,
+                region=region_ac,
+                compile_enabled=compile,
+            )
+        elif name == "activation_swap":
+            part = apply_activation_swap(
+                part,
+                sync_release=activation_swap_sync_release,
+                max_host_bytes=activation_swap_max_host_bytes,
+            )
+        elif name == "compile":
+            part = apply_compile(part, compile_config=compile_config, tp_mesh=tp_mesh)
+        elif name == "fsdp":
+            layout.parameter_bindings = dict(
+                part.named_parameters(remove_duplicate=False)
+            )
+            part = apply_fsdp(
+                part,
+                cfg=cfg if references is None else references.bind(part),
+                parallel_dims=parallel_dims,
+                chunked_loss_num_chunks=chunked_loss_num_chunks,
+            )
+        else:
+            raise ValueError(f"Unknown parallel assembly stage: {name!r}")
+        if on_model_acquired is not None:
+            on_model_acquired(part)
+    with synchronize_local_errors(
+        "Transformed model layout validation", group=error_group
+    ):
+        execution_layout.validate_model(part)
+        layout.refresh(part)
+    return ParallelAssembly(part, (layout,))

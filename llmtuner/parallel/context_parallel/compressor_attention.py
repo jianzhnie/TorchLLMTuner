@@ -24,6 +24,7 @@ from ..plan import (
     FullPlanBindings,
     ParallelPlan,
     PlanTarget,
+    first_paths_by_identity,
     snapshot_model_bindings,
 )
 from .attention import HeadToSeq, SeqToHead
@@ -188,6 +189,10 @@ def compressor_attention_forward(group):
     modeling_deepseek_v4.py (Apache-2.0). This factory does not install itself;
     the model integration must enforce contiguous inputs and supported layers.
     """
+    csa_compressor = partial(compress_csa_windows, group=group)
+    csa_selector = partial(select_csa_windows, group=group)
+    hca_compressor = partial(compress_hca_windows, group=group)
+    attention = partial(compressor_ulysses_attention, group=group)
 
     def forward(
         module,
@@ -224,10 +229,10 @@ def compressor_attention_forward(group):
             hidden_states,
             position_embeddings,
             position_ids,
-            compress_csa_windows=partial(compress_csa_windows, group=group),
-            select_csa_windows=partial(select_csa_windows, group=group),
-            compress_hca_windows=partial(compress_hca_windows, group=group),
-            attention=partial(compressor_ulysses_attention, group=group),
+            compress_csa_windows=csa_compressor,
+            select_csa_windows=csa_selector,
+            compress_hca_windows=hca_compressor,
+            attention=attention,
         )
 
     return forward
@@ -288,7 +293,7 @@ def resolve_compressor_plan(
     decoder = registered_submodule(model, structure.decoder)
     attentions = tuple(dict.fromkeys(structure.bind_attentions(model)))
     _validate_compressor_configuration(decoder, attentions, cfg=cfg, degree=degree)
-    paths = {id(module): path for path, module in reversed(bindings["module_bindings"])}
+    paths = first_paths_by_identity(bindings["module_bindings"])
     return ParallelPlan(
         stage="cp",
         degree=degree,

@@ -30,10 +30,9 @@ def collect_resource_metrics(
     Activation events are measured only when activation swap is configured.
     Byte counters are cumulative; device transfer seconds consume the log window.
     """
-    result = {}
-    result.update(getattr(activation_swap, "observation_metrics", {}).copy())
-    result.update(getattr(optimizer, "observation_metrics", {}).copy())
-    result.update(getattr(checkpointer, "observation_metrics", {}).copy())
+    result: dict[str, float] = {}
+    for owner in (activation_swap, optimizer, checkpointer):
+        result.update(getattr(owner, "observation_metrics", {}))
     timers = tuple(dispatch_timers)
     if timers:
         result["moe/local_forward_dispatch_seconds_window"] = sum(

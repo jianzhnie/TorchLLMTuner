@@ -148,9 +148,9 @@ class FSDPPatternReferences:
         current_parameters = set(parameters.values())
 
         def mapped_module_path(source: nn.Module | None, context: str) -> str | None:
-            if source not in self.replacements.module_targets:
+            target = self.replacements.module_targets.get(source)
+            if target is None:
                 return None
-            target = self.replacements.module_targets[source]
             path = first_module_paths.get(id(target))
             if path is None:
                 raise ValueError(
@@ -164,11 +164,12 @@ class FSDPPatternReferences:
         ) -> set[nn.Parameter]:
             rebound = set()
             for parameter in exclusions:
-                if parameter in self.replacements.parameter_targets:
+                replacements = self.replacements.parameter_targets.get(parameter)
+                if replacements is not None:
                     # An explicit conversion owns this identity. Its former
                     # paths may now belong to unrelated parameters; never union
                     # those registrations into a split/merged target set.
-                    targets = set(self.replacements.parameter_targets[parameter])
+                    targets = set(replacements)
                     if not targets <= current_parameters:
                         raise ValueError(
                             f"{context}: ignored_params replacement target is no "
@@ -203,23 +204,24 @@ class FSDPPatternReferences:
             hook = options.get("hook_module")
             if isinstance(hook, nn.Module):
                 mapped = mapped_module_path(hook, f"FSDP hook for {pattern!r}")
-                targets = [
-                    modules[path]
-                    for path in self.module_paths.get(hook, ())
-                    if path in modules
-                ]
                 if mapped is not None:
                     options["hook_module"] = modules[mapped]
-                elif targets:
-                    options["hook_module"] = targets[0]
-                elif id(hook) in first_module_paths:
-                    options["hook_module"] = modules[first_module_paths[id(hook)]]
                 else:
-                    raise ValueError(
-                        f"FSDP pattern {pattern!r}: hook_module lost its registered "
-                        "paths during model transformation; configure the "
-                        "override on the converted model"
+                    path = next(
+                        (
+                            path
+                            for path in self.module_paths.get(hook, ())
+                            if path in modules
+                        ),
+                        first_module_paths.get(id(hook)),
                     )
+                    if path is None:
+                        raise ValueError(
+                            f"FSDP pattern {pattern!r}: hook_module lost its registered "
+                            "paths during model transformation; configure the "
+                            "override on the converted model"
+                        )
+                    options["hook_module"] = modules[path]
             exclusions = options.get("ignored_params")
             if isinstance(exclusions, set):
                 options["ignored_params"] = bind_parameters(

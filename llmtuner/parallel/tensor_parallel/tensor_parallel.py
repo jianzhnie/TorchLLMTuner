@@ -62,7 +62,12 @@ from ...accelerator.linear_collectives import (
 )
 from ...models.common.moe.experts import GroupedExperts
 from ...models.common.moe.layer import MoE, declared_moe_block
-from ...models.contracts import DecoderStructure, GatedMLPStructure, MoEBlockContract
+from ...models.contracts import (
+    DecoderStructure,
+    GatedMLPStructure,
+    MoEBlockContract,
+    registered_submodule,
+)
 from ...utils.logging import get_logger
 from .. import compatibility
 from ..attention_heads import require_heads_divisible_by
@@ -71,6 +76,7 @@ from ..plan import (
     ParallelPlan,
     PlanTarget,
     snapshot_model_bindings,
+    unique_module_bindings,
 )
 from ..replacements import ReplacementObserver
 from ..vocab_parallel.vocab_parallel import VocabParallelEmbedding
@@ -402,10 +408,7 @@ def _resolve_tp_targets(
     )
     # Full ownership snapshots retain aliases; target application must see
     # each module once, using its first registered path.
-    unique_modules: dict[int, tuple[str, nn.Module]] = {}
-    for path, module in registered_modules:
-        unique_modules.setdefault(id(module), (path, module))
-    modules = tuple(unique_modules.values())
+    modules = unique_module_bindings(registered_modules)
     for module_path, module in modules:
         if isinstance(module, nn.Linear):
             spec = tp_sharding.match_tp_sharding_spec(module_path, plan=sharding_plan)
@@ -427,7 +430,7 @@ def _resolve_tp_targets(
     structure = getattr(model, "decoder_structure", None)
     declared_moe_ids: set[int] = set()
     if isinstance(structure, DecoderStructure):
-        for layer in model.get_submodule(structure.blocks):
+        for layer in structure.bind_blocks(model):
             declaration = declared_moe_block(layer)
             if declaration is None:
                 if plan_declares_moe:
@@ -673,10 +676,7 @@ def resolve_tp_plan(
     bindings = snapshot_model_bindings(model) if bindings is None else bindings
     # Keep the first registered path, matching named_modules() traversal, while
     # retaining every alias in the ownership snapshot handed to ParallelPlan.
-    unique_modules: dict[int, tuple[str, nn.Module]] = {}
-    for path, module in bindings["module_bindings"]:
-        unique_modules.setdefault(id(module), (path, module))
-    modules = tuple(unique_modules.values())
+    modules = unique_module_bindings(bindings["module_bindings"])
     targets, moe_blocks = _resolve_tp_targets(
         model, cfg=cfg, raw_plan=raw_plan, module_bindings=bindings["module_bindings"]
     )
@@ -706,10 +706,15 @@ def resolve_tp_plan(
         # Explicit projection-only plans have no attention semantics. Model
         # integrations declare their attention slots through DecoderStructure.
         attention_paths = []
-    attention_is_sharded = any(
-        any(path.startswith(f"{attention}.") for attention in attention_paths)
-        for path, _, _ in targets
-    )
+    # Each projection contributes its owning module and all registered ancestors.
+    # Reuse this index for attention boundaries and full-history restrictions.
+    sharded_module_paths: set[str] = set()
+    for path, _, _ in targets:
+        parent, _, _ = path.rpartition(".")
+        while parent:
+            sharded_module_paths.add(parent)
+            parent, _, _ = parent.rpartition(".")
+    attention_is_sharded = bool(sharded_module_paths.intersection(attention_paths))
     if not attention_paths or attention_is_sharded:
         require_heads_divisible_by(
             model,
@@ -803,15 +808,13 @@ def resolve_tp_plan(
         and not isinstance(
             module, GatherSequenceFirst | ReplicatedAttentionSequenceBoundary
         )
-        and not any(target.startswith(f"{path}.") for target, _, _ in targets)
+        and path not in sharded_module_paths
     ]
     # GDN's convolution and recurrence need the complete token history, even
     # though HF's colwise_gather_output projections stay replicated here.
     # Head-sharded GDN requires a different boundary and is not implemented.
     for path, module in modules:
-        if requires_full_token_history(module) and any(
-            target.startswith(f"{path}.") for target, _, _ in targets
-        ):
+        if requires_full_token_history(module) and path in sharded_module_paths:
             raise ValueError("TP linear_attn requires replicated GDN projections")
 
     # Attention gathers at its input boundary. Inner column projections must
@@ -822,7 +825,7 @@ def resolve_tp_plan(
     realized_targets = []
     for module_path, inner, spec in targets:
         parent_path, _, _ = module_path.rpartition(".")
-        parent = model.get_submodule(parent_path)
+        parent = registered_submodule(model, parent_path)
         is_attention = (
             declared_attentions is not None and id(parent) in declared_attentions
         )
@@ -949,37 +952,29 @@ def apply_tp(
     if resolved.degree != cfg.tp_size:
         raise ValueError("Resolved TP degree does not match configuration")
     resolved.validate_binding(model)
-    targets = tuple(
-        (target.path, target.module, target.spec)
-        for target in resolved.targets
-        if target.kind == "dense"
-    )
-    moe_blocks = tuple(
-        (target.path, target.module)
-        for target in resolved.targets
-        if target.kind == "moe"
-    )
-    vocab_targets = tuple(
-        (target.path, target.module)
-        for target in resolved.targets
-        if target.kind == "vocab"
-    )
-    attention_parents = tuple(
-        target.module
-        for target in resolved.targets
-        if target.kind == "attention" and target.layout == "gather"
-    )
-    replicated_attention = tuple(
-        target.module
-        for target in resolved.targets
-        if target.kind == "attention" and target.layout == "replicate_tokens"
-    )
+    targets = []
+    moe_blocks = []
+    vocab_targets = []
+    attention_parents = []
+    replicated_attention = []
+    sequence_metadata = []
+    shared_bindings = {}
+    for target in resolved.targets:
+        if target.kind == "dense":
+            targets.append((target.path, target.module, target.spec))
+        elif target.kind == "moe":
+            moe_blocks.append((target.path, target.module))
+            shared_bindings[target.module] = target.spec
+        elif target.kind == "vocab":
+            vocab_targets.append((target.path, target.module))
+        elif target.kind == "attention":
+            if target.layout == "gather":
+                attention_parents.append(target.module)
+            elif target.layout == "replicate_tokens":
+                replicated_attention.append(target.module)
+        elif target.kind == "decoder" and target.layout == "sequence_parallel":
+            sequence_metadata.append(target)
 
-    sequence_metadata = tuple(
-        target
-        for target in resolved.targets
-        if target.kind == "decoder" and target.layout == "sequence_parallel"
-    )
     for target in sequence_metadata:
         if not callable(target.spec) or (
             getattr(target.module, "configure_sequence_parallel", None) != target.spec
@@ -988,18 +983,19 @@ def apply_tp(
                 "Resolved sequence parallel configuration binding is stale"
             )
 
-    tp_size = mesh["tp"].size()
+    tp_mesh = mesh["tp"]
+    tp_size = tp_mesh.size()
     if tp_size != cfg.tp_size:
         raise ValueError(
             f"TP mesh size {tp_size} does not match configured tp={cfg.tp_size}"
         )
-    use_symm_mem = supports_symm_mem(mesh["tp"])
+    use_symm_mem = supports_symm_mem(tp_mesh)
     execution_plan = replace(
         resolved, implementation="symm_mem" if use_symm_mem else "functional"
     )
     execution_plan.validate_binding(model)
-    group = mesh["tp"].get_group()
-    tp_rank = mesh["tp"].get_local_rank()
+    group = tp_mesh.get_group()
+    tp_rank = tp_mesh.get_local_rank()
     if use_symm_mem:
         enable_symm_mem(group)
 
@@ -1013,7 +1009,7 @@ def apply_tp(
     # Deepest paths first, so replacing a module never hides an inner target.
     for module_path, inner, spec in sorted(targets, key=lambda t: -t[0].count(".")):
         parent_path, _, attr = module_path.rpartition(".")
-        parent = model.get_submodule(parent_path) if parent_path else model
+        parent = registered_submodule(model, parent_path)
 
         wrapped = spec.implementation(
             inner.weight,
@@ -1068,7 +1064,7 @@ def apply_tp(
     local_vocab_size = 0
     for module_path, inner in vocab_targets:
         parent_path, _, attr = module_path.rpartition(".")
-        parent = model.get_submodule(parent_path) if parent_path else model
+        parent = registered_submodule(model, parent_path)
         local_vocab_size = inner.num_embeddings // tp_size
         vocab_start = tp_rank * local_vocab_size
         wrapped = VocabParallelEmbedding(
@@ -1095,36 +1091,28 @@ def apply_tp(
         tp_size=tp_size,
         tp_rank=tp_rank,
         group=group,
-        shared_bindings={
-            target.module: target.spec
-            for target in resolved.targets
-            if target.kind == "moe"
-        },
+        shared_bindings=shared_bindings,
     )
     for parent, attr, wrapped in replacements:
         setattr(parent, attr, wrapped)
 
-    for parent in attention_parents:
-        if isinstance(parent, GatherSequenceFirst):
-            continue  # already gathered (apply_tp is idempotent per module)
-        parent._tp_seq_group = group
-        if "forward" in parent.__dict__:
-            parent._tp_attention_original_forward = parent.__dict__.pop("forward")
-        parent.__class__ = type(
-            f"TPGather{type(parent).__name__}",
-            (GatherSequenceFirst, type(parent)),
-            {},
-        )
-
-    for attention in replicated_attention:
-        attention._tp_seq_group = group
-        if "forward" in attention.__dict__:
-            attention._tp_attention_original_forward = attention.__dict__.pop("forward")
-        attention.__class__ = type(
-            f"TPReplicated{type(attention).__name__}",
-            (ReplicatedAttentionSequenceBoundary, type(attention)),
-            {},
-        )
+    for boundary, prefix, attentions in (
+        (GatherSequenceFirst, "TPGather", attention_parents),
+        (ReplicatedAttentionSequenceBoundary, "TPReplicated", replicated_attention),
+    ):
+        for attention in attentions:
+            if isinstance(attention, boundary):
+                continue  # Already wrapped; do not stack execution boundaries.
+            attention._tp_seq_group = group
+            if "forward" in attention.__dict__:
+                attention._tp_attention_original_forward = attention.__dict__.pop(
+                    "forward"
+                )
+            attention.__class__ = type(
+                f"{prefix}{type(attention).__name__}",
+                (boundary, type(attention)),
+                {},
+            )
 
     layouts = model.__dict__.setdefault("_tp_checkpoint_layouts", {})
     for path, _, spec in targets:
@@ -1147,16 +1135,16 @@ def apply_tp(
         # TP preserves FQNs, including packed expert parameters. Resolve these
         # exact paths once after installation and report identity changes to
         # downstream FSDP bindings; do not infer replacements by shape.
-        modules = {
-            source: model.get_submodule(path)
-            for path, source in execution_plan.module_bindings or ()
-            if model.get_submodule(path) is not source
-        }
-        parameters = {
-            source: (model.get_parameter(path),)
-            for path, source in execution_plan.parameter_bindings or ()
-            if model.get_parameter(path) is not source
-        }
+        modules = {}
+        for path, source in execution_plan.module_bindings or ():
+            current_module = registered_submodule(model, path)
+            if current_module is not source:
+                modules[source] = current_module
+        parameters = {}
+        for path, source in execution_plan.parameter_bindings or ():
+            current_parameter = model.get_parameter(path)
+            if current_parameter is not source:
+                parameters[source] = (current_parameter,)
         on_replacement(modules, parameters)
     model.parallel_plan = execution_plan
     logger.info(

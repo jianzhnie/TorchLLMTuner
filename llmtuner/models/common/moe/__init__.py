@@ -1,22 +1,6 @@
-"""The MoE stack, one node per file.
+"""Shared MoE routing, expert computation, layout contracts and balancing.
 
-Split out of torchtitan's single ``models/common/moe.py`` (plus its
-``token_dispatcher.py``), which carried all of this in one module:
-
-* ``routing.py`` -- ``TokenChoiceTopKRouter``, ``QuantileBalancedTopKRouter``,
-  ``QuantileBalancer``. Token-choice routing, including node-limited groups.
-* ``gate.py`` -- ``RouterGateLinear``, the FP32 router projection and backward.
-* ``experts.py`` -- ``GroupedExperts`` (every expert's weights as three stacked
-  tensors) and ``RoutedExperts`` (the dispatch/combine pair around them).
-* ``layer.py`` -- ``MoE`` itself, plus ``collect_moe_layers`` /
-  ``declared_moe_block``, the walk the hooks and the compile pass use.
-* ``auxiliary_loss.py`` -- ``MicrobatchWiseLoadBalanceLoss``, the per-forward
-  sequence-wise auxiliary loss a router can carry.
-* ``bias_update.py`` -- the auxiliary-loss-free bias updates and optimizer hooks.
-  the optimizer step pre-hooks that call it, sign-based and quantile.
-
-Local and distributed token dispatch implementations and their metadata live
-in ``parallel/expert_parallel/token_dispatch.py``. This package re-exports
-nothing; import the defining module directly. Model APIs remain discoverable
-through the ``models.common`` index.
+Dispatch observations live beside their forward boundary in ``experts.py``.
+Token dispatch implementations belong to ``parallel/expert_parallel``.
+Import public types from their defining modules; this package has no re-exports.
 """

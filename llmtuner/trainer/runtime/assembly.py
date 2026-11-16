@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 from torch.distributed import ProcessGroup
@@ -39,7 +39,10 @@ from ...components.loss import chunked_lm_head_cross_entropy, cross_entropy_loss
 from ...components.loss_contract import LossFunctions
 from ...components.metrics import MetricsProcessor
 from ...components.optimizer.ema import EMA
-from ...components.optimizer.lr_scheduler import build_lr_scheduler
+from ...components.optimizer.lr_scheduler import (
+    LRSchedulersContainer,
+    build_lr_scheduler,
+)
 from ...components.optimizer.optimizer import OptimizersContainer
 from ...components.optimizer.state_residency import validate_checkpoint_configuration
 from ...components.profiler import Profiler
@@ -76,9 +79,10 @@ if TYPE_CHECKING:
     from .environment import RuntimeEnvironment
 
 
-def _resolve_factory(
-    factory: Callable[..., Any] | None, default: Callable[..., Any]
-) -> Callable[..., Any]:
+_Factory = TypeVar("_Factory", bound=Callable[..., Any])
+
+
+def _resolve_factory(factory: _Factory | None, default: _Factory) -> _Factory:
     return default if factory is None else factory
 
 
@@ -136,7 +140,7 @@ class OptimizerStack:
     """Optimizer services sharing the final parallel parameter layout."""
 
     optimizer: OptimizersContainer
-    lr_scheduler: Any
+    lr_scheduler: LRSchedulersContainer
     ema: EMA | None
 
 
@@ -276,7 +280,6 @@ def _apply_parallelism(
     device: torch.device,
     load_initial_weights: bool,
     error_group: ProcessGroup | None = None,
-    loss_functions: LossFunctions | None = None,
     on_model_acquired: Callable[[torch.nn.Module], None] | None = None,
 ) -> ModelAssembly:
     """Apply configured stages and return this rank's explicit model ownership."""
@@ -308,17 +311,17 @@ def _apply_parallelism(
     if load_initial_weights or cfg.model.initialization_device == "meta":
         materialization_error: BaseException | None = None
         try:
-            for model_part in assembled.model_parts:
-                cpu_offload = cfg.parallel.fsdp_config.fsdp_cpu_offload
-                materialize_meta_model(
-                    model_part,
-                    device,
-                    parameter_device=torch.device("cpu") if cpu_offload else None,
-                    offloaded_parameters=(
-                        _fsdp_managed_parameters(model_part) if cpu_offload else None
-                    ),
-                    runtime_buffers=_model_materialization_buffers(model_part, device),
-                )
+            cpu_offload = cfg.parallel.fsdp_config.fsdp_cpu_offload
+            parameter_device = torch.device("cpu") if cpu_offload else None
+            materialize_meta_model(
+                orchestration,
+                device,
+                parameter_device=parameter_device,
+                offloaded_parameters=(
+                    _fsdp_managed_parameters(orchestration) if cpu_offload else None
+                ),
+                runtime_buffers=_model_materialization_buffers(orchestration, device),
+            )
         except BaseException as error:
             materialization_error = error
         # FSDP _apply may manage communication state. Finish materialization
@@ -329,18 +332,15 @@ def _apply_parallelism(
         if not load_initial_weights:
             initialization_error: BaseException | None = None
             try:
-                for model_part in assembled.model_parts:
-                    initialize_model = getattr(
-                        model_part, "initialize_parameters", None
+                initialize_model = getattr(orchestration, "initialize_parameters", None)
+                if not callable(initialize_model):
+                    raise TypeError(
+                        f"{type(orchestration).__name__} must implement "
+                        "initialize_parameters() for meta initialization"
                     )
-                    if not callable(initialize_model):
-                        raise TypeError(
-                            f"{type(model_part).__name__} must implement "
-                            "initialize_parameters() for meta initialization"
-                        )
-                    # DTensor initialization may communicate. Complete it
-                    # outside the local-only boundary, just like materialization.
-                    initialize_model()
+                # DTensor initialization may communicate. Complete it
+                # outside the local-only boundary, just like materialization.
+                initialize_model()
             except BaseException as error:
                 initialization_error = error
             with synchronize_local_errors(
@@ -360,7 +360,6 @@ def prepare_parallel_model(
     cfg: LLMTunerConfig,
     *,
     environment: RuntimeEnvironment,
-    loss_functions: LossFunctions | None = None,
     on_model_acquired: Callable[[torch.nn.Module], None] | None = None,
 ) -> PreparedModel:
     """Construct, count and assemble a model without accessing a Trainer.
@@ -377,12 +376,13 @@ def prepare_parallel_model(
         )
         if on_model_acquired is not None:
             on_model_acquired(model)
-        num_parameters = sum(parameter.numel() for parameter in model.parameters())
-        num_trainable_parameters = sum(
-            parameter.numel()
-            for parameter in model.parameters()
-            if parameter.requires_grad
-        )
+        num_parameters = 0
+        num_trainable_parameters = 0
+        for parameter in model.parameters():
+            count = parameter.numel()
+            num_parameters += count
+            if parameter.requires_grad:
+                num_trainable_parameters += count
     assembled = _apply_parallelism(
         model,
         cfg=cfg,
@@ -391,7 +391,6 @@ def prepare_parallel_model(
         device=environment.device,
         load_initial_weights=load_initial_weights,
         error_group=environment.error_group,
-        loss_functions=loss_functions,
         on_model_acquired=on_model_acquired,
     )
     return PreparedModel(

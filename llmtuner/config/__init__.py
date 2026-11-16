@@ -38,7 +38,6 @@ from llmtuner.config.parallel_config import (
     ParallelConfig,
     TensorParallelConfig,
 )
-from llmtuner.config.rope_config import RoPEConfig
 from llmtuner.config.training_config import TrainingConfig
 from llmtuner.config.validation_config import ValidationConfig
 
@@ -65,7 +64,6 @@ __all__ = [
     "ParamGroupConfig",
     "ProfilerConfig",
     "RegionACConfig",
-    "RoPEConfig",
     "SelectiveACConfig",
     "TrainingConfig",
     "VALID_AC_MODES",

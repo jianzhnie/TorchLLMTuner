@@ -24,6 +24,15 @@ if TYPE_CHECKING:
     from ....parallel.topology import ParallelTopology
 
 
+def _runtime_moe_layers(model_parts: Sequence[nn.Module]) -> list[MoE]:
+    """Collect declared MoE owners once in model-part and decoder-layer order."""
+    layers: dict[int, MoE] = {}
+    for part in model_parts:
+        for layer in collect_moe_layers(part):
+            layers.setdefault(id(layer), layer)
+    return list(layers.values())
+
+
 @torch.no_grad()
 def reset_routing_statistics(model_parts: Sequence[nn.Module]) -> None:
     """Discard observations before starting a new accumulation window.
@@ -90,32 +99,26 @@ def collect_routing_load_metrics(
     """Observe native MoE counters before optimizer hooks drain them.
 
     Counts use the same ownership reductions as balancing. Scalar aggregation
-    across WORLD handles PP stages with differing numbers of local MoE layers.
+    across WORLD combines local observations from every participating rank.
     Repeated data replicas cancel in averages; inactive layers are not counted.
     """
-    layers = list(
-        {
-            id(layer): layer
-            for part in model_parts
-            for layer in collect_moe_layers(part)
-        }.values()
-    )
+    layers = _runtime_moe_layers(model_parts)
     totals = torch.zeros(4, device=device, dtype=torch.float32)
     if layers:
         counts = _reduce_token_statistics(
-            [layer.tokens_per_expert_E.detach().clone() for layer in layers],
+            [layer.tokens_per_expert_E for layer in layers],
             parallel_dims,
         )
         for values in counts:
-            mean = values.float().mean()
+            floating_values = values.float()
+            mean = floating_values.mean()
             active = (mean > 0).float()
+            denominator = mean.clamp_min(1e-12)
             totals[0] += active
             totals[1] += active * (values == 0).float().mean()
-            totals[2] += (
-                active * values.float().std(unbiased=False) / mean.clamp_min(1e-12)
-            )
+            totals[2] += active * floating_values.std(unbiased=False) / denominator
             totals[3] = torch.maximum(
-                totals[3], active * values.max() / mean.clamp_min(1e-12)
+                totals[3], active * values.max() / denominator
             )
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.all_reduce(totals[:3])
@@ -151,9 +154,6 @@ def update_expert_bias(
       stream is sharded over TP as well. Without EP every TP rank already sees
       the same full stream, so summing would multiply the counts by ``tp``
       (harmless for a sign-based step, but wrong for anything else reading it).
-
-    Pipeline parallelism needs no collective here: it is a layer split, not a
-    token split, so each stage's blocks see their own whole token stream.
 
     The expert dimension is deliberately *not* reduced. ``tokens_per_expert_E``
     is the global per-expert count -- the routing map spans all ``E`` experts on
@@ -254,13 +254,7 @@ def register_moe_balancing_hook(
     otherwise sign-based coefficients must be set on every layer or none.
     Dense models and models without balancing need no hook or collective.
     """
-    layers: list[MoE] = []
-    seen: set[int] = set()
-    for part in model_parts:
-        for moe in collect_moe_layers(part):
-            if id(moe) not in seen:
-                layers.append(moe)
-                seen.add(id(moe))
+    layers = _runtime_moe_layers(model_parts)
     if not layers:
         return
     quantile_layers = [

@@ -2,8 +2,8 @@
 
 * ``registry.py`` registers model-owned config and construction hooks.
 * ``deepseek/``, ``kimi/`` and ``qwen/`` contain independent model structures.
-* ``common/`` contains model-agnostic attention, MoE, feed-forward, embedding,
-  RoPE, activation, and multimodal components.
+* ``common/`` contains shared attention masks, MoE, input preparation,
+  activation, loss and gradient contracts.
 
 Import implementations from their defining leaf modules. Package indexes do not
 eagerly import model stacks or optional accelerator dependencies. External model

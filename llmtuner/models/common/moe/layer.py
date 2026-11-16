@@ -40,9 +40,8 @@ import torch
 import torch.nn as nn
 from torch._dynamo import OptimizedModule
 
-from llmtuner.models.common.aux_loss import accumulate_forward_metric
-
 from ...contracts import DecoderStructure
+from ..aux_loss import accumulate_forward_metric
 from .experts import RoutedExperts
 from .routing import QuantileBalancedTopKRouter, TokenChoiceTopKRouter
 
@@ -266,17 +265,13 @@ class MoE(nn.Module):
             # recompute of this same microbatch sees the same mask and the
             # statistics stay filtered identically on both passes.
             padding_mask = self._pending_padding_mask
-        if x.dim() > 2:
-            lead = x.shape[:-1]
-            out = self._forward_tokens(
-                x.reshape(-1, x.shape[-1]),
-                padding_mask_T=(
-                    None if padding_mask is None else padding_mask.reshape(-1)
-                ),
-            )
-            out = out.reshape(*lead, out.shape[-1])
-        else:
-            out = self._forward_tokens(x, padding_mask_T=padding_mask)
+        restore_shape = x.dim() > 2
+        tokens = x.reshape(-1, x.shape[-1]) if restore_shape else x
+        if restore_shape and padding_mask is not None:
+            padding_mask = padding_mask.reshape(-1)
+        out = self._forward_tokens(tokens, padding_mask_T=padding_mask)
+        if restore_shape:
+            out = out.reshape(*x.shape[:-1], out.shape[-1])
         # Reproduce the replaced HF block's return arity. The second element is
         # ``None``: llmtuner's router consumes its scores internally, and the
         # swap refuses a config that would make HF read them (see
@@ -348,8 +343,8 @@ def collect_moe_layers(model_part: nn.Module) -> list[MoE]:
     seen: set[int] = set()
     # Activation checkpointing wraps each layer in torch's CheckpointWrapper;
     # bind declarations against the original layer, not wrapper attributes.
-    layers = [getattr(layer, "_checkpoint_wrapped_module", layer) for layer in layers]
     for layer in layers:
+        layer = getattr(layer, "_checkpoint_wrapped_module", layer)
         declared = declared_moe_block(layer)
         if declared is None:
             raise ValueError(

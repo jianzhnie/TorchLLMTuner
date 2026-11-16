@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.distributed import ProcessGroup
@@ -22,6 +22,7 @@ from ...components.loss import chunked_lm_head_cross_entropy, cross_entropy_loss
 from ...components.loss_contract import (
     ChunkedLossBackward,
     LossSum,
+    VocabularyLossKwargs,
     validate_loss_sum,
     validate_normalization_tokens,
 )
@@ -31,15 +32,19 @@ from ...models.common.moe.bias_update import (
     collect_routing_load_metrics,
     reset_routing_statistics,
 )
-from ...models.contracts import DecoderStructure
+from ...models.contracts import DecoderStructure, registered_submodule
 from ...models.execution import ModelExecutionCapabilities, validate_training_output
 from ...parallel.execution import ExecutionLayout
 from ...parallel.fully_shard_parallel.policies import iter_fsdp_modules
 from ...parallel.topology import ParallelTopology
 from . import gradients
 from .batch import prepare_model_inputs
-from .reductions import TrainingReductionMeshes
 from .results import AccumulationResult, StepResult, UpdateResult
+
+if TYPE_CHECKING:
+    from ...components.optimizer.ema import EMA
+    from ...components.optimizer.lr_scheduler import LRSchedulersContainer
+    from ...components.optimizer.optimizer import OptimizersContainer
 
 ParamContext = Callable[[], AbstractContextManager[Any]]
 
@@ -48,7 +53,7 @@ def loss_vocab_kwargs(
     parallel_dims: ParallelTopology | None,
     *,
     layout: ExecutionLayout | None = None,
-) -> dict[str, Any]:
+) -> VocabularyLossKwargs:
     """Bind loss reduction to declared output ownership, never module attributes."""
     tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
     if layout is not None:
@@ -70,9 +75,9 @@ class TrainingEngine:
     execution_layouts: tuple[ExecutionLayout, ...] = ()
     loss_sum: LossSum = cross_entropy_loss
     chunked_loss_backward: ChunkedLossBackward | None = chunked_lm_head_cross_entropy
-    optimizer: Any = None
-    lr_scheduler: Any = None
-    ema: Any = None
+    optimizer: OptimizersContainer | None = None
+    lr_scheduler: LRSchedulersContainer | None = None
+    ema: EMA | None = None
     # All update participants coordinate failures through this group.
     error_group: ProcessGroup | None = None
     max_norm: float = 1.0
@@ -89,22 +94,25 @@ class TrainingEngine:
         init=False, default=None, repr=False, compare=False
     )
 
-    _loss_kwargs: dict[str, Any] = field(init=False, repr=False, compare=False)
+    _loss_kwargs: VocabularyLossKwargs = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if self.chunked_loss_num_chunks > 1 and self.chunked_loss_backward is None:
+        chunked_loss = self.chunked_loss_num_chunks > 1
+        if chunked_loss and self.chunked_loss_backward is None:
             raise ValueError("Configured loss does not support chunked backward")
         # Execution policy belongs to this assembly. Rebuild the engine after
         # changing topology or loss mode rather than selecting it on each batch.
         if len(self.model_parts) != 1:
             raise ValueError("Dense execution requires exactly one model part")
-        if self.chunked_loss_num_chunks > 1:
-            structure = getattr(self.model, "decoder_structure", None)
+        model = self.model
+        if chunked_loss:
+            structure = getattr(model, "decoder_structure", None)
             if not isinstance(structure, DecoderStructure):
                 raise TypeError("Chunked loss requires a model-owned DecoderStructure")
-            self._chunked_projection = self.model.get_submodule(structure.head)
+            self._chunked_projection = registered_submodule(model, structure.head)
             if isinstance(self._chunked_projection, torch.nn.Identity):
                 raise ValueError("Chunked loss requires an owned output projection")
+        layout = None
         if self.execution_layouts:
             if len(self.execution_layouts) != len(self.model_parts):
                 raise ValueError("Execution layouts must match local model parts")
@@ -114,49 +122,37 @@ class TrainingEngine:
                 if self.parallel_dims is not None
                 and getattr(self.parallel_dims, f"{axis}_enabled")
             )
-            for part, layout in zip(
-                self.model_parts, self.execution_layouts, strict=True
-            ):
-                layout.validate_model(part)
-                if layout.sequence_shard_axes != expected_axes:
-                    raise ValueError("Engine topology disagrees with sequence layout")
-                if layout.chunked_loss != (self.chunked_loss_num_chunks > 1):
-                    raise ValueError(
-                        "Engine loss strategy disagrees with assembled output layout"
-                    )
-                if layout.output != "logits":
-                    raise ValueError(
-                        "Dense engine requires a logits-producing model part"
-                    )
+            layout = self.execution_layouts[0]
+            layout.validate_model(model)
+            if layout.sequence_shard_axes != expected_axes:
+                raise ValueError("Engine topology disagrees with sequence layout")
+            if layout.chunked_loss != chunked_loss:
+                raise ValueError(
+                    "Engine loss strategy disagrees with assembled output layout"
+                )
+            if layout.output != "logits":
+                raise ValueError("Dense engine requires a logits-producing model part")
         capabilities = (
-            tuple(layout.capabilities for layout in self.execution_layouts)
-            if self.execution_layouts
-            else tuple(
-                getattr(part, "execution_capabilities", None)
-                for part in self.model_parts
-            )
+            layout.capabilities
+            if layout is not None
+            else getattr(model, "execution_capabilities", None)
         )
-        if not capabilities or any(
-            not isinstance(value, ModelExecutionCapabilities) for value in capabilities
-        ):
+        if not isinstance(capabilities, ModelExecutionCapabilities):
             raise TypeError(
                 "Every model part must declare valid execution capabilities"
             )
-        self._output_capabilities = capabilities[0]
+        self._output_capabilities = capabilities
         if not self._output_capabilities.logits:
             raise ValueError("Dense execution requires model-declared logits output")
-        if (
-            self.chunked_loss_num_chunks > 1
-            and not self._output_capabilities.hidden_states
-        ):
+        if chunked_loss and not self._output_capabilities.hidden_states:
             raise ValueError("Chunked loss requires model-declared hidden output")
         self._loss_kwargs = loss_vocab_kwargs(
             self.parallel_dims,
-            layout=self.execution_layouts[0] if self.execution_layouts else None,
+            layout=layout,
         )
         self._dense_backward = (
             self._backward_chunked
-            if self.chunked_loss_num_chunks > 1
+            if chunked_loss
             else self._backward_logits
         )
 
@@ -193,8 +189,7 @@ class TrainingEngine:
     def prepare_accumulation_group(self, *, is_last: bool) -> None:
         """HSDP reduces accumulated gradients only on the final backward group."""
         if self.parallel_dims is not None and self.parallel_dims.dp_replicate_enabled:
-            for part in self.model_parts:
-                part.set_requires_all_reduce(is_last)
+            self.model.set_requires_all_reduce(is_last)
 
     def synchronize_gradients(self) -> None:
         """Finish excluded and replicated gradient reductions before clipping."""
@@ -244,7 +239,7 @@ class TrainingEngine:
         self, batch: Batch | TrainerBatch
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         return prepare_model_inputs(
-            self.model_parts[0],
+            self.model,
             batch,
             device=self.device,
             parallel_dims=self.parallel_dims,
@@ -281,11 +276,10 @@ class TrainingEngine:
         The caller owns eval/no-grad mode, RNG restoration and reporting.
         """
         inputs, labels, extra_kwargs = self.preprocess(batch)
+        model = self.model
         try:
             with self.param_context(), spmd_context(self.parallel_dims):
-                logits = self._training_output(
-                    self.model(inputs, **extra_kwargs), labels
-                )
+                logits = self._training_output(model(inputs, **extra_kwargs), labels)
                 loss = self.loss_sum(logits, labels.reshape(-1), **self._loss_kwargs)
                 with synchronize_local_errors(
                     "Validation loss result validation", group=self.error_group
@@ -296,9 +290,8 @@ class TrainingEngine:
             # Validation has no backward to restore units configured to retain
             # full parameters after forward. Restore their original bindings
             # before checkpointing, EMA or the next training update observes them.
-            for part in self.model_parts:
-                for module in iter_fsdp_modules(part):
-                    module.reshard()
+            for module in iter_fsdp_modules(model):
+                module.reshard()
 
     def forward_backward_dense(
         self,
@@ -446,7 +439,6 @@ class TrainingEngine:
         step: int,
         *,
         accumulation: AccumulationResult,
-        reduction_meshes: TrainingReductionMeshes,
         collect_metrics: bool,
         before_gradient_clipping: Callable[[], None] | None = None,
     ) -> UpdateResult:
@@ -471,7 +463,6 @@ class TrainingEngine:
             expert_reduce_layout=self.expert_reduce_layout,
             step=step,
             error_group=self.error_group,
-            reduction_meshes=reduction_meshes,
             loss_is_finite=accumulation.loss_is_finite,
         )
         return self.optimizer_step(

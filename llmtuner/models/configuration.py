@@ -56,15 +56,15 @@ def build_model_config(
     empty dict to use architecture defaults. ``None`` loads the config from a
     local checkpoint directory or Hub identifier.
     """
-    architecture = get_model_spec(model_name_or_path, task=None)
-    # Some HF composite constructors modify nested configuration dictionaries.
-    overrides = deepcopy(arch_overrides) if arch_overrides is not None else {}
     if arch_overrides is not None:
-        overrides.setdefault("max_position_embeddings", seq_len)
+        architecture = get_model_spec(model_name_or_path, task=None)
         if architecture is None:
             raise ValueError(
                 f"No local configuration registered for {model_name_or_path!r}"
             )
+        # Some HF composite constructors modify nested configuration dictionaries.
+        overrides = deepcopy(arch_overrides)
+        overrides.setdefault("max_position_embeddings", seq_len)
         config = architecture.build_config(**overrides)
     else:
         # Read external metadata, but only the registered config class loads it.
@@ -184,6 +184,7 @@ def build_model_config_for(cfg: LLMTunerConfig) -> Any:
     # paths and Hub IDs belong to from_pretrained, which owns their validation.
     architecture = get_model_spec(cfg.hf_model, task=None)
     offline = not os.path.exists(cfg.hf_model) and architecture is not None
+    arch_overrides = cfg.arch_overrides
     overrides = (
         {
             "vocab_size": cfg.vocab_size,
@@ -196,7 +197,7 @@ def build_model_config_for(cfg: LLMTunerConfig) -> Any:
             # an MoE's hidden width and its per-expert width are independent,
             # but a model that redefines ``intermediate_size`` can say so
             # rather than have the override silently lose.
-            **cfg.arch_overrides,
+            **arch_overrides,
         }
         if offline
         else None
@@ -209,7 +210,7 @@ def build_model_config_for(cfg: LLMTunerConfig) -> Any:
         # default alias must not overwrite an explicit architecture dimension
         # (e.g. intermediate_size -> moe_intermediate_size in DeepSeek V4).
         for alias, canonical in getattr(config_type, "attribute_map", {}).items():
-            if canonical in cfg.arch_overrides and alias not in cfg.arch_overrides:
+            if canonical in arch_overrides and alias not in arch_overrides:
                 overrides.pop(alias, None)
     config = build_model_config(
         cfg.hf_model, seq_len=cfg.max_seq_len, arch_overrides=overrides

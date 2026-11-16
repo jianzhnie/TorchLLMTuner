@@ -14,6 +14,7 @@ from torch import nn
 
 from ...config.parallel_config import ParallelConfig
 from ..module_patterns import module_name_matches, resolve_module_patterns
+from ..plan import unique_module_bindings
 from .linear import ColumnParallelLinear, RowParallelLinear
 
 ShardKind = Literal["colwise", "rowwise"]
@@ -196,12 +197,9 @@ def resolve_vocab_parallel_targets(
     modules = (
         module_bindings if module_bindings is not None else tuple(model.named_modules())
     )
-    unique_modules: dict[int, tuple[str, nn.Module]] = {}
-    for path, module in modules:
-        unique_modules.setdefault(id(module), (path, module))
     return [
         (path, module)
-        for path, module in unique_modules.values()
+        for path, module in unique_module_bindings(modules)
         if isinstance(module, nn.Embedding)
         and next(
             (

@@ -253,7 +253,7 @@ def prepare_model_inputs(
     batch: Batch | TrainerBatch,
     *,
     device: torch.device,
-    parallel_dims: Any,
+    parallel_dims: ParallelTopology | None,
     error_group: ProcessGroup | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Connect a batch to the explicit model's input contract.

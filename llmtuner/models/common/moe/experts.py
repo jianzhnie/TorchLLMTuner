@@ -23,9 +23,9 @@ instead of E separate ones.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 import torch.nn as nn
@@ -33,16 +33,30 @@ import torch.nn.functional as F
 
 from ....accelerator.capabilities import has
 from ..activation import SwiGLU
-from .observation import DispatchObservation
 
 if TYPE_CHECKING:
     from ....parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 
 __all__ = [
+    "DispatchObservation",
     "ExpertErrorCapture",
     "GroupedExperts",
     "RoutedExperts",
 ]
+
+
+class DispatchObserver(Protocol):
+    def measure(self, device: torch.device) -> AbstractContextManager[None]: ...
+
+
+@dataclass(eq=False, slots=True)
+class DispatchObservation:
+    """Optional observation boundary entered by the expert dispatch forward."""
+
+    observer: DispatchObserver | None = None
+
+    def measure(self, device: torch.device) -> AbstractContextManager[None]:
+        return nullcontext() if self.observer is None else self.observer.measure(device)
 
 
 @dataclass

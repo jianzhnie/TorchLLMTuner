@@ -21,9 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from llmtuner.models.common.aux_loss import in_checkpoint_recompute
-
-from .gate import RouterGateLinear
+from ..aux_loss import in_checkpoint_recompute
+from ..linear import RouterGateLinear
 
 if TYPE_CHECKING:
     from ..aux_loss import AuxLoss

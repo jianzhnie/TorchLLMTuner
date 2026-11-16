@@ -2,7 +2,7 @@
 
 Plans retain concrete bindings and model-owned routing declarations. Resolution
 never installs blocks, allocates replacement weights or executes collectives.
-Pipeline validation compares global semantics with freshly bound local targets.
+Execution resolves current targets after earlier transformations.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from ..plan import (
     ParallelPlan,
     PlanTarget,
     first_paths_by_identity,
+    snapshot_model_bindings,
 )
 from .block_conversion import validate_moe_conversion
 from .model_conversion import uses_model_expert_conversion
@@ -78,11 +79,11 @@ def validate_router_output_conversion(
 
 
 def decoder_layers_for_ep(model: nn.Module) -> Iterable[nn.Module]:
-    """Bind explicit local decoder ownership without requiring PP edge modules.
+    """Bind explicit decoder ownership without requiring embedding or head modules.
 
     A declared model must not recover from a malformed contract by reading a
     similarly named convenience property. Resolve current registered children
-    so PP copies and parameter replacement cannot leave cached references.
+    so structural and parameter replacement cannot leave cached references.
     """
     structure = getattr(model, "decoder_structure", None)
     if not isinstance(structure, DecoderStructure):
@@ -107,12 +108,15 @@ def find_moe_candidates(
         attr, block = declared
         if block is None:
             continue
-        if not isinstance(block, MoE) and not uses_model_expert_conversion(block):
-            if not isinstance(getattr(block, "moe_contract", None), MoEBlockContract):
-                raise UnsupportedCombinationError(
-                    f"Declared MoE slot {type(layer).__name__}.{attr} requires a "
-                    "model-owned MoEBlockContract"
-                )
+        if (
+            not isinstance(block, MoE)
+            and not uses_model_expert_conversion(block)
+            and not isinstance(getattr(block, "moe_contract", None), MoEBlockContract)
+        ):
+            raise UnsupportedCombinationError(
+                f"Declared MoE slot {type(layer).__name__}.{attr} requires a "
+                "model-owned MoEBlockContract"
+            )
         wants_router_logits = declared_router_output(block)
         validate_router_output_conversion(block, wants_router_logits, hf_config)
         candidates.append((layer, attr, block, wants_router_logits))
@@ -163,7 +167,10 @@ def validate_packed_expert_aliases(
         packed = binding.packed_experts
         if packed is None:
             continue
-        for parameter in (packed.gate_up, *((packed.down,) if degree > 1 else ())):
+        parameters = (
+            (packed.gate_up, packed.down) if degree > 1 else (packed.gate_up,)
+        )
+        for parameter in parameters:
             changed.add(id(parameter))
             if type(parameter) is nn.Parameter and parameter.layout == torch.strided:
                 storage = parameter.untyped_storage()._cdata
@@ -174,10 +181,10 @@ def validate_packed_expert_aliases(
                     )
     if not changed:
         return
+    root_paths = set(replaced_roots)
+    root_prefixes = tuple(root + "." for root in replaced_roots)
     for path, module in module_paths:
-        local = any(
-            path == root or path.startswith(root + ".") for root in replaced_roots
-        )
+        local = path in root_paths or path.startswith(root_prefixes)
         for is_buffer, tensors in (
             (False, module.named_parameters(recurse=False, remove_duplicate=False)),
             (True, module.named_buffers(recurse=False, remove_duplicate=False)),
@@ -250,8 +257,8 @@ def resolve_ep_plan(
     Group presence defaults to degree > 1; pass it explicitly for size-one groups.
     Execution revalidates restrictions defensively if options or metadata change.
     Generic conversion consumes explicit routing and packed storage declarations
-    rather than rediscovering them during execution. Re-resolve after config,
-    TP or PP changes. Kimi retains its dedicated conversion contract.
+    rather than rediscovering them during execution. Re-resolve after config
+    or structural changes. Model-owned conversions retain their own contract.
     """
     if isinstance(degree, bool) or not isinstance(degree, int) or degree < 1:
         raise ValueError("EP degree must be a positive integer")
@@ -259,11 +266,8 @@ def resolve_ep_plan(
     validate_ep_model_options(config, implementation)
     layers = decoder_layers_for_ep(model)
     candidates = find_moe_candidates(model, layers, config)
-    modules = (
-        tuple(model.named_modules(remove_duplicate=False))
-        if bindings is None
-        else bindings["module_bindings"]
-    )
+    resolved_bindings = snapshot_model_bindings(model) if bindings is None else bindings
+    modules = resolved_bindings["module_bindings"]
     first_paths = first_paths_by_identity(modules)
     targets = []
     for owner, attribute, block, router_logits in candidates:
@@ -288,7 +292,6 @@ def resolve_ep_plan(
                 routing,
                 tp_enabled=tp_enabled,
                 quantile_balancing=quantile_balancing,
-                token_dispatcher=implementation,
                 has_ep_group=degree > 1 if has_ep_group is None else has_ep_group,
             )
         targets.append(
@@ -331,15 +334,5 @@ def resolve_ep_plan(
         targets=tuple(targets),
         degree=degree,
         implementation=implementation,
-        **(
-            {
-                "module_bindings": modules,
-                "parameter_bindings": tuple(
-                    model.named_parameters(remove_duplicate=False)
-                ),
-                "buffer_bindings": tuple(model.named_buffers(remove_duplicate=False)),
-            }
-            if bindings is None
-            else bindings
-        ),
+        **resolved_bindings,
     )

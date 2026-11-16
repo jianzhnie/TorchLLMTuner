@@ -43,7 +43,7 @@ def apply_ep(
     allowing assembly to rebind programmatic FSDP overrides.
 
     resolved_plan optionally binds decoder slots before entering execution; it
-    must describe the post-TP/PP instance and the requested EP degree/backend.
+    must describe the post-TP instance and the requested EP degree/backend.
 
     The swap moves weights, so it must happen before FSDP wraps the model.
     With a multi-rank group each rank keeps ``num_experts / ep`` of them and
@@ -60,7 +60,7 @@ def apply_ep(
             if not cfg.ep_config.fixed_router:
                 return model
             # Local fixed routing needs no process group. Never use WORLD merely
-            # because this model runs within a larger DP or PP job.
+            # because this model runs within a larger distributed job.
             ep_group = None
 
         if cfg.ep_size > 1 and (ep_group is None or ep_group.size() != cfg.ep_size):
@@ -83,7 +83,7 @@ def apply_ep(
             torchao_pad_multiple=cfg.ep_config.ep_torchao_pad_multiple,
             tp_enabled=cfg.tp_size > 1,
             on_replacement=on_replacement,
-            **({"resolved_plan": resolved_plan} if resolved_plan is not None else {}),
+            resolved_plan=resolved_plan,
         )
     # Failures must reach all ranks sharing later FSDP/TP/CP collectives,
     # not only the ranks in one token-exchange group.

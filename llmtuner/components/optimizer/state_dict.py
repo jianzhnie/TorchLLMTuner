@@ -169,8 +169,8 @@ def get_flat_optim_state_dict(optim: torch.optim.Optimizer) -> dict[str, Any]:
     """Return a flat, FQN-keyed optimizer state dict ready for DCP.
 
     Output keys are ``state.{fqn}.{state_name}`` and ``param_groups.{fqn}.{key}``.
-    The flat layout avoids the integer ``param_group`` index collisions that break
-    pipeline-parallel checkpoints (multiple chunks reusing index 0).
+    The flat layout avoids integer ``param_group`` index collisions when
+    several inner optimizers reuse the same local indices.
 
     The optimizer state must already exist; call ``init_optim_state`` first.
     """
@@ -185,10 +185,12 @@ def get_flat_optim_state_dict(optim: torch.optim.Optimizer) -> dict[str, Any]:
             f"Conflicting nested optimizer state paths: {sorted(conflicts)}"
         )
     for param_group in fqn_sd["param_groups"]:
+        options = tuple(
+            (key, value) for key, value in param_group.items() if key != "params"
+        )
         for fqn in param_group["params"]:
-            for key, value in param_group.items():
-                if key != "params":
-                    flat[f"param_groups.{fqn}.{key}"] = value
+            for key, value in options:
+                flat[f"param_groups.{fqn}.{key}"] = value
     return flat
 
 
@@ -322,6 +324,7 @@ def unflatten_optim_state_dict(
     # A direct value and descendants cannot both describe the same state node.
     # Index conflicts once rather than scanning the full checkpoint per tensor.
     conflicting_paths = _conflicting_state_paths(flat_state)
+    is_adam = isinstance(optim, torch.optim.Adam | torch.optim.AdamW)
     param_id = 0
     seen_fqns: set[str] = set()
     for param_group in optim.param_groups:
@@ -337,12 +340,12 @@ def unflatten_optim_state_dict(
             if param in optim.state:
                 param_state: dict[str, Any] = {}
                 expected_state = dict(optim.state[param])
-                if isinstance(optim, torch.optim.Adam | torch.optim.AdamW):
+                if is_adam:
                     if restored_group["amsgrad"]:
                         expected_state["max_exp_avg_sq"] = expected_state["exp_avg_sq"]
                     else:
                         expected_state.pop("max_exp_avg_sq", None)
-                for state_name in expected_state:
+                for state_name, expected in expected_state.items():
                     flat_key = f"state.{fqn}.{state_name}"
                     if flat_key in flat_state:
                         if flat_key in conflicting_paths:
@@ -351,11 +354,7 @@ def unflatten_optim_state_dict(
                                 f"{flat_key!r}"
                             )
                         value = flat_state[flat_key]
-                        expected = expected_state[state_name]
-                        if (
-                            isinstance(optim, torch.optim.Adam | torch.optim.AdamW)
-                            and state_name == "step"
-                        ):
+                        if is_adam and state_name == "step":
                             validate_optimizer_step_counter(value, key=flat_key)
                         # Adam moments must match the destination parameter layout.
                         # Optimizer.load_state_dict casts tensors but does not check
@@ -372,7 +371,7 @@ def unflatten_optim_state_dict(
                         # tensor/counter and defer failure until the next update.
                         nested = (
                             _restore_nested_state(flat_state, prefix=flat_key)
-                            if isinstance(expected_state[state_name], dict)
+                            if isinstance(expected, dict)
                             else None
                         )
                         if not nested:
@@ -436,9 +435,12 @@ def _restore_param_group(
 def _conflicting_state_paths(flat_state: dict[str, Any]) -> set[str]:
     """Find values also used as dictionary parents in a dotted-key layout."""
     conflicts: set[str] = set()
+    checked: set[str] = set()
     for key in flat_state:
         parent = key.rpartition(".")[0]
-        while parent:
+        # A previously visited parent already checked all of its ancestors.
+        while parent and parent not in checked:
+            checked.add(parent)
             if parent in flat_state:
                 conflicts.add(parent)
             parent = parent.rpartition(".")[0]

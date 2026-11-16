@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -76,7 +76,14 @@ class ModelPartLayout:
     @property
     def state_parameter_names(self) -> Mapping[str, str]:
         """Model-state names preserve every registration, including aliases."""
-        names: dict[str, str] = {}
+        return MappingProxyType(
+            {path: name for path, name, _ in self._normalized_parameter_bindings()}
+        )
+
+    def _normalized_parameter_bindings(
+        self,
+    ) -> Iterator[tuple[str, str, nn.Parameter]]:
+        """Normalize each registered path and reject ambiguous checkpoint owners."""
         owners: dict[str, nn.Parameter] = {}
         for path, parameter in self.parameter_bindings.items():
             normalized = canonical_fqn(path)
@@ -85,16 +92,14 @@ class ModelPartLayout:
                     "Layout parameter names collide after wrapper removal: "
                     f"{normalized!r}"
                 )
-            names[path] = normalized
-        return MappingProxyType(names)
+            yield path, normalized, parameter
 
     @property
     def parameter_state_names(self) -> Mapping[nn.Parameter, str]:
         """One checkpoint name per parameter, chosen by registration order."""
-        state_names = self.state_parameter_names
         names: dict[nn.Parameter, str] = {}
-        for path, parameter in self.parameter_bindings.items():
-            names.setdefault(parameter, state_names[path])
+        for _, name, parameter in self._normalized_parameter_bindings():
+            names.setdefault(parameter, name)
         return MappingProxyType(names)
 
     def validate(self, model: nn.Module) -> None:
@@ -198,15 +203,15 @@ def validate_model_part_layouts(
     """Validate local ownership, including frozen parameters and state names."""
     if len(model_parts) != len(layouts):
         raise ValueError("Model layouts must match local model parts")
+    if any(not isinstance(layout, ModelPartLayout) for layout in layouts):
+        raise TypeError("Model layouts must be ModelPartLayout")
     if len({layout.topology for layout in layouts}) > 1:
         raise ValueError("Model parts must share the same declared topology snapshot")
     parameter_owners: dict[nn.Parameter, int] = {}
     name_owners: dict[str, int] = {}
     for index, (model, layout) in enumerate(zip(model_parts, layouts, strict=True)):
-        if not isinstance(layout, ModelPartLayout):
-            raise TypeError("Model layouts must be ModelPartLayout")
         layout.validate(model)
-        for parameter in layout.parameter_aliases:
+        for parameter in dict.fromkeys(layout.parameter_bindings.values()):
             previous = parameter_owners.setdefault(parameter, index)
             if previous != index:
                 raise ValueError(

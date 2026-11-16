@@ -98,21 +98,27 @@ class ReplacementMap:
         leave a partially composed mapping. Consumers needing their own checks
         should perform them before recording the event.
         """
-        module_targets = {
-            source: modules.get(target, target)
-            for source, target in self.module_targets.items()
-        } | modules
-        parameter_targets = {
-            source: tuple(
-                dict.fromkeys(
-                    replacement
-                    for target in targets
-                    for replacement in parameters.get(target, (target,))
+        if not modules and not parameters:
+            return
+        weak_modules = self._module_targets
+        if modules:
+            module_targets = {
+                source: modules.get(target, target)
+                for source, target in weak_modules.items()
+            } | modules
+            weak_modules = _WeakIdentityMapping(module_targets)
+        weak_parameters = self._parameter_targets
+        if parameters:
+            parameter_targets = {
+                source: tuple(
+                    dict.fromkeys(
+                        replacement
+                        for target in targets
+                        for replacement in parameters.get(target, (target,))
+                    )
                 )
-            )
-            for source, targets in self.parameter_targets.items()
-        } | parameters
-        weak_modules = _WeakIdentityMapping(module_targets)
-        weak_parameters = _WeakIdentityMapping(parameter_targets)
+                for source, targets in weak_parameters.items()
+            } | parameters
+            weak_parameters = _WeakIdentityMapping(parameter_targets)
         self._module_targets = weak_modules
         self._parameter_targets = weak_parameters

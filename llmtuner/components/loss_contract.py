@@ -1,12 +1,52 @@
-"""Loss execution interfaces shared by dense and pipeline assembly."""
+"""Loss service contracts and scalar validation for training execution."""
 
-from collections.abc import Callable
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol, TypedDict
 
 import torch
 
-LossSum = Callable[..., torch.Tensor]
-ChunkedLossBackward = Callable[..., torch.Tensor]
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
+
+class VocabularyLossKwargs(TypedDict, total=False):
+    """Loss keywords for an explicitly vocabulary-sharded output layout."""
+
+    tp_group: ProcessGroup
+    global_vocab_size: int
+
+
+class LossSum(Protocol):
+    """Return token-summed loss; the engine owns normalization and backward."""
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        /,
+        *,
+        tp_group: ProcessGroup | None = None,
+        global_vocab_size: int | None = None,
+    ) -> torch.Tensor: ...
+
+
+class ChunkedLossBackward(Protocol):
+    """Run scaled chunk backward and return detached, unnormalized loss."""
+
+    def __call__(
+        self,
+        projection: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+        /,
+        *,
+        num_chunks: int,
+        grad_scale: torch.Tensor | float,
+        tp_group: ProcessGroup | None = None,
+        global_vocab_size: int | None = None,
+    ) -> torch.Tensor: ...
 
 
 def validate_normalization_tokens(

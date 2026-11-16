@@ -27,37 +27,60 @@ class MoERoutingBinding:
     num_limited_groups: int | None
     shared_gate: nn.Module | None = None
 
+    def validate(self, block: nn.Module) -> None:
+        """Reject changed routing modules or declarations before conversion."""
+        if block is not self.source:
+            raise ValueError("MoE routing binding belongs to another block")
+        current = resolve_moe_routing(block)
+        if (
+            current.router is not self.router
+            or current.shared is not self.shared
+            or current.shared_gate is not self.shared_gate
+            or any(
+                getattr(current, name) != getattr(self, name)
+                for name in (
+                    "top_k",
+                    "score_func",
+                    "route_norm",
+                    "route_scale",
+                    "num_expert_groups",
+                    "num_limited_groups",
+                )
+            )
+        ):
+            raise ValueError("Stale EP routing binding")
+
 
 def resolve_moe_routing(block: nn.Module) -> MoERoutingBinding:
     """Bind routing from the model-owned contract without inspecting forward."""
     contract = getattr(block, "moe_contract", None)
-    if contract is not None:
-        if not isinstance(contract, MoEBlockContract):
-            raise TypeError("moe_contract must be a MoEBlockContract")
-        if contract.group_routing == "single_best":
-            raise NotImplementedError(
-                "EP group-limited greedy selects a single best expert per group; "
-                "the grouped dispatcher implements top-2 score summation"
-            )
-        router, _, shared = contract.bind(block)
-        return MoERoutingBinding(
-            source=block,
-            router=router,
-            shared=shared,
-            shared_gate=(
-                block._modules[contract.shared_expert_gate]
-                if contract.shared_expert_gate is not None
-                else None
-            ),
-            top_k=contract.top_k,
-            score_func=contract.score_func,
-            route_norm=contract.route_norm,
-            route_scale=contract.route_scale,
-            num_expert_groups=contract.num_expert_groups,
-            num_limited_groups=contract.num_limited_groups,
+    if contract is None:
+        raise UnsupportedCombinationError(
+            "MoE conversion requires a model-owned MoEBlockContract"
         )
-    raise UnsupportedCombinationError(
-        "MoE conversion requires a model-owned MoEBlockContract"
+    if not isinstance(contract, MoEBlockContract):
+        raise TypeError("moe_contract must be a MoEBlockContract")
+    if contract.group_routing == "single_best":
+        raise NotImplementedError(
+            "EP group-limited greedy selects a single best expert per group; "
+            "the grouped dispatcher implements top-2 score summation"
+        )
+    router, _, shared = contract.bind(block)
+    return MoERoutingBinding(
+        source=block,
+        router=router,
+        shared=shared,
+        shared_gate=(
+            block._modules[contract.shared_expert_gate]
+            if contract.shared_expert_gate is not None
+            else None
+        ),
+        top_k=contract.top_k,
+        score_func=contract.score_func,
+        route_norm=contract.route_norm,
+        route_scale=contract.route_scale,
+        num_expert_groups=contract.num_expert_groups,
+        num_limited_groups=contract.num_limited_groups,
     )
 
 
@@ -158,15 +181,7 @@ def resolve_packed_experts(block: nn.Module, *, degree: int) -> PackedExpertBind
         raise UnsupportedCombinationError(
             "Declared MoE router and experts are on different devices"
         )
-    if tuple(gate_up.shape) != (
-        num_experts,
-        gate_up.shape[1],
-        gate_up.shape[2],
-    ) or tuple(down.shape) != (
-        num_experts,
-        down.shape[1],
-        down.shape[2],
-    ):
+    if gate_up.shape[0] != num_experts or down.shape[0] != num_experts:
         raise ValueError("Declared MoE expert count differs from packed storage")
     if gate_up.shape[1] % 2 != 0 or tuple(down.shape[1:]) != (
         gate_up.shape[2],

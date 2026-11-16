@@ -1,7 +1,9 @@
 """Resolve output and sequence contracts before transforming a local part."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from torch import nn
 from torch.distributed import ProcessGroup
@@ -10,6 +12,9 @@ from ..models.contracts import DecoderStructure, registered_submodule
 from ..models.execution import ModelExecutionCapabilities
 from .plan import ParallelPlan
 from .tensor_parallel.sharding import ShardingConfig
+
+if TYPE_CHECKING:
+    from ..components.loss_contract import VocabularyLossKwargs
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +64,7 @@ class ExecutionLayout:
         ):
             raise ValueError("Transformed model vocabulary size changed")
 
-    def loss_kwargs(self, tp_group: ProcessGroup | None) -> dict[str, object]:
+    def loss_kwargs(self, tp_group: ProcessGroup | None) -> VocabularyLossKwargs:
         """Bind the declared output vocabulary to its reduction group."""
         if self.output != "logits":
             raise ValueError("LM loss requires logits output")
@@ -94,8 +99,10 @@ def resolve_execution_layout(
     structure = getattr(model, "decoder_structure", None)
     if structure is not None and not isinstance(structure, DecoderStructure):
         raise TypeError("Execution layout requires a DecoderStructure declaration")
+    if chunked_loss and structure is None:
+        raise TypeError("Chunked loss requires a model-owned DecoderStructure")
     head_path = None
-    if isinstance(structure, DecoderStructure):
+    if structure is not None:
         head_path = structure.head
         if isinstance(registered_submodule(model, head_path), nn.Identity):
             raise ValueError(
@@ -104,25 +111,26 @@ def resolve_execution_layout(
     vocabulary_sharded = False
     if tp_plan is not None and head_path is not None:
         for target in tp_plan.targets:
-            if target.path == head_path and target.kind == "dense":
-                if target.layout != "colwise":
-                    raise ValueError(
-                        "TP output head must preserve token shards and shard vocabulary"
-                    )
-                if not isinstance(target.spec, ShardingConfig):
-                    raise TypeError("TP output projection requires a sharding contract")
-                if target.spec.sequence_transform != "preserve":
-                    raise ValueError(
-                        "TP output projection changes token layout; loss labels remain "
-                        "sequence-sharded and need an explicit output/target adapter"
-                    )
-                if tp_size > 1:
-                    raise ValueError(
-                        "Vocabulary-sharded loss requires identical token/label rows "
-                        "across TP ranks; sequence-sharded inputs need an explicit "
-                        "output/target adapter"
-                    )
-                vocabulary_sharded = True
+            if target.path != head_path or target.kind != "dense":
+                continue
+            if target.layout != "colwise":
+                raise ValueError(
+                    "TP output head must preserve token shards and shard vocabulary"
+                )
+            if not isinstance(target.spec, ShardingConfig):
+                raise TypeError("TP output projection requires a sharding contract")
+            if target.spec.sequence_transform != "preserve":
+                raise ValueError(
+                    "TP output projection changes token layout; loss labels remain "
+                    "sequence-sharded and need an explicit output/target adapter"
+                )
+            if tp_size > 1:
+                raise ValueError(
+                    "Vocabulary-sharded loss requires identical token/label rows "
+                    "across TP ranks; sequence-sharded inputs need an explicit "
+                    "output/target adapter"
+                )
+            vocabulary_sharded = True
     if chunked_loss and not capabilities.hidden_states:
         raise ValueError("Chunked loss requires model-declared hidden output")
     if not capabilities.logits:

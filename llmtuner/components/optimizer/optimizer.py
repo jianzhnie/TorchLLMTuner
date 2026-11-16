@@ -262,12 +262,13 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
                     # PyTorch accepts arbitrary group metadata, so misspelled
                     # update options otherwise silently leave defaults active.
                     # initial_lr is the scheduler's intentional group metadata.
+                    allowed_options = optimizer.defaults.keys() | {
+                        "params",
+                        "param_names",
+                        "initial_lr",
+                    }
                     for group in optimizer.param_groups:
-                        unknown = (
-                            group.keys()
-                            - optimizer.defaults.keys()
-                            - {"params", "param_names", "initial_lr"}
-                        )
+                        unknown = group.keys() - allowed_options
                         if unknown:
                             raise ValueError(
                                 f"{opt_name} optimizer_kwargs contain unknown options: "
@@ -310,7 +311,7 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
                             "Optimizer groups duplicate parameter ownership"
                         )
                     seen.add(parameter)
-        if seen != set(expected):
+        if seen != expected.keys():
             raise ValueError("Optimizer groups no longer cover assembly ownership")
 
     @contextmanager
@@ -387,7 +388,9 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
             if param.requires_grad
         ]
 
-        layout_names = layout.parameter_state_names
+        layout_names: dict[nn.Parameter, str] = {}
+        for name, parameter in trainable_parameters:
+            layout_names.setdefault(parameter, name)
 
         for config_index, param_group_config in enumerate(param_group_configs):
             reserved = {
@@ -411,7 +414,7 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
                     claimed.add(id(param))
 
             if not params:
-                # A rule may target another local pipeline chunk. The
+                # A rule may target another local model part. The
                 # constructor checks unmatched rules over all local parts.
                 continue
 

@@ -1,7 +1,7 @@
 """Explicit structural declarations shared by model and training adapters.
 
 Paths are relative to the causal model, not the Trainer wrapper. Binding is
-metadata-only and must be repeated after structural transformations such as PP.
+metadata-only and must be repeated after structural transformations.
 No modules are registered here and no parameter storage is copied.
 """
 
@@ -147,26 +147,23 @@ class MoEBlockContract:
 
     def bind(self, block: nn.Module) -> tuple[nn.Module, str, nn.Module | None]:
         """Resolve direct children without registering or inspecting the block."""
-        router = block._modules.get(self.router)
-        if not isinstance(router, nn.Module):
-            raise ValueError(f"MoE router {self.router!r} must be a child module")
-        shared = (
-            None
-            if self.shared_expert is None
-            else block._modules.get(self.shared_expert)
-        )
-        if self.shared_expert is not None and not isinstance(shared, nn.Module):
-            raise ValueError(
-                f"MoE shared expert {self.shared_expert!r} must be a child module"
-            )
-        if self.shared_expert_gate is not None and not isinstance(
-            block._modules.get(self.shared_expert_gate), nn.Module
+        children: dict[str, nn.Module] = {}
+        for role, name in (
+            ("router", self.router),
+            ("shared expert", self.shared_expert),
+            ("shared expert gate", self.shared_expert_gate),
         ):
-            raise ValueError(
-                f"MoE shared expert gate {self.shared_expert_gate!r} "
-                "must be a child module"
-            )
-        return router, self.shared_expert or "shared_expert", shared
+            if name is None:
+                continue
+            child = block._modules.get(name)
+            if not isinstance(child, nn.Module):
+                raise ValueError(f"MoE {role} {name!r} must be a child module")
+            children[role] = child
+        return (
+            children["router"],
+            self.shared_expert or "shared_expert",
+            children.get("shared expert"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,7 +214,7 @@ class DecoderStructure:
         return BoundDecoderStructure(self, decoder, embedding, blocks, norm, head)
 
     def bind_blocks(self, model: nn.Module) -> nn.ModuleList:
-        """Bind current local blocks without requiring PP-removed edge modules."""
+        """Bind current blocks without requiring embedding, norm or head modules."""
         blocks = registered_submodule(model, self.blocks)
         if not isinstance(blocks, nn.ModuleList):
             raise TypeError(f"Decoder blocks {self.blocks!r} must be a ModuleList")
@@ -226,8 +223,8 @@ class DecoderStructure:
     def bind_attentions(self, model: nn.Module) -> tuple[nn.Module, ...]:
         """Bind only declared direct attention children, without model mutation.
 
-        Read the current block collection so PP replacement cannot leave cached
-        whole-model references. An absent declaration is unsupported, not a cue
+        Read the current block collection so replacement cannot leave cached
+        module references. An absent declaration is unsupported, not a cue
         to search common attribute names.
         """
         names = self.attention_names()

@@ -71,15 +71,14 @@ class OptimizerCheckpointState(Stateful):
 
     def _validate_params(self, all_params: list[nn.Parameter]) -> None:
         """Validate trainable parameter ownership before allocating state groups."""
-        trainable = [
-            (paths[0], parameter)
-            for layout in self.runtime_layouts
-            for parameter, paths in layout.parameter_aliases.items()
-            if parameter.requires_grad
-        ]
+        trainable: dict[int, tuple[str, nn.Parameter]] = {}
+        for layout in self.runtime_layouts:
+            for path, parameter in layout.parameter_bindings.items():
+                if parameter.requires_grad:
+                    trainable.setdefault(id(parameter), (path, parameter))
         registered = {id(param) for param in all_params}
         missing = [
-            (name, param) for name, param in trainable if id(param) not in registered
+            entry for identity, entry in trainable.items() if identity not in registered
         ]
         if missing:
             names = ", ".join(
@@ -91,7 +90,7 @@ class OptimizerCheckpointState(Stateful):
                 "Add a catch-all ParamGroupConfig(pattern='.*') last."
             )
 
-        foreign = registered - {id(parameter) for _, parameter in trainable}
+        foreign = registered - trainable.keys()
         if foreign:
             raise ValueError(
                 f"optimizer.param_groups contains {len(foreign)} parameter(s) "
@@ -232,7 +231,7 @@ class OptimizerCheckpointState(Stateful):
             for load, optimizer_state in zip(loaders, optimizer_states, strict=True):
                 load(optimizer_state)
 
-        # PP stages without local experts skip these subgroup collectives.
+        # Ranks without local experts skip these subgroup collectives.
         # Mesh participants must expose matching optimizer plans/order.
         plan_error: BaseException | None = None
         for validate_mesh in mesh_validators:
@@ -241,7 +240,7 @@ class OptimizerCheckpointState(Stateful):
             except BaseException as error:
                 if plan_error is None:
                     plan_error = error
-        # Subgroup validation may fail on only some pipeline/replica groups.
+        # Subgroup validation may fail on only some expert/replica groups.
         # Rejoin the world before any rank advances to the next checkpoint
         # component. The failed load is not rolled back.
         with synchronize_local_errors("Optimizer mesh plan validation"):

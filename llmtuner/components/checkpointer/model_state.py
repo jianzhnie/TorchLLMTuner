@@ -31,7 +31,7 @@ def clone_local_state_tensor(tensor: torch.Tensor) -> torch.Tensor:
     """Copy owned checkpoint storage without redistributing DTensor layouts.
 
     DTensor clone dispatch may reduce Partial placements. Export keys can belong
-    to only some PP ranks, so storage cloning must not introduce a collective.
+    to only some ranks, so storage cloning must not introduce a collective.
     Explicit shape/stride also preserve uneven-shard metadata without checks.
     """
     if isinstance(tensor, DTensor):
@@ -50,7 +50,7 @@ class ModelStateDictAdapter:
     """Map declared model names and coordinate one checkpoint's key coverage.
 
     ``error_group`` includes every owner contributing to the external state,
-    including PP peers. It is borrowed for conversion errors and key gathering;
+    across ranks. It is borrowed for conversion errors and key gathering;
     storage-backend IO remains independently configured. None uses the default
     process group for standalone callers.
     """
@@ -75,7 +75,7 @@ class ModelStateDictAdapter:
         ):
             if type(enabled) is not bool:
                 raise TypeError(f"{name} must be boolean")
-        # Includes all PP owners whose external keys form one checkpoint.
+        # Includes all owners whose external keys form one checkpoint.
         # The adapter borrows this group; the entry point owns its lifetime.
         self.error_group = error_group
         self._runtime_layouts = tuple(runtime_layouts)
@@ -106,29 +106,34 @@ class ModelStateDictAdapter:
         if hf_assets_path is None:
             return
         index_path = os.path.join(hf_assets_path, SAFETENSORS_INDEX)
-        if not os.path.isfile(index_path):
+        indexed = os.path.isfile(index_path)
+        if indexed:
+            weight_map = read_hf_weight_map(index_path)
+            self._hf_keys = set(weight_map)
+            # Preserve filename grouping with the writer's contiguous 1..N IDs.
+            shard_indices = {
+                filename: shard_index
+                for shard_index, filename in enumerate(
+                    sorted(set(weight_map.values())), 1
+                )
+            }
+            self.fqn_to_index_mapping = {
+                key: shard_indices[filename] for key, filename in weight_map.items()
+            }
+            if self.state_format.separate_export_indices:
+                self.hf_export_fqn_to_index_mapping = dict(self.fqn_to_index_mapping)
+        else:
             # Read only the header: single-file checkpoints omit tied heads
             # too, and need the same key coverage policy as indexed exports.
             tensor_path = os.path.join(hf_assets_path, "model.safetensors")
-            if os.path.isfile(tensor_path):
-                with safe_open(tensor_path, framework="pt") as tensors:
-                    self._hf_keys = set(tensors.keys())
-                self._normalize_expert_keys()
-            return
-        weight_map = read_hf_weight_map(index_path)
-        self._hf_keys = set(weight_map)
-        # HF filenames need not contain a shard number. Preserve their tensor
-        # grouping while providing the writer's required contiguous 1..N IDs.
-        shard_indices = {
-            filename: shard_index
-            for shard_index, filename in enumerate(sorted(set(weight_map.values())), 1)
-        }
-        self.fqn_to_index_mapping = {
-            key: shard_indices[filename] for key, filename in weight_map.items()
-        }
-        self.hf_export_fqn_to_index_mapping = dict(self.fqn_to_index_mapping)
-        self._normalize_expert_keys()
-        if not self.state_format.separate_export_indices:
+            if not os.path.isfile(tensor_path):
+                return
+            with safe_open(tensor_path, framework="pt") as tensors:
+                self._hf_keys = set(tensors.keys())
+        self._hf_keys, self.fqn_to_index_mapping = self.state_format.normalize_keys(
+            self._hf_keys, self.fqn_to_index_mapping
+        )
+        if indexed and not self.state_format.separate_export_indices:
             self.hf_export_fqn_to_index_mapping = self.fqn_to_index_mapping
 
     @property
@@ -136,17 +141,27 @@ class ModelStateDictAdapter:
         """Whether format conversion owns its rank-coordinated tensor boundary."""
         return self.state_format.coordinates_conversion
 
-    def _normalize_expert_keys(self) -> None:
-        if self._hf_keys is not None:
-            self._hf_keys, self.fqn_to_index_mapping = self.state_format.normalize_keys(
-                self._hf_keys, self.fqn_to_index_mapping
-            )
-
     def _validate_runtime_layouts(self) -> None:
         for layout, snapshot in zip(
             self._runtime_layouts, self._layout_snapshots, strict=True
         ):
             snapshot.validate(layout, consumer="HF checkpoint adapter")
+
+    def _map_state_keys(
+        self, state: dict[str, Any], *, to_hf: bool
+    ) -> dict[str, Any]:
+        """Map canonical runtime names and external names without losing aliases."""
+        mapped = {}
+        for key, value in state.items():
+            if to_hf:
+                key = self._runtime_parameter_names.get(key, key)
+            target = self.state_format.map_key(key, to_hf=to_hf)
+            if not to_hf:
+                target = self._runtime_parameter_names.get(target, target)
+            if target in mapped:
+                raise ValueError(f"HF checkpoint key mapping collision: {target!r}")
+            mapped[target] = value
+        return mapped
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         # Agree before model-owned conversion can enter tensor collectives.
@@ -165,20 +180,15 @@ class ModelStateDictAdapter:
                 state_dict, to_hf=True, error_group=self.error_group
             )
         # Only dictionary mapping is local. Model-owned tensor conversion above and
-        # the global PP coverage gather below stay outside this boundary.
+        # the global key coverage gather below stay outside this boundary.
         with synchronize_local_errors("HF export key mapping", group=self.error_group):
-            hf_state = {}
-            for key, value in state_dict.items():
-                key = self._runtime_parameter_names.get(key, key)
-                hf_key = self.state_format.map_key(key, to_hf=True)
-                if hf_key in hf_state:
-                    raise ValueError(f"HF checkpoint key mapping collision: {hf_key!r}")
-                hf_state[hf_key] = value
+            hf_state = self._map_state_keys(state_dict, to_hf=True)
+            tied_embeddings = getattr(self.model_config, "tie_word_embeddings", False)
         if self._hf_keys is not None:
             requested = set(hf_state)
             if dist.is_available() and dist.is_initialized():
-                # PP ranks own disjoint layer keys. Validate the whole model's
-                # coverage while returning only this rank's tensor dictionary.
+                # Validate all owners' key coverage while returning only this
+                # rank's tensor dictionary.
                 keys_by_rank: list[set[str] | None] = [None] * dist.get_world_size(
                     self.error_group
                 )
@@ -188,7 +198,7 @@ class ModelStateDictAdapter:
             unexpected = requested - self._hf_keys
             # A tied lm_head is legitimately omitted from a HF checkpoint.
             if (
-                getattr(self.model_config, "tie_word_embeddings", False)
+                tied_embeddings
                 and "lm_head.weight" not in self._hf_keys
             ):
                 unexpected.discard("lm_head.weight")
@@ -199,9 +209,9 @@ class ModelStateDictAdapter:
                     f"missing={sorted(missing)[:8]}, "
                     f"unexpected={sorted(unexpected)[:8]}"
                 )
-        if getattr(self.model_config, "tie_word_embeddings", False):
-            # All ranks with tied configuration participate, including PP parts
-            # without either key. DTensor clone preserves placements locally.
+        if tied_embeddings:
+            # All ranks with tied configuration participate, even without either
+            # key. DTensor clone preserves placements locally.
             with synchronize_local_errors(
                 "HF export tied weights", group=self.error_group
             ):
@@ -234,13 +244,7 @@ class ModelStateDictAdapter:
                 hf_state_dict["lm_head.weight"] = hf_state_dict[
                     "model.embed_tokens.weight"
                 ]
-            state = {}
-            for key, value in hf_state_dict.items():
-                target = self.state_format.map_key(key, to_hf=False)
-                target = self._runtime_parameter_names.get(target, target)
-                if target in state:
-                    raise ValueError(f"HF checkpoint key mapping collision: {target!r}")
-                state[target] = value
+            state = self._map_state_keys(hf_state_dict, to_hf=False)
         return self.state_format.convert_state(
             state, to_hf=False, error_group=self.error_group
         )
@@ -270,16 +274,17 @@ class ModelStateDictAdapter:
             if isinstance(value, ChunkedCheckpointTensor):
                 for target in targets:
                     del result[target]
+                chunks_by_target: dict[
+                    str, list[tuple[torch.Size, torch.Tensor]]
+                ] = {}
                 for offset, local in value.chunks:
                     for index in range(local.shape[0]):
                         target = targets[offset[0] + index]
-                        chunks = []
-                        if target in result:
-                            chunks.extend(result[target].chunks)
-                        chunks.append((offset[1:], local[index]))
-                        result[target] = ChunkedCheckpointTensor(
-                            value.shape[1:], chunks
+                        chunks_by_target.setdefault(target, []).append(
+                            (offset[1:], local[index])
                         )
+                for target, chunks in chunks_by_target.items():
+                    result[target] = ChunkedCheckpointTensor(value.shape[1:], chunks)
                 continue
             for target, weight in zip(targets, value.unbind(0), strict=True):
                 result[target] = weight

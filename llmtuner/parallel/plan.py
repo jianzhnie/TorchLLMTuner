@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 
@@ -15,6 +16,7 @@ __all__ = [
     "first_paths_by_identity",
     "model_bindings_from_plan",
     "snapshot_model_bindings",
+    "unique_module_bindings",
 ]
 
 
@@ -46,6 +48,16 @@ def first_paths_by_identity(
     for path, module in module_bindings:
         paths.setdefault(id(module), path)
     return paths
+
+
+def unique_module_bindings(
+    bindings: Iterable[tuple[str, nn.Module]],
+) -> tuple[tuple[str, nn.Module], ...]:
+    """Keep one execution target per module, using its first registered path."""
+    modules: dict[int, tuple[str, nn.Module]] = {}
+    for path, module in bindings:
+        modules.setdefault(id(module), (path, module))
+    return tuple(modules.values())
 
 
 def model_bindings_from_plan(plan: ParallelPlan) -> FullPlanBindings:
@@ -147,7 +159,7 @@ class ParallelPlan:
         default=(), init=False, repr=False, compare=False
     )
 
-    forward_bindings: tuple[tuple[str, object, object], ...] = field(
+    forward_bindings: tuple[tuple[str, object, object, object], ...] = field(
         default=(), init=False, repr=False, compare=False
     )
 
@@ -211,18 +223,23 @@ class ParallelPlan:
             # its function and receiver instead of that ephemeral object's ID.
             # A target can delegate its math to nested modules. The complete
             # ownership snapshot must protect their execution bindings too.
-            object.__setattr__(
-                self,
-                "forward_bindings",
-                tuple(
+            forward_bindings = []
+            buffer_persistence = []
+            for path, module in self.module_bindings:
+                forward = module.forward
+                forward_bindings.append(
                     (
                         path,
-                        getattr(module.forward, "__func__", module.forward),
-                        getattr(module.forward, "__self__", None),
+                        getattr(forward, "__func__", forward),
+                        getattr(forward, "__self__", None),
+                        module._compiled_call_impl,
                     )
-                    for path, module in self.module_bindings
-                ),
-            )
+                )
+                buffer_persistence.append(
+                    (path, frozenset(module._non_persistent_buffers_set))
+                )
+            object.__setattr__(self, "forward_bindings", tuple(forward_bindings))
+            object.__setattr__(self, "buffer_persistence", tuple(buffer_persistence))
             for path, module in self.module_bindings:
                 if path == "":
                     # Absence is part of the resolved semantics too. A minimal
@@ -231,14 +248,6 @@ class ParallelPlan:
                     if isinstance(structure, DecoderStructure):
                         object.__setattr__(self, "decoder_structure", structure)
                     break
-            object.__setattr__(
-                self,
-                "buffer_persistence",
-                tuple(
-                    (path, frozenset(module._non_persistent_buffers_set))
-                    for path, module in self.module_bindings
-                ),
-            )
         if self.buffer_bindings is not None:
             object.__setattr__(
                 self,
@@ -258,10 +267,10 @@ class ParallelPlan:
 
     def validate_binding(self, model: nn.Module) -> None:
         """Reject a plan whose live module references no longer match the model."""
-        bound_modules = None
-        decoder_structure_bound = self.module_bindings is not None and any(
-            path == "" for path, _ in self.module_bindings
+        bound_modules = (
+            dict(self.module_bindings) if self.module_bindings is not None else None
         )
+        decoder_structure_bound = bound_modules is not None and "" in bound_modules
         if decoder_structure_bound and (
             getattr(model, "decoder_structure", None) != self.decoder_structure
         ):
@@ -284,14 +293,21 @@ class ParallelPlan:
                 if path != bound_path or value is not bound_value:
                     raise ValueError(f"Stale plan {kind} binding: {path}")
         if self.module_bindings is not None:
-            bound_modules = dict(self.module_bindings)
-            for path, function, receiver in self.forward_bindings:
-                forward = bound_modules[path].forward
+            for path, function, receiver, compiled_call in self.forward_bindings:
+                module = bound_modules[path]
+                forward = module.forward
                 if (
                     getattr(forward, "__func__", forward) is not function
                     or getattr(forward, "__self__", None) is not receiver
                 ):
                     raise ValueError(f"Stale plan forward binding: {path or '<root>'}")
+                # Module.compile changes __call__ without replacing forward or
+                # parameter identities. An existing plan must not bypass a new
+                # compiled graph or reuse one after it has been removed.
+                if module._compiled_call_impl is not compiled_call:
+                    raise ValueError(
+                        f"Stale plan compiled call binding: {path or '<root>'}"
+                    )
             # register_buffer can change checkpoint ownership without replacing
             # its tensor or changing any tensor geometry metadata.
             for (path, module), (_, nonpersistent) in zip(
@@ -317,25 +333,21 @@ class ParallelPlan:
                 raise ValueError(f"Stale plan token history requirement: {path}")
         # Parameter identity survives `.data` reassignment. Keep immutable
         # geometry metadata so resized storage cannot reuse an old shard plan.
-        if self.parameter_bindings is not None:
-            for (path, parameter), metadata in zip(
-                self.parameter_bindings, self.parameter_metadata, strict=True
-            ):
-                if tuple(parameter.shape) != metadata[0]:
-                    raise ValueError(f"Stale plan parameter shape: {path}")
-                # Device, dtype, layout and trainability affect backend support,
-                # shard views and ownership even when identity survives. In
-                # particular, swap-based materialization preserves Parameter IDs.
-                if tensor_metadata(parameter) != metadata:
-                    raise ValueError(f"Stale plan parameter metadata: {path}")
         # Buffer identity also survives resize_ and .data replacement. Snapshot
         # layout, not values: legitimate in-place cache/router updates stay valid.
-        if self.buffer_bindings is not None:
-            for (path, buffer), metadata in zip(
-                self.buffer_bindings, self.buffer_metadata, strict=True
-            ):
-                if tensor_metadata(buffer) != metadata:
-                    raise ValueError(f"Stale plan buffer metadata: {path}")
+        # Device, dtype, layout and trainability matter even when swap-based
+        # materialization preserves tensor identities.
+        for kind, bindings, metadata in (
+            ("parameter", self.parameter_bindings, self.parameter_metadata),
+            ("buffer", self.buffer_bindings, self.buffer_metadata),
+        ):
+            if bindings is None:
+                continue
+            for (path, value), expected in zip(bindings, metadata, strict=True):
+                if kind == "parameter" and tuple(value.shape) != expected[0]:
+                    raise ValueError(f"Stale plan parameter shape: {path}")
+                if tensor_metadata(value) != expected:
+                    raise ValueError(f"Stale plan {kind} metadata: {path}")
         if self.storage_alias_groups() != self.storage_aliases:
             raise ValueError("Stale plan storage aliases")
         for target in self.targets:

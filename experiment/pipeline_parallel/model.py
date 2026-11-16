@@ -74,8 +74,11 @@ from transformers.utils.output_capturing import capture_outputs
 from experiment.pipeline_parallel.model_execution import PipelineStageIO
 from llmtuner.datasets.contracts import Batch
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.common.attention.masks import build_dense_attention_mask
-from llmtuner.models.common.cast_linear import build_lm_head
+from llmtuner.models.common.attention import (
+    build_dense_attention_mask,
+    temporary_attention_mask,
+)
+from llmtuner.models.common.linear import build_lm_head
 from llmtuner.models.common.gradient_norm import (
     ReferenceNormGroup,
     packed_expert_reference_norm_group,
@@ -83,7 +86,6 @@ from llmtuner.models.common.gradient_norm import (
 )
 from llmtuner.models.common.input_preparation import prepare_text_inputs
 from llmtuner.models.common.moe.layer import collect_moe_layers
-from llmtuner.models.common.validation import temporary_attention_mask
 from llmtuner.models.configuration import (
     configure_reference_experts,
     validate_attention_backend,

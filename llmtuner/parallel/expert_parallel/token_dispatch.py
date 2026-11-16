@@ -22,7 +22,6 @@ from torch.distributed._functional_collectives import all_to_all_single
 
 from ...accelerator.distributed import get_world_size
 from ...errors import EnvironmentUnsupportedError
-from ...models.common.scatter_add import deterministic_scatter_add
 from ...utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -269,12 +268,11 @@ class LocalTokenDispatcher:
             * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
         ).to(accumulation_dtype)
 
-        dim = x_TD.shape[-1]
-        # A token routed to K experts appears K times at its own index, so this
-        # scatter_add has duplicate indices -- hence the deterministic variant.
-        out_TD = deterministic_scatter_add(
-            out_TD,
-            metadata.token_indices_experts_sorted_N.reshape(-1, 1).expand(-1, dim),
+        # Sum expert contributions by token row using the run's global
+        # deterministic-algorithms policy and PyTorch's native autograd.
+        out_TD = out_TD.index_add(
+            0,
+            metadata.token_indices_experts_sorted_N,
             routed_output_RD,
         )
         return out_TD.to(x_TD.dtype)

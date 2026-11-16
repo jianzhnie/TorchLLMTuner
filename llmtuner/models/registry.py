@@ -214,120 +214,92 @@ def _flops_note(module: str, config: Any, *, seq_len: int) -> str | None:
     )
 
 
-_FLOPS_MODULES = {
-    "kimi_linear": ".kimi.kimi_k3.flops",
-    "qwen3_5_moe_text": ".qwen.qwen3_5_moe.flops",
-}
-
-
-for (
-    _model_type,
-    _config_module,
-    _config_name,
-    _model_module,
-    _model_name,
-    _state_module,
-    _state_name,
-    _task,
-) in (
-    (
-        "kimi_linear",
-        ".kimi.kimi_k3.configuration",
-        "KimiLinearConfig",
-        ".kimi.kimi_k3.model",
-        "KimiLinearForCausalLM",
-        ".kimi.kimi_k3.checkpoint",
-        "KimiStateFormat",
-        "causal_lm",
-    ),
-    (
-        "qwen3_moe",
-        "transformers.models.qwen3_moe.configuration_qwen3_moe",
-        "Qwen3MoeConfig",
-        ".qwen.qwen3.model",
-        "Qwen3MoeForCausalLM",
-        ".qwen.qwen3.state",
-        "Qwen3StateFormat",
-        "causal_lm",
-    ),
-    (
-        "deepseek_v4",
-        "transformers.models.deepseek_v4.configuration_deepseek_v4",
-        "DeepseekV4Config",
-        ".deepseek.deepseek_v4.modeling",
-        "DeepseekV4ForCausalLM",
-        None,
-        None,
-        "causal_lm",
-    ),
-    (
-        "qwen3_5_moe_text",
-        "transformers.models.qwen3_5_moe.configuration_qwen3_5_moe",
-        "Qwen3_5MoeTextConfig",
-        ".qwen.qwen3_5_moe.model",
-        "Qwen3_5MoeForCausalLM",
-        None,
-        None,
-        "causal_lm",
-    ),
-    (
-        "kimi_k3",
-        ".kimi.kimi_k3.configuration",
-        "KimiK3Config",
-        ".kimi.kimi_k3.multimodal",
-        "KimiK3ForConditionalGeneration",
-        None,
-        None,
-        "conditional_generation",
-    ),
-    (
-        "qwen3_5",
-        "transformers.models.qwen3_5.configuration_qwen3_5",
-        "Qwen3_5Config",
-        ".qwen.qwen3_5.multimodal",
-        "Qwen3_5ForConditionalGeneration",
-        None,
-        None,
-        "conditional_generation",
-    ),
-    (
-        "qwen3_5_moe",
-        "transformers.models.qwen3_5_moe.configuration_qwen3_5_moe",
-        "Qwen3_5MoeConfig",
-        ".qwen.qwen3_5_moe.multimodal",
-        "Qwen3_5MoeForConditionalGeneration",
-        None,
-        None,
-        "conditional_generation",
-    ),
-):
-    _config_loader = partial(_load_class, _config_module, _config_name)
+def _register_builtin(
+    model_type: str,
+    *,
+    config: tuple[str, str],
+    model: tuple[str, str] | Callable[[], type[nn.Module]],
+    state: tuple[str, str] | None = None,
+    flops_module: str | None = None,
+    has_flops_note: bool = False,
+    task: str = "causal_lm",
+) -> None:
+    """Declare lazy built-in hooks together, without model-name dispatch."""
+    config_loader = partial(_load_class, *config)
     register_model(
         ModelSpec(
-            _model_type,
-            config_factory=partial(_build_config, _config_loader),
-            config_type_loader=_config_loader,
+            model_type,
+            config_factory=partial(_build_config, config_loader),
+            config_type_loader=config_loader,
             model_class_loader=(
-                _load_kimi_model_class
-                if _model_type == "kimi_linear"
-                else partial(_load_class, _model_module, _model_name)
+                model if callable(model) else partial(_load_class, *model)
             ),
-            state_format_loader=(
-                partial(_load_class, _state_module, _state_name)
-                if _state_module is not None
-                else None
-            ),
+            state_format_loader=partial(_load_class, *state) if state else None,
             flops_estimator=(
-                partial(_estimate_flops, _FLOPS_MODULES[_model_type])
-                if _model_type in _FLOPS_MODULES
-                else None
+                partial(_estimate_flops, flops_module) if flops_module else None
             ),
-            flops_note=(
-                partial(_flops_note, _FLOPS_MODULES[_model_type])
-                if _model_type == "qwen3_5_moe_text"
-                else None
-            ),
-            task=_task,
+            flops_note=partial(_flops_note, flops_module) if has_flops_note else None,
+            task=task,
             explicit=True,
         )
     )
+
+
+_register_builtin(
+    "kimi_linear",
+    config=(".kimi.kimi_k3.configuration", "KimiLinearConfig"),
+    model=_load_kimi_model_class,
+    state=(".kimi.kimi_k3.checkpoint", "KimiStateFormat"),
+    flops_module=".kimi.kimi_k3.flops",
+)
+_register_builtin(
+    "qwen3_moe",
+    config=(
+        "transformers.models.qwen3_moe.configuration_qwen3_moe",
+        "Qwen3MoeConfig",
+    ),
+    model=(".qwen.qwen3.model", "Qwen3MoeForCausalLM"),
+    state=(".qwen.qwen3.state", "Qwen3StateFormat"),
+)
+_register_builtin(
+    "deepseek_v4",
+    config=(
+        "transformers.models.deepseek_v4.configuration_deepseek_v4",
+        "DeepseekV4Config",
+    ),
+    model=(".deepseek.deepseek_v4.modeling", "DeepseekV4ForCausalLM"),
+)
+_register_builtin(
+    "qwen3_5_moe_text",
+    config=(
+        "transformers.models.qwen3_5_moe.configuration_qwen3_5_moe",
+        "Qwen3_5MoeTextConfig",
+    ),
+    model=(".qwen.qwen3_5_moe.model", "Qwen3_5MoeForCausalLM"),
+    flops_module=".qwen.qwen3_5_moe.flops",
+    has_flops_note=True,
+)
+_register_builtin(
+    "kimi_k3",
+    config=(".kimi.kimi_k3.configuration", "KimiK3Config"),
+    model=(".kimi.kimi_k3.multimodal", "KimiK3ForConditionalGeneration"),
+    task="conditional_generation",
+)
+_register_builtin(
+    "qwen3_5",
+    config=(
+        "transformers.models.qwen3_5.configuration_qwen3_5",
+        "Qwen3_5Config",
+    ),
+    model=(".qwen.qwen3_5.multimodal", "Qwen3_5ForConditionalGeneration"),
+    task="conditional_generation",
+)
+_register_builtin(
+    "qwen3_5_moe",
+    config=(
+        "transformers.models.qwen3_5_moe.configuration_qwen3_5_moe",
+        "Qwen3_5MoeConfig",
+    ),
+    model=(".qwen.qwen3_5_moe.multimodal", "Qwen3_5MoeForConditionalGeneration"),
+    task="conditional_generation",
+)

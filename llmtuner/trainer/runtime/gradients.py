@@ -15,7 +15,6 @@ from ...accelerator.distributed import get_comm_device
 from ...errors import UnsupportedCombinationError
 from ...models.common.gradient_norm import ReferenceNormGroup
 from ...parallel.tensor_parallel.tensor_parallel import tp_sharded_param_ids
-from .reductions import TrainingReductionMeshes
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -57,19 +56,20 @@ def allreduce_fsdp_excluded_grads(
     expert_ids = (
         expert_parameter_ids(model_parts) if parallel_dims.ep_enabled else set()
     )
-    meshes = {
-        False: [parallel_dims.get_optional_mesh(axis) for axis in ("dp", "cp")],
-        True: [
-            parallel_dims.get_optional_mesh(axis) for axis in ("dp_replicate", "efsdp")
-        ],
-    }
+    groups: dict[bool, list[ProcessGroup]] = {}
+    for expert, axes in (
+        (False, ("dp", "cp")),
+        (True, ("dp_replicate", "efsdp")),
+    ):
+        groups[expert] = []
+        for axis in axes:
+            mesh = parallel_dims.get_optional_mesh(axis)
+            if mesh is not None and mesh.size() > 1:
+                groups[expert].append(mesh.get_group())
     for parameter in unique_parameters(model_parts):
         if not parameter.requires_grad or isinstance(parameter, DTensor):
             continue
-        for mesh in meshes[id(parameter) in expert_ids]:
-            if mesh is None or mesh.size() <= 1:
-                continue
-            group = mesh.get_group()
+        for group in groups[id(parameter) in expert_ids]:
             present = torch.tensor(
                 int(parameter.grad is not None),
                 device=parameter.device,
@@ -176,11 +176,14 @@ def grad_norm_options(
     }
 
 
-def _collect_reference_groups(parameters, model_parts):
+def _collect_reference_groups(
+    parameters: Iterable[torch.nn.Parameter],
+    model_parts: Iterable[torch.nn.Module],
+) -> dict[tuple[int, ...], ReferenceNormGroup]:
     """Bind and validate model-declared groups before gradient collectives."""
     parameter_ids = {id(parameter) for parameter in parameters}
-    groups = {}
-    occupied = set()
+    groups: dict[tuple[int, ...], ReferenceNormGroup] = {}
+    occupied: set[int] = set()
     for part in model_parts:
         for module in part.modules():
             declare_groups = getattr(module, "reference_norm_groups", None)
@@ -194,9 +197,10 @@ def _collect_reference_groups(parameters, model_parts):
                 identities = tuple(map(id, group.parameters))
                 if identities in groups:
                     continue
-                if not identities or len(set(identities)) != len(identities):
+                unique_ids = set(identities)
+                if not identities or len(unique_ids) != len(identities):
                     raise ValueError("reference norm groups require unique parameters")
-                if not set(identities) <= parameter_ids:
+                if not unique_ids <= parameter_ids:
                     raise ValueError(
                         "reference norm group contains untracked parameters"
                     )
@@ -214,7 +218,12 @@ def _collect_reference_groups(parameters, model_parts):
 
 
 @torch.no_grad()
-def reference_norm_gradients(parameters, model_parts, *, error_group=None):
+def reference_norm_gradients(
+    parameters: Iterable[torch.nn.Parameter],
+    model_parts: Iterable[torch.nn.Module],
+    *,
+    error_group: ProcessGroup | None = None,
+) -> list[torch.Tensor]:
     """Expand declared logical parameter groups into their gradient tensors."""
     with synchronize_local_errors(
         "Reference gradient norm preflight", group=error_group
@@ -250,7 +259,7 @@ def reference_norm_gradients(parameters, model_parts, *, error_group=None):
             raise ValueError(
                 "Reference norm ranks declared incompatible ordered layouts"
             )
-    replacements = {}
+    replacements: dict[int, tuple[torch.Tensor, ...]] = {}
     for identities, group in groups.items():
         gradients = group.logical_gradients()
         if len(gradients) != len(identities):
@@ -313,18 +322,19 @@ def clip_and_check_finite(
     expert_reduce_layout: str,
     step: int,
     error_group: ProcessGroup | None = None,
-    reduction_meshes: TrainingReductionMeshes,
     loss_is_finite: torch.Tensor,
 ) -> torch.Tensor:
     """Clip gradients and produce one rank-uniform finite-step verdict."""
     parameters = list(unique_parameters(model_parts))
-    expert_ids = expert_parameter_ids(model_parts)
-    expert_parameters = [p for p in parameters if id(p) in expert_ids]
     ep_mesh = (
         parallel_dims.get_optional_mesh("ep")
         if parallel_dims is not None and parallel_dims.ep_enabled
         else None
     )
+    expert_parameters = None
+    if ep_mesh is not None:
+        expert_ids = expert_parameter_ids(model_parts)
+        expert_parameters = [p for p in parameters if id(p) in expert_ids]
     tp_mesh = (
         parallel_dims.get_optional_mesh("tp")
         if parallel_dims is not None and parallel_dims.tp_enabled
@@ -339,7 +349,7 @@ def clip_and_check_finite(
         max_norm=max_norm,
         foreach=True,
         ep_mesh=ep_mesh,
-        expert_parameters=expert_parameters if ep_mesh is not None else None,
+        expert_parameters=expert_parameters,
         tp_mesh=tp_mesh,
         tp_sharded_parameters=(
             [p for p in parameters if id(p) in tp_sharded_ids]

@@ -20,8 +20,8 @@ def resolve_cp_plan(
 ) -> ParallelPlan:
     """Select the declared CP backend and resolve targets without mutation.
 
-    Global preflight, PP-local ownership checks and post-TP/EP execution use
-    the same selection rules, but each resolves its own live model bindings.
+    Global preflight and post-TP/EP execution use the same selection rules,
+    but each resolves its own live model bindings.
     """
     kcp = cfg.cp_config.context_parallel_strategy == "kcp"
     if (

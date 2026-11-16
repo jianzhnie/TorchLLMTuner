@@ -61,10 +61,10 @@ from transformers.modeling_outputs import (
 )
 
 from ....errors import UnsupportedCombinationError
-from ...common.cast_linear import build_lm_head
+from ...common.linear import build_lm_head
 from ...common.input_preparation import prepare_text_inputs, restore_text_batch_rows
 from ...common.moe.layer import MoE
-from ...common.validation import temporary_attention_mask
+from ...common.attention import temporary_attention_mask
 from ...configuration import (
     validate_attention_backend,
     validate_native_execution_policy,

@@ -177,20 +177,19 @@ def finalize_validation(
                 "average validation loss. Ensure the validation batches "
                 "contain unmasked labels."
             )
-        global_loss_sum = (
-            accumulated_loss.clone() if accumulated_loss is not None else None
-        )
-    if global_loss_sum is not None and loss_mesh is not None:
+        if accumulated_loss is None:
+            raise ValueError("Validation batches did not produce a loss sum")
+        global_loss_sum = accumulated_loss.clone()
+    if loss_mesh is not None:
         all_reduce(global_loss_sum, group=loss_mesh.get_group())
     # Coordinate reporting errors before any rank proceeds to the next step.
     with synchronize_local_errors("Validation result reporting", group=error_group):
-        if global_loss_sum is not None:
-            global_avg_loss = float(global_loss_sum) / num_global_valid_tokens
-            if not math.isfinite(global_avg_loss):
-                raise FloatingPointError(
-                    f"Validation loss is not finite at step {step}: {global_avg_loss}"
-                )
-            metrics.log_validation(loss=global_avg_loss, step=step)
+        global_avg_loss = float(global_loss_sum) / num_global_valid_tokens
+        if not math.isfinite(global_avg_loss):
+            raise FloatingPointError(
+                f"Validation loss is not finite at step {step}: {global_avg_loss}"
+            )
+        metrics.log_validation(loss=global_avg_loss, step=step)
 
 
 def check_validation_feasibility(
@@ -385,12 +384,11 @@ def run_validation_loop(
                 dp_mesh=dp_mesh,
                 error_group=engine.error_group,
             )
-            loss_sum = engine.evaluate(batch)
-            if loss_sum is not None:
-                if accumulated_loss is None:
-                    accumulated_loss = loss_sum.detach().clone()
-                else:
-                    accumulated_loss.add_(loss_sum.detach())
+            loss_sum = engine.evaluate(batch).detach()
+            if accumulated_loss is None:
+                accumulated_loss = loss_sum.clone()
+            else:
+                accumulated_loss.add_(loss_sum)
             total_global_valid_tokens.add_(global_valid_tokens)
             num_steps += 1
     finally:

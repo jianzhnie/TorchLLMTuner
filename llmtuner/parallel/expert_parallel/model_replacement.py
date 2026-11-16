@@ -231,7 +231,6 @@ def swap_moe_blocks(
                 binding.routing,
                 tp_enabled=tp_enabled,
                 quantile_balancing=quantile_balancing,
-                token_dispatcher=token_dispatcher,
                 has_ep_group=ep_group is not None,
             )
             routing_bindings[id(target.module)] = binding.routing

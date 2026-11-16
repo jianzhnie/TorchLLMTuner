@@ -20,14 +20,18 @@ import torch.distributed as dist
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...components.metrics import compute_utilization, model_tflops
-from ...models.common.moe.observation import DispatchObservation
+from ...models.common.moe.experts import DispatchObservation
 from ...utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
 def percentile(values: list[float], fraction: float) -> float:
-    ordered = sorted(values)
+    return _sorted_percentile(sorted(values), fraction)
+
+
+def _sorted_percentile(ordered: list[float], fraction: float) -> float:
+    """Interpolate a percentile from an already sorted observation window."""
     position = (len(ordered) - 1) * fraction
     lower = int(position)
     upper = min(lower + 1, len(ordered) - 1)
@@ -237,32 +241,41 @@ class TrainingObserver:
         replication = self.metrics._non_data_parallel_size
         tokens, valid = (int(value) // replication for value in counts.tolist())
         tps = tokens / seconds
+        result = {
+            "train/slowest_rank_step_seconds": seconds,
+            "train/global_tokens": float(tokens),
+            "train/global_valid_targets": float(valid),
+            "train/global_tps": tps,
+            "train/valid_target_tps_per_device": valid / seconds / world,
+            "train/valid_target_fraction": valid / tokens if tokens else 0.0,
+            "train/data_loading_rank_max_seconds": loading,
+            "train/data_loading_rank_max_percent": 100 * loading / seconds,
+        }
+        result.update(self._throughput_metrics("train", tps=tps, world=world))
+        result.update(
+            self.record_steady_step(seconds=seconds, tokens=tokens, world=world)
+        )
+        self.metrics.latest_training_observations = result
+        return result
+
+    def _throughput_metrics(
+        self, prefix: str, *, tps: float, world: int
+    ) -> dict[str, float]:
+        """Report per-device throughput and utilization from global token rates."""
+        result = {
+            f"{prefix}/tps_per_device": tps / world,
+            f"{prefix}/tflops_per_device": model_tflops(
+                self.metrics.num_flops_per_token, tps / world
+            ),
+        }
         compute = compute_utilization(
             tokens_per_second=tps,
             flops_per_token=self.metrics.num_flops_per_token,
             peak_flops_per_device=self.metrics.gpu_peak_flops,
             world_size=world,
         )
-        result = {
-            "train/slowest_rank_step_seconds": seconds,
-            "train/global_tokens": float(tokens),
-            "train/global_valid_targets": float(valid),
-            "train/global_tps": tps,
-            "train/tps_per_device": tps / world,
-            "train/valid_target_tps_per_device": valid / seconds / world,
-            "train/valid_target_fraction": valid / tokens if tokens else 0.0,
-            "train/data_loading_rank_max_seconds": loading,
-            "train/data_loading_rank_max_percent": 100 * loading / seconds,
-            "train/tflops_per_device": model_tflops(
-                self.metrics.num_flops_per_token, tps / world
-            ),
-        }
         if compute["utilization_percent"] is not None:
-            result["train/mfu_percent"] = compute["utilization_percent"]
-        result.update(
-            self.record_steady_step(seconds=seconds, tokens=tokens, world=world)
-        )
-        self.metrics.latest_training_observations = result
+            result[f"{prefix}/mfu_percent"] = compute["utilization_percent"]
         return result
 
     def record_steady_step(
@@ -277,21 +290,13 @@ class TrainingObserver:
 
         durations = [sample[0] for sample in self.samples]
         steady_tps = sum(sample[1] for sample in self.samples) / sum(durations)
+        durations.sort()
         result = {
             "steady/samples": float(len(self.samples)),
-            "steady/step_p50_seconds": percentile(durations, 0.5),
-            "steady/step_p90_seconds": percentile(durations, 0.9),
-            "steady/tps_per_device": steady_tps / world,
-            "steady/tflops_per_device": model_tflops(
-                self.metrics.num_flops_per_token, steady_tps / world
-            ),
+            "steady/step_p50_seconds": _sorted_percentile(durations, 0.5),
+            "steady/step_p90_seconds": _sorted_percentile(durations, 0.9),
         }
-        steady_compute = compute_utilization(
-            tokens_per_second=steady_tps,
-            flops_per_token=self.metrics.num_flops_per_token,
-            peak_flops_per_device=self.metrics.gpu_peak_flops,
-            world_size=world,
+        result.update(
+            self._throughput_metrics("steady", tps=steady_tps, world=world)
         )
-        if steady_compute["utilization_percent"] is not None:
-            result["steady/mfu_percent"] = steady_compute["utilization_percent"]
         return result

@@ -28,14 +28,14 @@ from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
 from ....errors import UnsupportedCombinationError
-from ...common.cast_linear import build_lm_head
+from ...common.linear import build_lm_head
 from ...common.gradient_norm import (
     ReferenceNormGroup,
     packed_expert_reference_norm_group,
     qkv_reference_norm_group,
 )
 from ...common.input_preparation import prepare_text_inputs, restore_text_batch_rows
-from ...common.validation import temporary_attention_mask
+from ...common.attention import temporary_attention_mask
 from ...configuration import (
     configure_reference_experts,
     validate_attention_backend,

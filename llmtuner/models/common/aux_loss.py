@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, ClassVar
 
@@ -173,14 +173,12 @@ class AuxLoss(nn.Module):
         if model_parts is None:
             cls._step_denominator = denominator
             return
-        for part in model_parts:
-            for module in part.modules():
-                if isinstance(module, AuxLoss):
-                    module._runtime_denominator = denominator
-                    module._step_metric = None
-                    # A failed iteration may never reach the optimizer hook.
-                    # A new runtime step must discard its partial metrics.
-                    module.instance_acc.zero_()
+        for module in _iter_aux_losses(model_parts):
+            module._runtime_denominator = denominator
+            module._step_metric = None
+            # A failed iteration may never reach the optimizer hook.
+            # A new runtime step must discard its partial metrics.
+            module.instance_acc.zero_()
 
     def inject(self, raw_sum: torch.Tensor, *, carrier: torch.Tensor) -> torch.Tensor:
         """Inject the aux-loss gradient on ``carrier`` and accumulate the metric.
@@ -234,6 +232,16 @@ class AuxLoss(nn.Module):
         return AuxLossInjection.apply(carrier, injected)
 
 
+def _iter_aux_losses(model_parts: Sequence[nn.Module]) -> Iterator[AuxLoss]:
+    """Visit each auxiliary-loss instance owned by this runtime once."""
+    seen: set[int] = set()
+    for part in model_parts:
+        for module in part.modules():
+            if isinstance(module, AuxLoss) and id(module) not in seen:
+                seen.add(id(module))
+                yield module
+
+
 def rollup_aux_loss_metrics(model_parts: Sequence[nn.Module]) -> None:
     """Snapshot per-instance metrics, populate standalone groups, and clear scratch.
 
@@ -241,17 +249,13 @@ def rollup_aux_loss_metrics(model_parts: Sequence[nn.Module]) -> None:
     to its metric group's step total.
     """
     AuxLoss.group_acc.clear()
-    seen = set()
-    for part in model_parts:
-        for module in part.modules():
-            if isinstance(module, AuxLoss) and id(module) not in seen:
-                seen.add(id(module))
-                module._step_metric = module.instance_acc.detach().clone()
-                key = (module.reduce_mesh, module.metric_name)
-                if key not in AuxLoss.group_acc:
-                    AuxLoss.group_acc[key] = torch.zeros_like(module.instance_acc)
-                AuxLoss.group_acc[key] += module.instance_acc
-                module.instance_acc.zero_()
+    for module in _iter_aux_losses(model_parts):
+        module._step_metric = module.instance_acc.detach().clone()
+        key = (module.reduce_mesh, module.metric_name)
+        if key not in AuxLoss.group_acc:
+            AuxLoss.group_acc[key] = torch.zeros_like(module.instance_acc)
+        AuxLoss.group_acc[key] += module.instance_acc
+        module.instance_acc.zero_()
 
 
 def collect_aux_loss_metrics(
@@ -266,20 +270,14 @@ def collect_aux_loss_metrics(
     supplied, use only their snapshots. Standalone calls without parts retain
     the constructor registry; the trainer always supplies its current parts.
     """
-    counts = dict(AuxLoss._group_counts)
     runtime_totals: dict[tuple[str, str], torch.Tensor] = {}
-    if model_parts is not None:
-        instances = {
-            id(module): module
-            for part in model_parts
-            for module in part.modules()
-            if isinstance(module, AuxLoss)
-        }
-        counts = Counter(
-            (module.reduce_mesh, module.metric_name) for module in instances.values()
-        )
-        for module in instances.values():
+    if model_parts is None:
+        counts = dict(AuxLoss._group_counts)
+    else:
+        counts = Counter()
+        for module in _iter_aux_losses(model_parts):
             key = (module.reduce_mesh, module.metric_name)
+            counts[key] += 1
             value = module._step_metric
             if value is None:
                 continue

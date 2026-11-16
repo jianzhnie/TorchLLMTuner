@@ -105,26 +105,38 @@ def plan_tp_checkpoint_layouts(
     # independent parameters, so each checkpoint slice now has its own name
     # and no longer uses packed-half gathering. Preserve the registration's
     # owner, which may be the model root rather than the replaced block.
+    projection_names = {
+        "gate_up_proj": ("w1_EFD", "w3_EFD"),
+        "down_proj": ("w2_EDF",),
+    }
+    projection_replacements = {
+        f"{root}.experts.{name}": targets
+        for root in replaced_roots
+        for name, targets in projection_names.items()
+    }
+    shared_prefixes = tuple(f"{root}.shared_expert." for root in replaced_roots)
+    converted_expert_owners_by_module: dict[int, nn.Module] = {}
+    seen_blocks: set[int] = set()
+    for _, _, block, _ in candidates:
+        identity = id(block)
+        if identity in seen_blocks:
+            continue
+        seen_blocks.add(identity)
+        if identity in converted_blocks and not uses_model_expert_conversion(block):
+            converted_expert_owners_by_module.setdefault(
+                id(block.experts),
+                converted_blocks[identity].routed_experts.inner_experts,
+            )
     converted_layouts = []
     for owner_path, owner in module_paths:
         layouts = owner.__dict__.get("_tp_checkpoint_layouts")
         if layouts is None:
             continue
-        expert_owner = next(
-            (
-                converted_blocks[id(block)].routed_experts.inner_experts
-                for _, _, block, _ in candidates
-                if not uses_model_expert_conversion(block) and owner is block.experts
-            ),
-            None,
-        )
+        expert_owner = converted_expert_owners_by_module.get(id(owner))
         if expert_owner is not None:
             updated = {}
             for name, layout in layouts.items():
-                names = {
-                    "gate_up_proj": ("w1_EFD", "w3_EFD"),
-                    "down_proj": ("w2_EDF",),
-                }.get(name, (name,))
+                names = projection_names.get(name, (name,))
                 for target_name in names:
                     updated[target_name] = (
                         (layout[0], False, layout[2])
@@ -136,23 +148,13 @@ def plan_tp_checkpoint_layouts(
         updated = {}
         for name, layout in layouts.items():
             full_name = f"{owner_path}.{name}" if owner_path else name
-            replacement = None
-            for root in replaced_roots:
-                if full_name == f"{root}.experts.gate_up_proj":
-                    replacement = ("w1_EFD", "w3_EFD")
-                    break
-                if full_name == f"{root}.experts.down_proj":
-                    replacement = ("w2_EDF",)
-                    break
+            replacement = projection_replacements.get(full_name)
             if replacement is None:
-                for root in replaced_roots:
-                    prefix = f"{root}.shared_expert."
-                    if full_name.startswith(prefix) and "shared_expert." in name:
-                        # The reused shared module keeps its own relative
-                        # registrations. Only an ancestor's path needs renaming.
-                        parent, suffix = name.rsplit("shared_expert.", 1)
-                        name = f"{parent}shared_experts.{suffix}"
-                        break
+                if full_name.startswith(shared_prefixes) and "shared_expert." in name:
+                    # The reused shared module keeps its own relative
+                    # registrations. Only an ancestor's path needs renaming.
+                    parent, suffix = name.rsplit("shared_expert.", 1)
+                    name = f"{parent}shared_experts.{suffix}"
                 updated[name] = layout
                 continue
             prefix = name.rsplit("experts.", 1)[0]
@@ -213,8 +215,10 @@ def external_state_owners(
 ) -> tuple[dict[int, list[str]], dict[int, list[str]]]:
     external_parameters: dict[int, list[str]] = {}
     external_buffers: dict[int, list[str]] = {}
+    root_paths = set(replaced_roots)
+    root_prefixes = tuple(root + "." for root in replaced_roots)
     for path, module in module_paths:
-        if any(path == root or path.startswith(f"{root}.") for root in replaced_roots):
+        if path in root_paths or path.startswith(root_prefixes):
             continue
         for name, parameter in module.named_parameters(
             recurse=False, remove_duplicate=False

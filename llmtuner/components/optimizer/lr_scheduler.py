@@ -85,7 +85,7 @@ class LRSchedulersContainer(Stateful):
 
     Args:
         optimizers: one scheduler is built per entry, in order. An empty list
-            tracks progress without learning-rate metrics for frozen PP stages.
+            tracks progress without learning-rate metrics for frozen models.
         lr_lambda: maps ``last_epoch`` to the multiplicative lr factor.
         total_steps: the schedule's length, resolved by :func:`build_lr_scheduler`
             from the config and run length. Restore rejects checkpoint progress
@@ -104,8 +104,7 @@ class LRSchedulersContainer(Stateful):
         self.total_steps = total_steps
         require_integer_at_least(self, "total_steps", group="lr_scheduler")
         self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
-        # A frozen pipeline stage owns no optimizer, but must checkpoint the
-        # same training progress as stages with trainable parameters.
+        # Models without trainable parameters still checkpoint training progress.
         self._last_epoch = 0
 
     def __iter__(self) -> Iterator[LambdaLR]:
@@ -123,7 +122,7 @@ class LRSchedulersContainer(Stateful):
         """
         # Independent stepping of an exposed inner scheduler breaks the common
         # progress contract. Reject it before advancing any optimizer's rate.
-        last_epoch = self.state_dict()["last_epoch"]
+        last_epoch = self._validated_last_epoch()
         if last_epoch >= self.total_steps:
             raise ValueError(
                 "Cannot advance lr_scheduler beyond total_steps "
@@ -136,10 +135,9 @@ class LRSchedulersContainer(Stateful):
     def get_metrics(self) -> dict[str, float]:
         """The current lr of each optimizer, keyed so several cannot collide.
 
-        Upstream's keying: ``lr/<OptName>`` when there is only one scheduler of
-        that optimizer type; a per-type index disambiguates several (PP gives
-        every pipeline stage its own optimizer of the same class), and a
-        param-group index goes last when one optimizer has several groups.
+        Use ``lr/<OptName>`` when there is one scheduler of that optimizer type.
+        A per-type index disambiguates several instances; a param-group index
+        goes last when one optimizer has several groups.
         """
         metrics: dict[str, float] = {}
         optimizer_counts = Counter(
@@ -164,6 +162,10 @@ class LRSchedulersContainer(Stateful):
         # together from the same lambda, so they share a step count by
         # construction. Storing it once is what lets a checkpoint survive
         # resharding to a different number of optimizers.
+        return {"last_epoch": self._validated_last_epoch()}
+
+    def _validated_last_epoch(self) -> int:
+        """Read common progress without serializing checkpoint state."""
         last_epoch = (
             self.schedulers[0].last_epoch if self.schedulers else self._last_epoch
         )
@@ -172,7 +174,7 @@ class LRSchedulersContainer(Stateful):
                 "Cannot checkpoint schedulers with different last_epoch values; "
                 "advance them through LRSchedulersContainer.step() together"
             )
-        return {"last_epoch": last_epoch}
+        return last_epoch
 
     def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Validate saved progress without reading or changing optimizer groups."""

@@ -17,9 +17,8 @@ from __future__ import annotations
 import sys
 from collections import deque
 from collections.abc import Iterable, Iterator
-from contextlib import ExitStack, nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from datetime import timedelta
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -36,6 +35,7 @@ from ..components.checkpointer.core.base import BaseCheckpointManager
 from ..components.metrics import MetricsProcessor
 from ..components.optimizer.ema import EMA
 from ..components.optimizer.lr_scheduler import LRSchedulersContainer
+from ..components.optimizer.optimizer import OptimizersContainer
 from ..datasets.contracts import (
     BaseDataLoader,
     Batch,
@@ -55,7 +55,7 @@ from .runtime import assembly, engine
 from .runtime import batch as batch_runtime
 from .runtime import metrics as metrics_runtime
 from .runtime import validation as validation_runtime
-from .runtime.builders import TrainingBuilders
+from .runtime.builders import ProfilerOwner, TrainingBuilders
 from .runtime.environment import build_runtime_environment
 from .runtime.gradients import check_step_condition
 from .runtime.reductions import (
@@ -78,12 +78,8 @@ __all__ = ["Trainer"]
 
 
 class Trainer:
-    # The state a built trainer carries, declared here so the shape of the
-    # object is readable without reading ``__init__`` -- the reference does the
-    # same. Anything built later is annotated with ``| None`` so a ``Trainer``
-    # made with ``__new__`` (how the tests exercise the pure helpers without a
-    # process group) sees the same "not built yet" state an attribute would
-    # give, rather than an AttributeError.
+    # Resource defaults support cleanup after partial assembly. Acquired owners
+    # are assigned to the instance before dependent construction begins.
     cfg: LLMTunerConfig
     _builders: TrainingBuilders | None
     rank: int
@@ -96,20 +92,21 @@ class Trainer:
     model_parts: list[torch.nn.Module]
     training_engine: engine.TrainingEngine
     error_group: dist.ProcessGroup | None = None
-    optimizer: torch.optim.Optimizer
+    optimizer: OptimizersContainer | None = None
     # None denotes incomplete assembly; data_iterator rejects it explicitly.
     # Defaults also let close() safely handle partial initialization failures.
     dataloader: BaseDataLoader | None = None
-    lr_scheduler: LRSchedulersContainer | None
-    ema: EMA | None
-    checkpointer: BaseCheckpointManager | None
-    metrics: MetricsProcessor | None
-    gc_handler: GarbageCollection | None
+    lr_scheduler: LRSchedulersContainer | None = None
+    ema: EMA | None = None
+    checkpointer: BaseCheckpointManager | None = None
+    metrics: MetricsProcessor | None = None
+    gc_handler: GarbageCollection | None = None
     activation_swap_resources: ActivationSwapResources | None = None
     fsdp_communication_resources: FSDPCommunicationResources | None = None
     dispatch_timer_resources: DispatchTimerResources | None = None
     validation_resources: validation_runtime.ValidationDataLoaderResources | None = None
-    profiler_resource: Any | None = None
+    profiler_resource: ProfilerOwner | None = None
+    training_observer: TrainingObserver | None = None
 
     # Created lazily for callers that construct a Trainer with __new__.
     # Each instance owns its counters; checkpoints do not retain the Trainer.
@@ -200,7 +197,6 @@ class Trainer:
         prepared_model = assembly.prepare_parallel_model(
             cfg,
             environment=environment,
-            loss_functions=loss_functions,
             on_model_acquired=self._retain_model_resources,
         )
         model_assembly = prepared_model.assembly
@@ -327,7 +323,7 @@ class Trainer:
         # The loader batch is replicated across CP/TP. Commit this rank's
         # share only after every local counter has passed group validation.
         self.ntokens_seen += logical_tokens_per_rank(
-            num_tokens, getattr(self, "parallel_dims", None)
+            num_tokens, self.parallel_dims
         )
         return prepared
 
@@ -347,7 +343,7 @@ class Trainer:
     def before_gradient_clipping(self) -> None:
         """Run diagnostics after gradient reduction and before clipping."""
 
-    def param_context(self):
+    def param_context(self) -> AbstractContextManager[None]:
         """Context shared by forward-backward and validation.
 
         The default is empty. Diagnostic integrations wrap this hook to control
@@ -474,7 +470,6 @@ class Trainer:
         update_result = self.training_engine.finish_step(
             self.step,
             accumulation=accumulation,
-            reduction_meshes=reduction_meshes,
             collect_metrics=should_log,
             before_gradient_clipping=self.before_gradient_clipping,
         )
@@ -656,7 +651,7 @@ class Trainer:
                     self.gc_handler.run(self.step)
 
                 try:
-                    observer = getattr(self, "training_observer", None)
+                    observer = self.training_observer
                     if observer is not None:
                         observer.begin()
                     step_metrics = self.train_step(data_iterator)

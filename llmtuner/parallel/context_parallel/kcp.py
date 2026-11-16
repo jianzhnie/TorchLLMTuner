@@ -22,6 +22,7 @@ from ..plan import (
     FullPlanBindings,
     ParallelPlan,
     PlanTarget,
+    first_paths_by_identity,
     snapshot_model_bindings,
 )
 from .attention import HeadToSeq, SeqToHead
@@ -252,7 +253,7 @@ def resolve_kcp_plan(
     for module in mla_modules:
         if module.num_heads % degree:
             raise ValueError("KCP MLA heads must be divisible by the CP degree")
-    paths = {id(module): path for path, module in reversed(bindings["module_bindings"])}
+    paths = first_paths_by_identity(bindings["module_bindings"])
     return ParallelPlan(
         stage="cp",
         degree=degree,
@@ -278,7 +279,7 @@ def apply_kcp(
     """Prepare all KCP wrappers, then install them without stacking wrappers.
 
     Runtime/group resources remain explicit. A pre-resolved plan belongs to the
-    current local instance and must be rebound after PP or parameter conversion.
+    current instance and must be rebound after structural or parameter conversion.
     """
     degree = cp_mesh.size()
     plan = resolved_plan

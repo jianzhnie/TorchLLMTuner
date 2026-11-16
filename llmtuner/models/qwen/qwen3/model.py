@@ -73,10 +73,11 @@ from transformers.utils.output_capturing import capture_outputs
 
 from ....datasets.contracts import Batch
 from ....errors import UnsupportedCombinationError
-from ...common.attention.masks import (
+from ...common.attention import (
     build_dense_attention_mask,
+    temporary_attention_mask,
 )
-from ...common.cast_linear import build_lm_head
+from ...common.linear import build_lm_head
 from ...common.gradient_norm import (
     ReferenceNormGroup,
     packed_expert_reference_norm_group,
@@ -84,7 +85,6 @@ from ...common.gradient_norm import (
 )
 from ...common.input_preparation import prepare_text_inputs
 from ...common.moe.layer import collect_moe_layers
-from ...common.validation import temporary_attention_mask
 from ...configuration import configure_reference_experts, validate_attention_backend
 from ...contracts import DecoderStructure, MoEBlockContract
 from ...execution import ModelExecutionCapabilities

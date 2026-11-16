@@ -6,7 +6,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...accelerator.device import device_type
 from ...accelerator.distributed import get_rank, get_world_size
 from ...accelerator.linear_collectives import all_gather_along, reduce_scatter_along
 from ...errors import UnsupportedCombinationError
@@ -23,7 +22,6 @@ from ...models.common.moe.layout import (
     resolve_moe_routing,
     resolve_packed_experts,
 )
-from ...models.common.moe.packed_expert_execution import forward_packed_experts
 from ...models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
@@ -33,11 +31,6 @@ from ..tensor_parallel.sequence_boundary import FeatureParallelSequenceBoundary
 from .checkpointing import mark_experts_ep_sharded
 from .domino_dispatch import DominoRoutedExperts
 from .mc2_dispatch import MC2GroupedExperts, MC2RoutedExperts
-from .npu_baseline_experts import (
-    NpuBaselineAllToAllTokenDispatcher,
-    NpuBaselineGroupedExperts,
-    NpuBaselineRoutedExperts,
-)
 from .token_dispatch import (
     AllToAllTokenDispatcher,
     LocalTokenDispatcher,
@@ -94,18 +87,15 @@ def validate_moe_conversion(
     *,
     tp_enabled: bool,
     quantile_balancing: bool,
-    token_dispatcher: str,
     has_ep_group: bool,
-) -> bool:
+) -> None:
     """Check metadata-only conversion restrictions before any weight allocation.
 
-    Return whether the existing torchtitan NPU expert implementation must be
-    preserved. No process group queries, parameter mutation or RNG consumption.
+    No process group queries, parameter mutation or RNG consumption.
     The caller supplies group ownership explicitly; size-one groups retain
     their distinction from local conversion without a group.
     """
-    if routing.source is not block:
-        raise ValueError("MoE routing binding belongs to another block")
+    routing.validate(block)
     if getattr(routing.router, "bias", None) is not None:
         compatibility.router_bias(routing.router)
     if routing.shared is not None:
@@ -130,19 +120,6 @@ def validate_moe_conversion(
             compatibility.quantile_requires_sigmoid(routing.score_func, block)
         if routing.num_expert_groups is not None and routing.num_expert_groups > 1:
             compatibility.quantile_no_group_limit(block)
-    original_forward = block.__dict__.get("_tp_moe_original_forward", block.forward)
-    baseline_npu = (
-        device_type == "npu"
-        and getattr(original_forward, "__func__", None) is forward_packed_experts
-    )
-    if baseline_npu:
-        if token_dispatcher != "alltoall":
-            raise ValueError(
-                "torchtitan NPU experts with EP require token_dispatcher='alltoall'"
-            )
-        if not has_ep_group:
-            raise ValueError("torchtitan NPU expert conversion requires an EP group")
-    return baseline_npu
 
 
 def convert_block(
@@ -163,12 +140,11 @@ def convert_block(
     ep_rank = 0 if ep_group is None else get_rank(ep_group)
 
     routing = routing if routing is not None else resolve_moe_routing(block)
-    baseline_npu = validate_moe_conversion(
+    validate_moe_conversion(
         block,
         routing,
         tp_enabled=tp_enabled,
         quantile_balancing=quantile_balancing,
-        token_dispatcher=token_dispatcher,
         has_ep_group=ep_group is not None,
     )
     router_gate = routing.router
@@ -192,9 +168,7 @@ def convert_block(
 
     num_expert_groups = routing.num_expert_groups
     num_limited_groups = routing.num_limited_groups
-    if baseline_npu:
-        grouped = NpuBaselineGroupedExperts(dim, hidden, num_local)
-    elif token_dispatcher == "mc2":
+    if token_dispatcher == "mc2":
         grouped = MC2GroupedExperts(dim, hidden, num_local)
     else:
         grouped = GroupedExperts(dim, hidden, num_local)
@@ -245,10 +219,7 @@ def convert_block(
     elif ep_group is None:
         dispatcher = LocalTokenDispatcher(num_experts, top_k)
     else:
-        if baseline_npu:
-            dispatcher = NpuBaselineAllToAllTokenDispatcher(num_experts, top_k)
-        else:
-            dispatcher = AllToAllTokenDispatcher(num_experts, top_k)
+        dispatcher = AllToAllTokenDispatcher(num_experts, top_k)
     if ep_group is not None:
         dispatcher.set_ep_group(ep_group=ep_group)
         # Flag the stacked expert weights as expert-dim-sharded over the EP
@@ -261,8 +232,6 @@ def convert_block(
     )
     if token_dispatcher == "mc2":
         routed_experts_cls = MC2RoutedExperts
-    if baseline_npu and ep_group is not None:
-        routed_experts_cls = NpuBaselineRoutedExperts
     moe_cls = FeatureParallelMoE if feature_parallel else MoE
     moe = moe_cls(
         num_experts=num_experts,

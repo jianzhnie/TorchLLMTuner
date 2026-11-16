@@ -88,7 +88,14 @@ class EMAStateOptimizer(Optimizer):
         # was replaced since then has no entry. state is a defaultdict, so
         # indexing it here would insert an empty entry and fail later with a
         # bare KeyError("ema_params").
-        untracked = [t for t in tensors if "ema_params" not in self.state.get(t, {})]
+        averages: list[torch.Tensor] = []
+        untracked: list[torch.Tensor] = []
+        for tensor in tensors:
+            state = self.state.get(tensor, {})
+            if "ema_params" in state:
+                averages.append(state["ema_params"])
+            else:
+                untracked.append(tensor)
         if untracked:
             raise RuntimeError(
                 f"EMA has no state for {len(untracked)} of {len(tensors)} "
@@ -124,7 +131,6 @@ class EMAStateOptimizer(Optimizer):
                     f"{checkpoint_names[id(tensor)]!r} -> {name!r}. "
                     "Build EMA after model names are final."
                 )
-        averages = [self.state[t]["ema_params"] for t in tensors]
         for tensor, average in zip(tensors, averages, strict=True):
             if isinstance(tensor, DTensor) != isinstance(average, DTensor) or (
                 isinstance(tensor, DTensor)
@@ -161,7 +167,7 @@ class EMA(OptimizerCheckpointState):
     no gradient clearing, optimizer hooks or scheduler-facing parameter groups.
 
     Args:
-        model_parts: the model chunks to track, one per pipeline stage.
+        model_parts: the local model parts whose parameters and buffers to track.
         decay: fixed decay per firing, or None (default) to compute it
             dynamically from ``half_life_fraction``.
         half_life_fraction: used when ``decay`` is None:
@@ -344,16 +350,14 @@ class EMA(OptimizerCheckpointState):
     def _parameter_groups(self) -> list[list[tuple[str, nn.Parameter]]]:
         """Use the final ownership captured at construction for every update."""
         self._validate_runtime_layouts()
-        groups = []
-        for layout in self.runtime_layouts:
-            groups.append(
-                [
-                    (name, parameter)
-                    for parameter, name in layout.parameter_state_names.items()
-                    if parameter.requires_grad
-                ]
-            )
-        return groups
+        return [
+            [
+                (name, parameter)
+                for parameter, name in layout.parameter_state_names.items()
+                if parameter.requires_grad
+            ]
+            for layout in self.runtime_layouts
+        ]
 
     def _tracked_groups(
         self,
@@ -398,7 +402,7 @@ class EMA(OptimizerCheckpointState):
                     "EMA checkpoint is empty for tracked tensors; "
                     "use reset_from_model() for an explicit cold start"
                 )
-        # A PP rank with no tracked tensors legitimately receives empty state,
+        # A rank with no tracked tensors legitimately receives empty state,
         # but must join the same restore coordination as the owning ranks.
         super().load_state_dict(state_dict)
 
