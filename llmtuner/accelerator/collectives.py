@@ -293,7 +293,6 @@ def clip_grad_norm_(
     norm_type: float = 2.0,
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
-    pp_mesh=None,
     ep_mesh=None,
     expert_parameters: Iterable[torch.Tensor] | None = None,
     tp_mesh=None,
@@ -438,9 +437,10 @@ def clip_grad_norm_(
                 norm = norm.full_tensor()
             # Squaring a finite fp16 norm (e.g. 300) already overflows. Mesh
             # accumulation must use at least fp32 before taking p-th powers.
-            if (
-                pp_mesh is not None or tp_mesh is not None or ep_mesh is not None
-            ) and norm.dtype in (torch.float16, torch.bfloat16):
+            if (tp_mesh is not None or ep_mesh is not None) and norm.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
                 norm = norm.float()
             group_norms.append(norm)
         if len(group_norms) == 1:
@@ -508,27 +508,6 @@ def clip_grad_norm_(
     # to return a tensor whose ``.item()`` is the real global value.
     if isinstance(total_norm, DTensor):
         total_norm = total_norm.full_tensor()
-
-    if pp_mesh is not None:
-        # Empty gradient lists produce a CPU zero; NCCL/HCCL still require
-        # this stage to participate using its parameter device.
-        device = next(
-            (p.grad.device for p in parameters if p.grad is not None),
-            parameters[0].device
-            if parameters
-            else get_comm_device(pp_mesh.get_group()),
-        )
-        if device.type == "cpu":
-            device = get_comm_device(pp_mesh.get_group())
-        total_norm = total_norm.to(device)
-        if math.isinf(norm_type):
-            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
-        else:
-            # A norm does not survive an all-reduce directly: sum the p-th
-            # powers, reduce, then take the p-th root.
-            total_norm **= norm_type
-            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
-            total_norm **= 1.0 / norm_type
 
     if error_if_nonfinite and not torch.isfinite(total_norm):
         raise RuntimeError(

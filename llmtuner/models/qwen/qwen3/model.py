@@ -87,7 +87,7 @@ from ...common.moe.layer import collect_moe_layers
 from ...common.validation import temporary_attention_mask
 from ...configuration import configure_reference_experts, validate_attention_backend
 from ...contracts import DecoderStructure, MoEBlockContract
-from ...execution import ModelExecutionCapabilities, PipelineStageIO
+from ...execution import ModelExecutionCapabilities
 from ..routing import Qwen3MoeFP32TopKRouter, validate_router_compute_dtype
 from .normalization import build_rms_norm, validate_norm_backend
 from .rotary import (
@@ -710,82 +710,6 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.post_init()
 
-    pipeline_runtime_modules = ("model.rotary_emb",)
-
-    def validate_pipeline_partition(self, assignments: list[list[str]]) -> None:
-        """Validate exact stage ownership without changing modules or RNG."""
-        if self.enable_weight_tying:
-            raise UnsupportedCombinationError("Qwen3 PP requires untied embedding/head")
-        if self.config.output_router_logits:
-            raise UnsupportedCombinationError("Qwen3 PP does not return router logits")
-        required = [f"model.layers.{key}" for key in self.model.layers._modules]
-        observed = []
-        for index, targets in enumerate(assignments):
-            expected = set(self.pipeline_runtime_modules)
-            if index == 0:
-                expected.add("model.embed_tokens")
-            if index == len(assignments) - 1:
-                expected.update(("model.norm", "lm_head"))
-            blocks = [target for target in targets if target in required]
-            expected.update(blocks)
-            if set(targets) != expected:
-                raise ValueError(f"Qwen3 PP stage {index} has invalid module ownership")
-            observed.extend(blocks)
-        if observed != required:
-            raise ValueError("Qwen3 PP must assign every decoder block once in order")
-
-    def configure_pipeline_stage(self, *, first: bool, last: bool) -> None:
-        """Select model-owned stage tensor I/O after generic module pruning."""
-        self.pipeline_stage_io = PipelineStageIO(
-            first=first,
-            last=last,
-            hidden_size=self.config.hidden_size,
-            activation_dtype=next(self.parameters()).dtype,
-        )
-
-    def forward_pipeline_stage(
-        self,
-        inputs: Tensor,
-        *,
-        positions: Tensor | None,
-        attention_mask: Tensor | None,
-        padding_mask: Tensor | None,
-    ) -> Tensor:
-        """Run tokens on the first stage and hidden states on later stages."""
-        first, last = self.pipeline_stage_io.first, self.pipeline_stage_io.last
-        self.pipeline_stage_io.validate_input(inputs)
-        token_shape = tuple(inputs.shape if first else inputs.shape[:-1])
-        flat = inputs.ndim == (1 if first else 2)
-        if flat:
-            inputs = inputs.unsqueeze(0)
-        if positions is not None and positions.ndim == 1:
-            positions = positions.unsqueeze(0)
-        if attention_mask is None and padding_mask is not None:
-            attention_mask = ~padding_mask
-            if attention_mask.ndim == 1:
-                attention_mask = attention_mask.unsqueeze(0)
-        output = self.model(
-            input_ids=inputs if first else None,
-            inputs_embeds=None if first else inputs,
-            position_ids=positions,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_router_logits=False,
-            padding_mask=padding_mask,
-        ).last_hidden_state
-        if last:
-            output = self.lm_head(output)
-        # Stage sends must own storage, including an Identity-only stage.
-        output = (output.squeeze(0) if flat else output).clone()
-        self.pipeline_stage_io.validate_output(
-            output,
-            token_shape=token_shape,
-            output_width=(
-                self.vocab_size if last else self.pipeline_stage_io.hidden_size
-            ),
-        )
-        return output
-
     @property
     def layers(self) -> nn.ModuleList:
         """Expose decoder blocks for parallel execution without inspection."""
@@ -856,11 +780,7 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
         existing training behavior. Vocabulary sharding remains an explicit
         parallel override. Resolve again after PP changes local ownership.
         """
-        plan = (
-            {"lm_head": "replicated_with_grad_allreduce"}
-            if not hasattr(self, "pipeline_stage_io") or self.pipeline_stage_io.last
-            else {}
-        )
+        plan = {"lm_head": "replicated_with_grad_allreduce"}
         for block_id, layer in self.model.layers._modules.items():
             prefix = f"model.layers.{block_id}"
             for projection in ("q_proj", "k_proj", "v_proj"):
@@ -980,34 +900,6 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
             raise ValueError("Specify only one of positions and position_ids")
         if attention_masks is not None and attention_mask is not None:
             raise ValueError("Specify only one of attention_masks and attention_mask")
-        if hasattr(self, "pipeline_stage_io"):
-            if not isinstance(logits_to_keep, int) or logits_to_keep != 0:
-                raise UnsupportedCombinationError(
-                    "Qwen3 PP must preserve every token row; logits_to_keep must be 0"
-                )
-            if kwargs:
-                raise UnsupportedCombinationError(
-                    f"Qwen3 PP does not support extra forward options: {sorted(kwargs)}"
-                )
-            if skip_lm_head:
-                raise UnsupportedCombinationError(
-                    "Qwen3 PP requires its declared stage output; "
-                    "hidden-only requests are unsupported"
-                )
-            if input_ids is None or inputs_embeds is not None or labels is not None:
-                raise ValueError("Qwen3 PP requires a stage tensor and external loss")
-            if past_key_values is not None or use_cache or output_router_logits:
-                raise UnsupportedCombinationError(
-                    "Qwen3 PP does not support cache/router outputs"
-                )
-            return self.forward_pipeline_stage(
-                input_ids,
-                positions=positions if positions is not None else position_ids,
-                attention_mask=attention_masks
-                if attention_masks is not None
-                else attention_mask,
-                padding_mask=padding_mask,
-            )
         flat_input = input_ids is not None and input_ids.ndim == 1
         if flat_input:
             input_ids = input_ids.unsqueeze(0)
@@ -1174,10 +1066,7 @@ class Qwen3MoeForCausalLM(HFQwen3MoeForCausalLM):
                     raise ValueError(
                         f"Qwen3 {name} storage differs from declared geometry"
                     )
-        # PP deliberately removes non-owned vocabulary modules. Validate the
-        # stage's declared roles, not Identity placeholders from other stages.
-        stage_io = getattr(self, "pipeline_stage_io", None)
-        first, last = (stage_io.first, stage_io.last) if stage_io else (True, True)
+        first, last = True, True
         for name, module, shape, owned in (
             (
                 "embedding",

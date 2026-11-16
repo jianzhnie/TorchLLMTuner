@@ -20,7 +20,6 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed._functional_collectives import all_reduce
 
@@ -269,7 +268,6 @@ def collect_aux_loss_metrics(
     including stages with no local loss. Standalone calls without parts retain
     the constructor registry; the trainer always supplies its current parts.
     """
-    pp_mesh = parallel_dims.get_optional_mesh("pp")
     counts = dict(AuxLoss._group_counts)
     runtime_totals: dict[tuple[str, str], torch.Tensor] = {}
     if model_parts is not None:
@@ -291,15 +289,6 @@ def collect_aux_loss_metrics(
                 runtime_totals[key] = value.clone()
             else:
                 runtime_totals[key].add_(value)
-        if pp_mesh is not None:
-            # Stage-local groups may differ, including a stage with none.
-            # Agree on keys before issuing the per-group tensor collectives.
-            stage_keys = [None] * pp_mesh.size()
-            dist.all_gather_object(
-                stage_keys, sorted(counts), group=pp_mesh.get_group()
-            )
-            counts = {key: counts.get(key, 0) for keys in stage_keys for key in keys}
-
     metrics = {}
     for key, count in sorted(counts.items()):
         mesh_name, tag = key
@@ -312,7 +301,7 @@ def collect_aux_loss_metrics(
             # A stage with no local instance still joins every collective.
             total = torch.zeros((), dtype=torch.float32, device=device_type)
         reduce_mesh = parallel_dims.get_optional_mesh(mesh_name)
-        for mesh in (reduce_mesh, pp_mesh):
+        for mesh in (reduce_mesh,):
             if mesh is None:
                 continue
             # Sum: each coordinate contributes its own data, and every layer
@@ -326,8 +315,6 @@ def collect_aux_loss_metrics(
             # process. Count the current runtime's distinct local instances,
             # then combine pipeline stages (data peers replicate each layer).
             layer_count = torch.tensor(count, dtype=torch.int64, device=total.device)
-            if pp_mesh is not None:
-                layer_count = all_reduce(layer_count, reduceOp="sum", group=pp_mesh)
             count = int(layer_count.item())
             if count == 0:
                 continue

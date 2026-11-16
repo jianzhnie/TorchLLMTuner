@@ -1,8 +1,8 @@
 """Model execution independent of the Trainer lifecycle.
 
 The engine owns forward/backward dispatch, parallel gradient synchronization,
-routing state and optimizer/scheduler/EMA updates. Data iteration, clipping
-policy, reporting cadence and checkpointing remain Trainer responsibilities.
+routing state, gradient clipping and optimizer/scheduler/EMA updates. Data
+iteration, reporting cadence and checkpointing remain Trainer responsibilities.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any
 
 import torch
@@ -34,10 +33,11 @@ from ...models.common.moe.bias_update import (
 )
 from ...models.contracts import DecoderStructure
 from ...models.execution import ModelExecutionCapabilities, validate_training_output
-from ...parallel.execution import ExecutionLayout, validate_local_pipeline_layouts
+from ...parallel.execution import ExecutionLayout
 from ...parallel.topology import ParallelTopology
-from . import gradients, pipeline
+from . import gradients
 from .batch import prepare_model_inputs
+from .reductions import TrainingReductionMeshes
 from .results import AccumulationResult, StepResult, UpdateResult
 
 ParamContext = Callable[[], AbstractContextManager[Any]]
@@ -72,14 +72,11 @@ class TrainingEngine:
     optimizer: Any = None
     lr_scheduler: Any = None
     ema: Any = None
-    pp_schedule: Any | None = None
-    pp_has_first_stage: bool = False
-    pp_has_last_stage: bool = False
-    pp_loss_sentinel: torch.Tensor | None = None
-    pp_num_microbatches: int = 1
-    # All update participants, including PP stages without tracked EMA tensors.
-    # None preserves the default-group behavior for standalone callers.
+    # All update participants coordinate failures through this group.
     error_group: ProcessGroup | None = None
+    max_norm: float = 1.0
+    grad_norm_precision: str = "float32"
+    expert_reduce_layout: str = "storage"
 
     _run_forward_backward: Callable[..., torch.Tensor] = field(
         init=False, repr=False, compare=False
@@ -104,20 +101,9 @@ class TrainingEngine:
             raise ValueError("Configured loss does not support chunked backward")
         # Execution policy belongs to this assembly. Rebuild the engine after
         # changing topology or loss mode rather than selecting it on each batch.
-        pipeline_enabled = (
-            self.parallel_dims is not None and self.parallel_dims.pp_enabled
-        )
-        if not self.model_parts:
-            raise ValueError("Training execution requires at least one model part")
-        if not pipeline_enabled and len(self.model_parts) != 1:
+        if len(self.model_parts) != 1:
             raise ValueError("Dense execution requires exactly one model part")
-        if pipeline_enabled != (self.pp_schedule is not None):
-            raise ValueError("Pipeline topology and schedule must be enabled together")
         if self.chunked_loss_num_chunks > 1:
-            if pipeline_enabled:
-                raise ValueError(
-                    "Chunked loss cannot execute with pipeline parallelism"
-                )
             structure = getattr(self.model, "decoder_structure", None)
             if not isinstance(structure, DecoderStructure):
                 raise TypeError("Chunked loss requires a model-owned DecoderStructure")
@@ -143,16 +129,10 @@ class TrainingEngine:
                     raise ValueError(
                         "Engine loss strategy disagrees with assembled output layout"
                     )
-                if not pipeline_enabled and layout.output != "logits":
+                if layout.output != "logits":
                     raise ValueError(
                         "Dense engine requires a logits-producing model part"
                     )
-            if pipeline_enabled:
-                validate_local_pipeline_layouts(
-                    self.execution_layouts,
-                    has_first_stage=self.pp_has_first_stage,
-                    has_last_stage=self.pp_has_last_stage,
-                )
         capabilities = (
             tuple(layout.capabilities for layout in self.execution_layouts)
             if self.execution_layouts
@@ -168,33 +148,19 @@ class TrainingEngine:
                 "Every model part must declare valid execution capabilities"
             )
         self._output_capabilities = capabilities[0]
-        if not pipeline_enabled and not self._output_capabilities.logits:
+        if not self._output_capabilities.logits:
             raise ValueError("Dense execution requires model-declared logits output")
         if (
             self.chunked_loss_num_chunks > 1
             and not self._output_capabilities.hidden_states
         ):
             raise ValueError("Chunked loss requires model-declared hidden output")
-        # PP schedules own their loss binding; intermediate parts return hidden
-        # activations and must never be bound to the dense LM loss.
-        self._loss_kwargs = (
-            {}
-            if pipeline_enabled
-            else loss_vocab_kwargs(
-                self.parallel_dims,
-                layout=self.execution_layouts[0] if self.execution_layouts else None,
-            )
+        self._loss_kwargs = loss_vocab_kwargs(
+            self.parallel_dims,
+            layout=self.execution_layouts[0] if self.execution_layouts else None,
         )
-        self._run_forward_backward = (
-            partial(pipeline.run_pipeline_step, self)
-            if pipeline_enabled
-            else self._forward_backward_batch
-        )
-        self._run_evaluation = (
-            partial(pipeline.run_pipeline_eval, self)
-            if pipeline_enabled
-            else self._evaluate_dense
-        )
+        self._run_forward_backward = self._forward_backward_batch
+        self._run_evaluation = self._evaluate_dense
         self._dense_backward = (
             self._backward_chunked
             if self.chunked_loss_num_chunks > 1
@@ -292,13 +258,6 @@ class TrainingEngine:
             error_group=self.error_group,
         )
 
-    def pp_microbatches(
-        self, batch: Batch | TrainerBatch
-    ) -> list[Batch | TrainerBatch]:
-        return pipeline.split_pipeline_microbatches(
-            batch, num_microbatches=self.pp_num_microbatches
-        )
-
     def forward_backward(
         self,
         batch: Batch | TrainerBatch,
@@ -320,7 +279,7 @@ class TrainingEngine:
             )
 
     def evaluate(self, batch: Batch | TrainerBatch) -> torch.Tensor | None:
-        """Return raw validation loss; non-final PP stages return None.
+        """Return raw validation loss.
 
         The caller owns eval/no-grad mode, RNG restoration and reporting.
         """
@@ -488,3 +447,42 @@ class TrainingEngine:
                 # All ranks enter, including PP stages with no tracked tensors.
                 self.ema.step(step)
         return result
+
+    def finish_step(
+        self,
+        step: int,
+        *,
+        accumulation: AccumulationResult,
+        reduction_meshes: TrainingReductionMeshes,
+        collect_metrics: bool,
+        before_gradient_clipping: Callable[[], None] | None = None,
+    ) -> UpdateResult:
+        """Synchronize, check and commit an accumulated optimizer update.
+
+        The diagnostic hook observes synchronized, unclipped gradients. Keep
+        it before clipping and routing observation, and reject a nonfinite
+        step before optimizer, scheduler or EMA can advance. Clipping policy
+        is bound at construction, independently of the Trainer lifecycle.
+        """
+        self.synchronize_gradients()
+        with synchronize_local_errors(
+            "Before gradient clipping hook", group=self.error_group
+        ):
+            if before_gradient_clipping is not None:
+                before_gradient_clipping()
+        grad_norm = gradients.clip_and_check_finite(
+            self.model_parts,
+            parallel_dims=self.parallel_dims,
+            max_norm=self.max_norm,
+            precision=self.grad_norm_precision,
+            expert_reduce_layout=self.expert_reduce_layout,
+            step=step,
+            error_group=self.error_group,
+            reduction_meshes=reduction_meshes,
+            loss_is_finite=accumulation.loss_is_finite,
+        )
+        return self.optimizer_step(
+            step,
+            grad_norm=grad_norm,
+            auxiliary_metrics=self.routing_metrics() if collect_metrics else {},
+        )

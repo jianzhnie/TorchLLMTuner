@@ -2,7 +2,7 @@
 
 Each family has one same-named public entry module. Supporting modules contain
 mechanisms only: TP linear kernels, FSDP plans, CP kernels and input sharding,
-EP model conversion, and PP stage splitting. External callers can use the
+and EP model conversion. External callers can use the
 family packages; implementation code imports from the defining modules.
 
 The composition entry calls each transformation in the declared stage order.
@@ -10,10 +10,8 @@ Each entry decides whether it is needed from the configuration and topology.
 FSDP may still be required with a singleton DP shard axis when CP, replication,
 or expert sharding is active; callers must not skip it based only on DP degree.
 
-Pipeline parallelism lives in ``pipeline_parallel/``: ``partition.py`` computes
-the stage split and ``pipeline_parallel.py`` builds this rank's schedule.
-``parallelize_model`` dispatches to it when ``pp > 1``. It always returns a
-``ParallelAssembly`` carrying execution objects and final local layouts.
+Pipeline parallelism has moved to ``experiments/pipeline_parallel``. Production
+assembly returns a transformed module with its final local layout.
 """
 
 from __future__ import annotations

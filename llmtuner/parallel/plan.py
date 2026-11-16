@@ -147,7 +147,7 @@ class ParallelPlan:
         default=(), init=False, repr=False, compare=False
     )
 
-    forward_bindings: tuple[tuple[object, object], ...] = field(
+    forward_bindings: tuple[tuple[str, object, object], ...] = field(
         default=(), init=False, repr=False, compare=False
     )
 
@@ -209,7 +209,8 @@ class ParallelPlan:
         if self.module_bindings is not None:
             # Accessing a bound method creates a fresh method object. Snapshot
             # its function and receiver instead of that ephemeral object's ID.
-            forward_paths = {target.path for target in self.targets} | {""}
+            # A target can delegate its math to nested modules. The complete
+            # ownership snapshot must protect their execution bindings too.
             object.__setattr__(
                 self,
                 "forward_bindings",
@@ -220,7 +221,6 @@ class ParallelPlan:
                         getattr(module.forward, "__self__", None),
                     )
                     for path, module in self.module_bindings
-                    if not self.targets or path in forward_paths
                 ),
             )
             for path, module in self.module_bindings:
@@ -351,44 +351,3 @@ class ParallelPlan:
                 raise ValueError(f"Stale plan binding: {target.path}") from error
             if current is not target.module:
                 raise ValueError(f"Stale plan binding: {target.path}")
-
-
-def validate_pipeline_targets(
-    global_plan: ParallelPlan, local_plan: ParallelPlan, model: nn.Module
-) -> tuple[tuple[PlanTarget, PlanTarget], ...]:
-    """Validate retained PP ownership and return global/local metadata pairs.
-
-    Missing modules and removed-stage Identity placeholders are nonlocal targets.
-    The returned global bindings are only references for semantic comparison;
-    execution must consume the independently resolved local plan.
-    """
-    local_plan.validate_binding(model)
-    label = f"Pipeline {global_plan.stage.upper()}"
-    # validate_binding checked the complete module table when supplied.
-    modules = dict(
-        model.named_modules(remove_duplicate=False)
-        if local_plan.module_bindings is None
-        else local_plan.module_bindings
-    )
-    expected = {}
-    for target in global_plan.targets:
-        module = modules.get(target.path)
-        if module is None or (
-            isinstance(module, nn.Identity)
-            and not isinstance(target.module, nn.Identity)
-        ):
-            continue
-        key = (target.path, target.kind)
-        if key in expected:
-            raise ValueError(f"{label} global plan contains duplicate targets")
-        expected[key] = target
-    actual = {(target.path, target.kind): target for target in local_plan.targets}
-    if len(actual) != len(local_plan.targets):
-        raise ValueError(f"{label} local plan contains duplicate targets")
-    if expected.keys() != actual.keys():
-        raise ValueError(
-            f"{label} target ownership changed: "
-            f"missing={sorted(expected.keys() - actual.keys())}, "
-            f"unexpected={sorted(actual.keys() - expected.keys())}"
-        )
-    return tuple((expected[key], target) for key, target in actual.items())

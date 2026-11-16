@@ -24,7 +24,6 @@ flex_attention) have nothing to probe.
 from __future__ import annotations
 
 import importlib
-import inspect
 from collections.abc import Callable
 from functools import cache
 
@@ -33,11 +32,6 @@ import torch
 from llmtuner.errors import EnvironmentUnsupportedError
 
 from .device import get_current_device
-
-try:
-    import torch.distributed.pipelining.schedules as pipeline_schedules
-except ImportError:
-    pipeline_schedules = None
 
 try:
     import torch.distributed.fsdp._fully_shard._fully_shard as fully_shard_module
@@ -60,6 +54,19 @@ def importable(module: str, attr: str | None = None) -> Callable[[], bool]:
     return probe
 
 
+def npu_ascendc_codegen() -> bool:
+    """AscendC imports may initialize the device while detecting its SoC.
+
+    A missing/inaccessible device makes this optional backend unavailable,
+    even when torch-npu itself is installed. Other probe failures keep their
+    normal diagnostics; do not make every import probe swallow runtime errors.
+    """
+    try:
+        return importable("torch_npu._inductor.ascendc")()
+    except RuntimeError:
+        return False
+
+
 def dynamo_lru_cache_knob() -> bool:
     """Whether dynamo exposes ``eval_frame._set_lru_cache``.
 
@@ -76,29 +83,6 @@ def dynamo_lru_cache_knob() -> bool:
         return False
     eval_frame = getattr(getattr(torch._C, "_dynamo", None), "eval_frame", None)
     return getattr(eval_frame, "_set_lru_cache", None) is not None
-
-
-def _pipelining_has_eval() -> bool:
-    """Whether torch's pipeline schedules carry the microbatch eval driver.
-
-    Attribute presence is not enough: torch 2.9 shipped ``eval(*args, target,
-    losses, **kwargs)`` -- the microbatch keyword form (``arg_mbs`` /
-    ``kwarg_mbs`` / ``target_mbs``) would be swallowed by ``**kwargs`` and
-    misrouted into the model kwargs. Probe the signature instead. The training
-    seam's ``_step_microbatches(..., return_outputs=...)`` arrived in the same
-    window, so both are checked.
-    """
-    schedule = getattr(pipeline_schedules, "_PipelineSchedule", None)
-    evaluate = getattr(schedule, "eval", None)
-    if evaluate is None:
-        return False
-    eval_params = inspect.signature(evaluate).parameters
-    if "arg_mbs" not in eval_params:
-        return False
-    step = getattr(schedule, "_step_microbatches", None)
-    if step is None:
-        return False
-    return "return_outputs" in inspect.signature(step).parameters
 
 
 def _fsdp_unshard_is_a_context_manager() -> bool:
@@ -181,7 +165,7 @@ CAPABILITIES: dict[str, Capability] = {
         ),
     ),
     "npu_ascendc_codegen": Capability(
-        importable("torch_npu._inductor.ascendc"),
+        npu_ascendc_codegen,
         what="torch_npu._inductor.ascendc and the matching CANN AutoFuse runtime",
         since="torch_npu with the built-in AscendC Inductor backend",
         hint="Install the matching torch_npu/CANN runtime, or use aot_eager/eager.",
@@ -243,20 +227,6 @@ CAPABILITIES: dict[str, Capability] = {
         hint="Upgrade torch; without the knob, activation checkpointing runs "
         "without upstream's SAC + pipeline-parallel cache workaround.",
         consumers="memory/activation_checkpoint.py (disable_dynamo_lru_cache)",
-    ),
-    # -- pipeline eval driver (consumer: trainer/runtime/validation.py) --------
-    "pipelining_microbatch_drivers": Capability(
-        _pipelining_has_eval,
-        what="torch.distributed.pipelining microbatch drivers "
-        "(_PipelineSchedule.eval(arg_mbs=...) and "
-        "_step_microbatches(return_outputs=...))",
-        since="no released torch through 2.12 (2.9's and 2.12's eval both "
-        "swallow the microbatch kwargs); the probe reads the signature",
-        hint="Optional: when absent, PP falls back to the drivers in "
-        "parallel/pipeline_parallel/microbatch_drivers.py, which reproduce the "
-        "schedule setup torch's own step() performs.",
-        consumers="trainer/runtime/{pipeline,validation}.py (chooses the native "
-        "microbatch driver or the fallback)",
     ),
     # -- model kernels (consumer: models/common/moe/experts.py) ----------------
     "torch_grouped_mm": Capability(

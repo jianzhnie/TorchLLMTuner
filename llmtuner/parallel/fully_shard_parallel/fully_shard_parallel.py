@@ -200,7 +200,6 @@ def apply_fsdp_to_decoder(
     *,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
-    pp_enabled: bool,
     cpu_offload: bool = False,
     cpu_offload_pin_memory: bool = True,
     reshard_after_forward_policy: str = "default",
@@ -271,10 +270,7 @@ def apply_fsdp_to_decoder(
         decoder = structure.bind(model)
         all_modules = tuple(model.modules())
         if root_owned_boundaries and (
-            fsdp_implementation != "native"
-            or cpu_offload
-            or pp_enabled
-            or ep_degree > 1
+            fsdp_implementation != "native" or cpu_offload or ep_degree > 1
         ):
             raise ValueError("root-owned boundaries require native decoder-only FSDP")
         mp_policy = MixedPrecisionPolicy(
@@ -294,7 +290,7 @@ def apply_fsdp_to_decoder(
             )
 
         reshard_after_forward = get_fsdp_reshard_after_forward_policy(
-            reshard_after_forward_policy, pp_enabled
+            reshard_after_forward_policy
         )
 
         # Models declare parameters that need a separate storage-dtype group. Wrap
@@ -664,7 +660,6 @@ def apply_fsdp(
         or parallel_dims.ep_enabled
         or parallel_dims.tp_enabled
         or parallel_dims.cp_enabled
-        or parallel_dims.pp_enabled
         or parallel_dims.dp_replicate_enabled
     ):
         raise UnsupportedCombinationError(
@@ -689,7 +684,6 @@ def apply_fsdp(
                 parallel_dims.tp_enabled
                 or parallel_dims.cp_enabled
                 or parallel_dims.ep_enabled
-                or parallel_dims.pp_enabled
             ),
         )
 
@@ -751,7 +745,6 @@ def apply_fsdp(
         storage_mesh,
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
-        pp_enabled=parallel_dims.pp_enabled,
         cpu_offload=cfg.fsdp_config.fsdp_cpu_offload,
         cpu_offload_pin_memory=cfg.fsdp_config.fsdp_cpu_offload_pin_memory,
         reshard_after_forward_policy=cfg.fsdp_config.fsdp_reshard_after_forward,

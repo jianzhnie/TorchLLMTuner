@@ -274,7 +274,7 @@ def resolve_effective_tp_plan(
 ) -> dict[str, str | ShardingConfig]:
     """Merge overrides once for dense, expert and vocabulary target resolution."""
     # A PP-local part may not own a globally validated override target.
-    overrides = resolve_tp_overrides(model, cfg=cfg, allow_unmatched=cfg.pp_size > 1)
+    overrides = resolve_tp_overrides(model, cfg=cfg, allow_unmatched=False)
     declared = model_tp_config(model) if plan is None else _require_tp_plan(plan)
     # First matching pattern wins, so configuration overrides precede defaults.
     return {

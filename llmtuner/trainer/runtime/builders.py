@@ -11,14 +11,11 @@ if TYPE_CHECKING:
 
     from torch import nn
     from torch.distributed import ProcessGroup
-    from torch.distributed.device_mesh import DeviceMesh
-    from torch.distributed.pipelining import PipelineStage
-    from torch.distributed.pipelining.schedules import _PipelineSchedule
     from torch.optim import Optimizer
 
     from ...components.checkpointer.core.base import BaseCheckpointManager
     from ...components.checkpointer.model_state import ModelStateDictAdapter
-    from ...components.loss_contract import LossFunctions, LossSum
+    from ...components.loss_contract import LossFunctions
     from ...components.metrics import MetricsProcessor
     from ...components.optimizer.ema import EMA
     from ...components.optimizer.lr_scheduler import LRSchedulersContainer
@@ -28,33 +25,8 @@ if TYPE_CHECKING:
     from ...config.lr_scheduler_config import LRSchedulerConfig
     from ...config.observability_config import MetricsConfig, ProfilerConfig
     from ...config.optimizer_config import OptimizerConfig
-    from ...config.parallel_config import ParallelConfig
     from ...parallel.assembly import ModelPartLayout
     from ...parallel.topology import ParallelTopology
-
-
-class PipelineScheduleFactory(Protocol):
-    """Build a training schedule retaining the supplied stages in order.
-
-    Pass PipelineLoss (or an equivalent callable with mutable scalar tensor
-    global_valid_tokens) as the schedule's loss_fn. The driver scopes this
-    denominator to each invocation. The returned schedule must support the
-    installed Torch microbatch API and have backward enabled. logits_width is
-    the declared replicated vocabulary width and must be checked before loss;
-    None leaves vocabulary-sharded geometry to the sharded loss contract.
-    """
-
-    def __call__(
-        self,
-        stages: list[PipelineStage],
-        /,
-        *,
-        cfg: ParallelConfig,
-        loss_sum: LossSum | None,
-        tp_group: ProcessGroup | None = None,
-        global_vocab_size: int | None = None,
-        logits_width: int | None = None,
-    ) -> _PipelineSchedule: ...
 
 
 class EMAFactory(Protocol):
@@ -88,7 +60,6 @@ class MetricsFactory(Protocol):
         dump_folder: str,
         num_parameters: int,
         num_trainable_parameters: int,
-        pp_schedule: str,
         num_flops_per_token: int,
     ) -> MetricsProcessor: ...
 
@@ -102,7 +73,6 @@ class OptimizerFactory(Protocol):
         /,
         *,
         model_parts: list[nn.Module],
-        pipeline_mesh: DeviceMesh | None,
         initialization_group: ProcessGroup | None,
         sharded_tensor_parallel: bool,
         sharded_expert_parallel: bool,
@@ -204,9 +174,7 @@ class TrainingBuilders:
     rank-local scalar counters; training reporting consumes it without inspecting
     optimizer implementations.
 
-    loss receives the run configuration and returns LossFunctions. A pipeline
-    schedule factory accepts stages, parallel cfg, loss_sum and vocabulary
-    reduction keywords, using build_pipeline_schedule's calling convention.
+    loss receives the run configuration and returns LossFunctions.
 
     profiler accepts profiler config, global_step and base_folder, and returns
     a context manager with close() whose entered value supports step(). checkpoint
@@ -216,7 +184,6 @@ class TrainingBuilders:
     """
 
     loss: Callable[[LLMTunerConfig], LossFunctions] | None = None
-    pipeline_schedule: PipelineScheduleFactory | None = None
     optimizer: OptimizerFactory | None = None
     scheduler: SchedulerFactory | None = None
     ema: EMAFactory | None = None

@@ -46,7 +46,6 @@ def build_step_metrics(
     *,
     ntokens_seen: int,
     device: torch.device,
-    pp_has_last_stage: bool,
     accumulation: AccumulationResult,
     global_valid_tokens: torch.Tensor,
     local_valid_tokens: int,
@@ -59,11 +58,8 @@ def build_step_metrics(
     if accumulated_loss is None:
         raise ValueError("Step reporting requires an accumulation result with loss_sum")
     dp_mesh = reduction_meshes.dp_mesh
-    pp_mesh = reduction_meshes.pp_mesh
     loss_mesh = reduction_meshes.loss_mesh
     sequence_mesh = reduction_meshes.sequence_mesh
-    if pp_mesh is not None and not pp_has_last_stage:
-        accumulated_loss = torch.zeros_like(accumulated_loss)
     # Division creates reporting tensors owned here; collectives can update
     # them directly without copying or mutating the accumulation result.
     loss_sum = accumulated_loss / global_valid_tokens
@@ -88,9 +84,6 @@ def build_step_metrics(
     else:
         local_max = loss_sum.clone()
         global_ntokens_seen = float(ntokens_seen)
-    if pp_mesh is not None:
-        all_reduce(loss_sum, group=pp_mesh.get_group())
-        all_reduce(local_max, group=pp_mesh.get_group())
     metrics = {
         "loss": float(loss_sum),
         "max_loss": float(local_max),

@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 @dataclass(frozen=True, slots=True)
 class TrainingReductionMeshes:
     dp_mesh: DeviceMesh | None
-    pp_mesh: DeviceMesh | None
     loss_mesh: DeviceMesh | None
     sequence_mesh: DeviceMesh | None
 
@@ -49,10 +48,10 @@ def resolve_loss_reduction_meshes(
 def resolve_training_reduction_meshes(
     parallel_dims: ParallelTopology | None,
 ) -> TrainingReductionMeshes:
-    """Resolve the four meshes used by one training step."""
+    """Resolve the meshes used by one training step."""
     dp_mesh, loss_mesh = resolve_loss_reduction_meshes(parallel_dims)
     if parallel_dims is None:
-        return TrainingReductionMeshes(None, None, None, None)
+        return TrainingReductionMeshes(None, None, None)
     sequence_axes = [
         axis
         for axis, enabled in (
@@ -70,7 +69,6 @@ def resolve_training_reduction_meshes(
         sequence_mesh = sequence_mesh._flatten("sequence_loss")
     return TrainingReductionMeshes(
         dp_mesh=dp_mesh,
-        pp_mesh=parallel_dims.get_optional_mesh("pp"),
         loss_mesh=loss_mesh,
         sequence_mesh=sequence_mesh,
     )

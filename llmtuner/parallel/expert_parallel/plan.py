@@ -33,7 +33,6 @@ from ..plan import (
     ParallelPlan,
     PlanTarget,
     first_paths_by_identity,
-    validate_pipeline_targets,
 )
 from .block_conversion import validate_moe_conversion
 from .model_conversion import uses_model_expert_conversion
@@ -344,58 +343,3 @@ def resolve_ep_plan(
             else bindings
         ),
     )
-
-
-def pipeline_ep_semantics(target: PlanTarget) -> tuple[object, ...]:
-    """Describe conversion mathematics without instance-specific references.
-
-    PP deepcopy changes module/parameter identity. Routing values and packed
-    geometry must remain unchanged until TP starts slicing those parameters.
-    """
-    binding = target.spec
-    if target.kind != "moe" or not isinstance(binding, MoEConversionTarget):
-        raise ValueError("Pipeline EP requires resolved MoE conversion targets")
-    routing = binding.routing
-    return (
-        target.layout,
-        binding.attribute,
-        binding.router_logits,
-        binding.contract,
-        binding.model_math,
-        binding.model_conversion,
-        binding.declared_slot,
-        None if binding.packed_experts is None else binding.packed_experts.shape,
-        None
-        if routing is None
-        else (
-            routing.top_k,
-            routing.score_func,
-            routing.route_norm,
-            routing.route_scale,
-            routing.num_expert_groups,
-            routing.num_limited_groups,
-            routing.shared is not None,
-            routing.shared_gate is not None,
-        ),
-    )
-
-
-def validate_pipeline_ep_plan(
-    global_plan: ParallelPlan, local_plan: ParallelPlan, model: nn.Module
-) -> None:
-    """Validate freshly bound PP-local EP ownership before any TP mutation.
-
-    Removed stages are absent or Identity placeholders. Retained MoE paths must
-    keep their globally checked layout and routing; global references are never
-    reused for local execution. Resolve again after TP changes parameter layout.
-    """
-    if (
-        global_plan.stage != "ep"
-        or local_plan.stage != "ep"
-        or global_plan.degree != local_plan.degree
-        or global_plan.implementation != local_plan.implementation
-    ):
-        raise ValueError("Pipeline EP plans must describe the same execution")
-    for original, target in validate_pipeline_targets(global_plan, local_plan, model):
-        if pipeline_ep_semantics(target) != pipeline_ep_semantics(original):
-            raise ValueError(f"Pipeline EP conversion semantics changed: {target.path}")

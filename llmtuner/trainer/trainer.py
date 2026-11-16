@@ -2,7 +2,7 @@
 
 ``runtime.assembly`` builds explicit services, ``runtime.engine`` executes
 model and update steps, and ``runtime.validation`` evaluates. This module owns
-gradient checks, loss reductions, checkpoint counters, and the outer loop.
+token accounting, loss reporting, checkpoint counters, and the outer loop.
 
 Step order matters: read every accumulation batch, reduce the whole-batch
 valid-token count over DP, run forward/backward with that denominator, clip
@@ -51,12 +51,13 @@ from ..parallel.topology import ParallelTopology
 from ..utils.garbage_collection import GarbageCollection
 from ..utils.logging import get_logger, set_log_ranks
 from ..utils.seeding import rollback_execution_settings_on_error
-from .runtime import assembly, engine, gradients
+from .runtime import assembly, engine
 from .runtime import batch as batch_runtime
 from .runtime import metrics as metrics_runtime
 from .runtime import validation as validation_runtime
 from .runtime.builders import TrainingBuilders
 from .runtime.environment import build_runtime_environment
+from .runtime.gradients import check_step_condition
 from .runtime.reductions import (
     logical_tokens_per_rank,
     resolve_training_reduction_meshes,
@@ -200,7 +201,6 @@ class Trainer:
             cfg,
             environment=environment,
             loss_functions=loss_functions,
-            pipeline_schedule_factory=factories.pipeline_schedule,
             on_model_acquired=self._retain_model_resources,
         )
         model_assembly = prepared_model.assembly
@@ -432,7 +432,7 @@ class Trainer:
         # no stage updates on an undefined (zero-divided) gradient. The device
         # assertion stays asynchronous where supported; NPU uses an explicit
         # scalar read because torch-npu 2.12 lacks the native assertion kernel.
-        gradients.check_step_condition(
+        check_step_condition(
             global_valid_tokens > 0,
             "Training step has zero valid tokens; cannot normalize the loss.",
         )
@@ -474,24 +474,12 @@ class Trainer:
             executed_groups(), retain_loss=should_log
         )
 
-        self.training_engine.synchronize_gradients()
-
-        self.before_gradient_clipping()
-        grad_norm = gradients.clip_and_check_finite(
-            self.model_parts,
-            parallel_dims=self.parallel_dims,
-            max_norm=self.cfg.max_norm,
-            precision=self.cfg.grad_norm_precision,
-            expert_reduce_layout=self.cfg.parallel.fsdp_config.fsdp_expert_reduce_layout,
-            step=self.step,
-            error_group=self.error_group,
+        update_result = self.training_engine.finish_step(
+            self.step,
+            accumulation=accumulation,
             reduction_meshes=reduction_meshes,
-            loss_is_finite=accumulation.loss_is_finite,
-        )
-
-        routing_metrics = self.training_engine.routing_metrics() if should_log else {}
-        update_result = self.training_engine.optimizer_step(
-            self.step, grad_norm=grad_norm, auxiliary_metrics=routing_metrics
+            collect_metrics=should_log,
+            before_gradient_clipping=self.before_gradient_clipping,
         )
 
         if not should_log:
@@ -509,7 +497,6 @@ class Trainer:
         result = metrics_runtime.build_step_metrics(
             ntokens_seen=self.ntokens_seen,
             device=self.device,
-            pp_has_last_stage=self.training_engine.pp_has_last_stage,
             accumulation=accumulation,
             global_valid_tokens=global_valid_tokens,
             local_valid_tokens=local_valid_tokens,

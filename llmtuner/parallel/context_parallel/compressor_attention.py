@@ -256,7 +256,7 @@ def _validate_compressor_configuration(
         raise ValueError(
             "DeepSeek V4 Compressor CP currently requires strategy='ulysses'"
         )
-    if cfg.tp_size != 1 or cfg.pp_size != 1:
+    if cfg.tp_size != 1:
         raise ValueError(
             "DeepSeek V4 Compressor CP TP/PP composition is not implemented"
         )

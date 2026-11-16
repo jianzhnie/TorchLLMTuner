@@ -1,10 +1,10 @@
-"""Resolve FSDP patterns, shared ownership, policies and local PP bindings."""
+"""Resolve FSDP patterns, shared ownership and policies."""
 
 from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 from types import MappingProxyType
 from typing import Any
@@ -25,14 +25,9 @@ from llmtuner.config.parallel_config import ParallelConfig
 from ...accelerator.capabilities import require
 from ...models.common.moe.experts import GroupedExperts
 from ..module_patterns import compile_module_pattern, resolve_module_patterns
-from ..pipeline_parallel.ownership import (
-    PipelineOwnership,
-    snapshot_pipeline_ownership,
-)
 from ..plan import (
     ParallelPlan,
     PlanTarget,
-    model_bindings_from_plan,
     snapshot_model_bindings,
 )
 from .fine_grained.fine_grained import get_fsdp_strategy, validate_fsdp_hook_target
@@ -45,7 +40,6 @@ from .policies import (
 __all__ = [
     "FSDPPatternPlan",
     "resolve_fsdp_pattern_plan",
-    "resolve_pipeline_fsdp_configs",
 ]
 
 
@@ -115,98 +109,6 @@ def validate_fsdp_ignored_parameters(
             f"FSDP unit {unit_name!r}: ignored_params contains parameters not "
             "registered in the model; use the current model's Parameter objects"
         )
-
-
-def resolve_pipeline_fsdp_configs(
-    model: nn.Module,
-    parts: list[nn.Module],
-    cfg: ParallelConfig,
-    *,
-    ownership: list[PipelineOwnership] | None = None,
-) -> list[ParallelConfig]:
-    """Bind a whole-model pattern plan to copied pipeline parts by registered FQN.
-
-    Global patterns must match before selecting local units. Module and parameter
-    overrides refer to the copied objects, while meshes and policies retain their
-    identity. A part without a selected child still gets its root FSDP state.
-    """
-    bindings = (
-        snapshot_pipeline_ownership(model, parts) if ownership is None else ownership
-    )
-    if len(bindings) != len(parts):
-        raise ValueError("Pipeline ownership must describe every local part")
-    validated_sources: set[int] = set()
-    for part, binding in zip(parts, bindings, strict=True):
-        # Parts normally share one source plan. Distinct supplied snapshots must
-        # each be checked before borrowing any of their registered bindings.
-        source_id = id(binding.global_plan)
-        if source_id not in validated_sources:
-            binding.global_plan.validate_binding(model)
-            validated_sources.add(source_id)
-        binding.local_plan.validate_binding(part)
-
-    module_bindings = (
-        model_bindings_from_plan(bindings[0].global_plan)["module_bindings"]
-        if bindings
-        else tuple(model.named_modules(remove_duplicate=False))
-    )
-    source_modules, unit_options, _ = _resolve_pattern_units(module_bindings, cfg)
-    source_parameters = {
-        parameter
-        for module in source_modules.values()
-        for parameter in module.parameters(recurse=False)
-    }
-    for name, options in unit_options.items():
-        validate_fsdp_hook_target([source_modules[name]], options.get("hook_module"))
-        validate_fsdp_ignored_parameters(
-            options.get("ignored_params"), parameters=source_parameters, unit_name=name
-        )
-    source_paths = dict(module_bindings)
-    ignored_names = resolve_module_patterns(
-        list(source_paths),
-        patterns=cfg.fsdp_config.fsdp_ignored_modules,
-        plan_name="FSDP ignored",
-    )
-
-    configs = []
-    for binding in bindings:
-        local_options = {}
-        for name, overrides in unit_options.items():
-            unit_binding = binding.module_binding(source_modules[name])
-            if unit_binding is None:
-                continue
-            local_name, _ = unit_binding
-            options = overrides.copy()
-            hook = options.get("hook_module")
-            if hook is not None:
-                hook_binding = binding.module_binding(hook)
-                if hook_binding is None:
-                    raise ValueError(
-                        f"FSDP unit {name!r}: hook_module must belong to its "
-                        "pipeline part"
-                    )
-                options["hook_module"] = hook_binding[1]
-            exclusions = options.get("ignored_params")
-            if exclusions is not None:
-                options["ignored_params"] = binding.parameter_bindings(exclusions)
-            local_options.setdefault(local_name, {}).update(options)
-        local_ignored = [
-            ignored_binding[0]
-            for name in ignored_names
-            if (ignored_binding := binding.module_binding(source_paths[name]))
-            is not None
-        ]
-        configs.append(
-            replace(
-                cfg,
-                fsdp_config=replace(
-                    cfg.fsdp_config,
-                    fsdp_apply_modules=local_options or {"": {}},
-                    fsdp_ignored_modules=list(dict.fromkeys(local_ignored)),
-                ),
-            )
-        )
-    return configs
 
 
 def _resolve_shared_fsdp_units(
@@ -460,7 +362,7 @@ def resolve_fsdp_pattern_plan(
         ),
         "ignored_params": ignored_params,
         "reshard_after_forward": get_fsdp_reshard_after_forward_policy(
-            cfg.fsdp_config.fsdp_reshard_after_forward, cfg.pp_size > 1
+            cfg.fsdp_config.fsdp_reshard_after_forward
         ),
     }
     if cfg.fsdp_config.fsdp_cpu_offload:

@@ -28,9 +28,8 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 
-from ...accelerator.collectives import all_reduce, synchronize_local_errors
+from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.device import device_type, get_current_device
-from ...accelerator.distributed import get_comm_device
 from ...parallel.assembly import ModelPartLayout
 from ...utils.logging import get_logger
 from .adamw_swap import AdamWSwap
@@ -48,7 +47,6 @@ except ImportError:  # Private helper is absent on some supported torch builds.
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
-    from torch.distributed.device_mesh import DeviceMesh
 
     # Type-only. ``llmtuner.config`` does not import this package at runtime (it
     # describes the object; the trainer builds it), so there is no cycle to
@@ -165,7 +163,6 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
         config: OptimizerConfig,
         *,
         model_parts: list[nn.Module],
-        pipeline_mesh: DeviceMesh | None = None,
         initialization_group: ProcessGroup | None = None,
         sharded_tensor_parallel: bool = False,
         sharded_expert_parallel: bool = False,
@@ -182,14 +179,7 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
         if on_acquired is not None:
             on_acquired(self)
 
-        pipeline_group = (
-            pipeline_mesh.get_group()
-            if pipeline_mesh is not None and pipeline_mesh.size() > 1
-            else None
-        )
-        error_group = (
-            initialization_group if initialization_group is not None else pipeline_group
-        )
+        error_group = initialization_group
         with (
             synchronize_local_errors("Optimizer parameter planning", group=error_group)
             if error_group is not None
@@ -213,17 +203,6 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
             for groups in plan.values()
             for index in groups.config_indices
         }
-        if pipeline_group is not None:
-            group = pipeline_group
-            matches = torch.tensor(
-                [index in matched_configs for index in range(len(config.param_groups))],
-                dtype=torch.int32,
-                device=get_comm_device(group),
-            )
-            all_reduce(matches, op="max", group=group)
-            matched_configs = {
-                index for index, matched in enumerate(matches.tolist()) if matched
-            }
         with (
             self._construction_resources(),
             (

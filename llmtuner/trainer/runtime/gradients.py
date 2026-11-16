@@ -278,7 +278,7 @@ def clip_grad_norm_(
     if args:
         raise ValueError("reference norm requires keyword clipping options")
     if kwargs.get("norm_precision") != "parameter" or any(
-        kwargs.get(name) is not None for name in ("pp_mesh", "ep_mesh", "tp_mesh")
+        kwargs.get(name) is not None for name in ("ep_mesh", "tp_mesh")
     ):
         raise UnsupportedCombinationError(
             "reference norm layout requires plain DP parameter precision"
@@ -317,7 +317,6 @@ def clip_and_check_finite(
     loss_is_finite: torch.Tensor,
 ) -> torch.Tensor:
     """Clip gradients and produce one rank-uniform finite-step verdict."""
-    pp_mesh = reduction_meshes.pp_mesh
     parameters = list(unique_parameters(model_parts))
     expert_ids = expert_parameter_ids(model_parts)
     expert_parameters = [p for p in parameters if id(p) in expert_ids]
@@ -339,7 +338,6 @@ def clip_and_check_finite(
         parameters,
         max_norm=max_norm,
         foreach=True,
-        pp_mesh=pp_mesh,
         ep_mesh=ep_mesh,
         expert_parameters=expert_parameters if ep_mesh is not None else None,
         tp_mesh=tp_mesh,

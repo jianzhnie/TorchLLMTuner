@@ -71,7 +71,6 @@ from ..plan import (
     ParallelPlan,
     PlanTarget,
     snapshot_model_bindings,
-    validate_pipeline_targets,
 )
 from ..replacements import ReplacementObserver
 from ..vocab_parallel.vocab_parallel import VocabParallelEmbedding
@@ -913,47 +912,6 @@ def resolve_tp_plan(
         ),
         **bindings,
     )
-
-
-def validate_pipeline_tp_plan(
-    global_plan: ParallelPlan, local_plan: ParallelPlan, model: nn.Module
-) -> None:
-    """Check a freshly bound PP-local plan against the unmodified global plan.
-
-    PP preserves registered FQNs and replaces unowned simple modules with
-    Identity. Keep those removals distinct from a retained target losing its TP
-    transformation. Live bindings and conversion metadata always come from the
-    local resolver; global module references must never reach execution.
-    """
-    if (
-        global_plan.stage != "tp"
-        or local_plan.stage != "tp"
-        or global_plan.degree != local_plan.degree
-    ):
-        raise ValueError("Pipeline TP plans must describe the same stage and degree")
-    for original, target in validate_pipeline_targets(global_plan, local_plan, model):
-        key = (target.path, target.kind)
-        if target.layout != original.layout or (
-            target.kind == "dense" and target.spec != original.spec
-        ):
-            raise ValueError(
-                f"Pipeline TP layout or projection strategy changed: {key}"
-            )
-    modules = dict(
-        model.named_modules(remove_duplicate=False)
-        if local_plan.module_bindings is None
-        else local_plan.module_bindings
-    )
-    local_history = dict(local_plan.token_history_requirements)
-    for path, requirement in global_plan.token_history_requirements:
-        module = modules.get(path)
-        if module is None or isinstance(module, nn.Identity):
-            continue
-        if path not in local_history or (
-            type(local_history[path]) is not type(requirement)
-            or local_history[path] != requirement
-        ):
-            raise ValueError(f"Pipeline TP token history requirement changed: {path}")
 
 
 def apply_tp(

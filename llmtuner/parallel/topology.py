@@ -41,7 +41,6 @@ class ParallelTopologySnapshot:
     dp_shard: int = 1
     cp: int = 1
     tp: int = 1
-    pp: int = 1
     ep: int = 1
     world_size: int = 1
     cp_kv: int = 1
@@ -66,7 +65,6 @@ class ParallelTopology:
     dp_shard: int
     cp: int
     tp: int
-    pp: int
     ep: int
     world_size: int
     cp_kv: int = 1
@@ -95,7 +93,6 @@ class ParallelTopology:
             dp_shard=parallelism_config.data_parallel_shard_size,
             cp=parallelism_config.cp_size,
             tp=parallelism_config.tensor_parallel_size,
-            pp=parallelism_config.pipeline_parallel_size,
             ep=parallelism_config.expert_parallel_size,
             world_size=world_size,
             cp_kv=parallelism_config.context_parallel_kv_allgather_size,
@@ -106,19 +103,17 @@ class ParallelTopology:
         self._validate()
 
     def _validate(self) -> None:
-        dp_replicate, dp_shard, cp, tp, pp, ep = (
+        dp_replicate, dp_shard, cp, tp, ep = (
             self.dp_replicate,
             self.dp_shard,
             self.cp,
             self.tp,
-            self.pp,
             self.ep,
         )
         named_degrees = {
             "dp_replicate": dp_replicate,
             "cp": cp,
             "tp": tp,
-            "pp": pp,
             "ep": ep,
             "cp_kv": self.cp_kv,
             "cp_ulysses": self.cp_ulysses,
@@ -149,19 +144,19 @@ class ParallelTopology:
                 f"world_size must be >= 1 (a positive integer), got {self.world_size!r}"
             )
         if dp_shard < 0:
-            fixed = dp_replicate * cp * tp * pp
+            fixed = dp_replicate * cp * tp
             if self.world_size % fixed != 0:
                 raise ValueError(
                     f"world_size ({self.world_size}) must be divisible by "
-                    f"dp_replicate * cp * tp * pp ({fixed}) when dp_shard=-1"
+                    f"dp_replicate * cp * tp ({fixed}) when dp_shard=-1"
                 )
             self.dp_shard = dp_shard = self.world_size // fixed
 
-        if dp_replicate * dp_shard * cp * tp * pp != self.world_size:
+        if dp_replicate * dp_shard * cp * tp != self.world_size:
             raise ValueError(
                 f"Invalid parallel dims: dp_replicate({dp_replicate}) * "
                 f"dp_shard({dp_shard}) * "
-                f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
+                f"cp({cp}) * tp({tp}) != WORLD_SIZE({self.world_size})"
             )
 
         sparse_region = dp_shard * cp * tp
@@ -257,7 +252,7 @@ class ParallelTopology:
 
         logger.info(
             f"Building device mesh with parallelism: "
-            f"pp={self.pp}, dp_replicate={self.dp_replicate}, "
+            f"dp_replicate={self.dp_replicate}, "
             f"dp_shard={self.dp_shard}, "
             f"cp={self.cp}, tp={self.tp}, ep={self.ep}"
         )
@@ -270,8 +265,8 @@ class ParallelTopology:
         )
         dataloading_mesh = unflatten_mesh(
             world_mesh,
-            ("pp", "batch", "cp", "tp"),
-            (self.pp, batch, self.cp, self.tp),
+            ("batch", "cp", "tp"),
+            (batch, self.cp, self.tp),
         )
         loss_mesh = dataloading_mesh["batch", "cp", "tp"]._flatten("loss_mesh")
         # Two mesh views over the same devices:
@@ -282,20 +277,20 @@ class ParallelTopology:
         # typechecking, with dp folding dp_replicate * dp_shard into one axis.
         full_dense_mesh_for_fsdp = unflatten_mesh(
             world_mesh,
-            ("pp", "dp_replicate", "dp_shard", "cp", "tp"),
-            (self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp),
+            ("dp_replicate", "dp_shard", "cp", "tp"),
+            (self.dp_replicate, self.dp_shard, self.cp, self.tp),
         )
         full_dense_mesh_for_fwdbwd = unflatten_mesh(
             world_mesh,
-            ("pp", "dp", "cp", "tp"),
-            (self.pp, batch, self.cp, self.tp),
+            ("dp", "cp", "tp"),
+            (batch, self.cp, self.tp),
         )
         spmd_dense_mesh_for_fwdbwd = full_dense_mesh_for_fwdbwd["dp", "cp", "tp"]
 
         full_sparse_mesh = unflatten_mesh(
             world_mesh,
-            ("pp", "dp_replicate", "efsdp", "ep"),
-            (self.pp, self.dp_replicate, efsdp, self.ep),
+            ("dp_replicate", "efsdp", "ep"),
+            (self.dp_replicate, efsdp, self.ep),
         )
 
         global_meshes = {
@@ -310,7 +305,6 @@ class ParallelTopology:
                 "dp_replicate", "efsdp", "ep"
             ]
         single_axis_meshes = {
-            "pp": dataloading_mesh["pp"],
             "batch": dataloading_mesh["batch"],
             "loss": loss_mesh,
             "dp_replicate": full_dense_mesh_for_fsdp["dp_replicate"],
@@ -322,8 +316,8 @@ class ParallelTopology:
         if self.cp_kv * self.cp_ulysses == self.cp and self.cp > 1:
             cp_axes_mesh = unflatten_mesh(
                 world_mesh,
-                ("pp", "batch", "cp_kv", "cp_ulysses", "tp"),
-                (self.pp, batch, self.cp_kv, self.cp_ulysses, self.tp),
+                ("batch", "cp_kv", "cp_ulysses", "tp"),
+                (batch, self.cp_kv, self.cp_ulysses, self.tp),
             )
             single_axis_meshes["cp_kv"] = cp_axes_mesh["cp_kv"]
             single_axis_meshes["cp_ulysses"] = cp_axes_mesh["cp_ulysses"]
@@ -355,7 +349,6 @@ class ParallelTopology:
         instead (see the ``lm_head`` row in docs/llmtuner_upstream_map.md).
         """
         sizes = {
-            "pp": self.pp,
             "batch": self.dp_replicate * self.dp_shard,
             "loss": self.dp_replicate * self.dp_shard * self.cp * self.tp,
             "dp_replicate": self.dp_replicate,
@@ -546,23 +539,19 @@ class ParallelTopology:
         return self.tp > 1
 
     @property
-    def pp_enabled(self):
-        return self.pp > 1
-
-    @property
     def ep_enabled(self):
         return self.ep > 1
 
     @property
     def non_data_parallel_size(self):
-        return self.cp * self.tp * self.pp
+        return self.cp * self.tp
 
 
 # Mesh axis names. `axis` names a specific DeviceMesh axis; `dim` is for shapes.
 # These are the axes of the dense mesh the parallel layer is handed; ``pp`` is
 # not among them because pipeline stages live on disjoint rank sets -- the PP
 # path resolves its own views off ParallelTopology instead (see
-# parallel/pipeline_parallel/pipeline_parallel.py).
+# experiments/pipeline_parallel/pipeline_parallel.py).
 MESH_AXES = ("dp", "cp", "tp")
 
 
@@ -584,7 +573,6 @@ def resolve_parallel_topology(
             field: value
             for field, value in (
                 ("tensor_parallel_size", par.tensor_parallel_size),
-                ("pipeline_parallel_size", par.pipeline_parallel_size),
                 (
                     "context_parallel_kv_allgather_size",
                     par.context_parallel_kv_allgather_size,

@@ -5,8 +5,8 @@ and return their results. They never receive a Trainer or assign its attributes.
 Trainer owns creation order and retains resources as soon as they are acquired.
 Model-dependent combination guards run before parallel transformations.
 
-Parallel stage order is defined in ``parallel/stages.py``. Pipeline parallelism
-splits the model first, then applies those stages to each local model part.
+Parallel stage order is defined in ``parallel/stages.py``. Experimental pipeline
+assembly lives outside this production runtime.
 """
 
 from __future__ import annotations
@@ -58,11 +58,10 @@ from ...models.flops import flops_estimation_note, flops_per_token
 from ...models.registry import resolve_state_format
 from ...parallel import compatibility
 from ...parallel.assembly import ModelPartLayout, validate_model_part_layouts
-from ...parallel.execution import ExecutionLayout, validate_local_pipeline_layouts
+from ...parallel.execution import ExecutionLayout
 from ...parallel.parallelize import parallelize_model
-from ...parallel.pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 from ...utils import logging as logging_utils
-from .builders import PipelineScheduleFactory, TrainingBuilders
+from .builders import TrainingBuilders
 from .engine import ParamContext, TrainingEngine
 
 if TYPE_CHECKING:
@@ -106,15 +105,11 @@ def build_profiler(
 
 @dataclass(frozen=True, slots=True)
 class ModelAssembly:
-    """Parallel model ownership and PP execution metadata for this rank."""
+    """Final model ownership and local layouts for this rank."""
 
     model: torch.nn.Module | None
     model_parts: list[torch.nn.Module]
     layouts: tuple[ModelPartLayout, ...] = ()
-    pp_schedule: Any | None = None
-    pp_has_first_stage: bool = False
-    pp_has_last_stage: bool = False
-    pp_loss_sentinel: torch.Tensor | None = None
 
     @property
     def execution_layouts(self) -> tuple[ExecutionLayout, ...]:
@@ -134,13 +129,6 @@ class ModelAssembly:
         """Validate supplied layout metadata against the final local parts."""
         if self.layouts:
             validate_model_part_layouts(self.model_parts, self.layouts)
-            execution = self.execution_layouts
-            if self.pp_schedule is not None:
-                validate_local_pipeline_layouts(
-                    execution,
-                    has_first_stage=self.pp_has_first_stage,
-                    has_last_stage=self.pp_has_last_stage,
-                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,14 +166,7 @@ def build_model(
     implementation owns its module tree; this function only resolves config,
     construction device and checkpoint policy.
     """
-    # PP schedules consume logits; chunked loss requires a hidden-state path.
     chunked_loss_num_chunks = cfg.training.chunked_loss_num_chunks
-    if (
-        chunked_loss_num_chunks > 1
-        and parallel_dims is not None
-        and parallel_dims.pp_enabled
-    ):
-        compatibility.chunked_loss_pp(chunked_loss_num_chunks, parallel_dims.pp)
     if (
         chunked_loss_num_chunks > 1
         and parallel_dims is not None
@@ -198,7 +179,6 @@ def build_model(
                 parallel_dims.tp_enabled
                 or parallel_dims.cp_enabled
                 or parallel_dims.ep_enabled
-                or parallel_dims.pp_enabled
             ),
             compile=cfg.training.compile,
         )
@@ -232,14 +212,13 @@ def build_model(
         degree > 1
         for degree in (
             cfg.parallel.tp_size,
-            cfg.parallel.pp_size,
             cfg.parallel.cp_size,
             cfg.parallel.ep_size,
         )
     ):
         raise UnsupportedCombinationError(
             "Random meta initialization supports local/DP/FSDP; "
-            "TP/EP/PP/CP paths need an ownership-aware initializer."
+            "TP/EP/CP paths need an ownership-aware initializer."
         )
     model_class = resolve_model_class(text_config)
     if initialize_from_meta:
@@ -298,7 +277,6 @@ def _apply_parallelism(
     load_initial_weights: bool,
     error_group: ProcessGroup | None = None,
     loss_functions: LossFunctions | None = None,
-    pipeline_schedule_factory: PipelineScheduleFactory | None = None,
     on_model_acquired: Callable[[torch.nn.Module], None] | None = None,
 ) -> ModelAssembly:
     """Apply configured stages and return this rank's explicit model ownership."""
@@ -308,7 +286,6 @@ def _apply_parallelism(
         mesh=mesh,
         parallel_dims=parallel_dims,
         error_group=error_group,
-        device=device,
         compile=cfg.training.compile,
         compile_config=cfg.training.compile_config,
         activation_checkpoint=cfg.training.activation_checkpoint_mode,
@@ -318,31 +295,15 @@ def _apply_parallelism(
         selective_ac=cfg.training.selective_ac,
         memory_budget_ac=cfg.training.memory_budget_ac,
         region_ac=cfg.training.region_ac,
-        global_batch_size=cfg.training.global_batch_size,
         chunked_loss_num_chunks=cfg.training.chunked_loss_num_chunks,
-        loss_sum=None if loss_functions is None else loss_functions.token_sum,
-        pipeline_schedule_factory=pipeline_schedule_factory,
         on_model_acquired=on_model_acquired,
     )
     orchestration = parallel_assembly.execution
-    if isinstance(orchestration, PipelineParallelSetup):
-        assembled = ModelAssembly(
-            model=None,
-            model_parts=orchestration.model_parts,
-            layouts=parallel_assembly.layouts,
-            pp_schedule=orchestration.schedule,
-            pp_has_first_stage=orchestration.has_first_stage,
-            pp_has_last_stage=orchestration.has_last_stage,
-            # Non-last stages contribute a finite float32 zero to PP loss
-            # reduction. Its scalar shape and dtype must match the last stage.
-            pp_loss_sentinel=torch.zeros((), dtype=torch.float32, device=device),
-        )
-    else:
-        assembled = ModelAssembly(
-            model=orchestration,
-            model_parts=[orchestration],
-            layouts=parallel_assembly.layouts,
-        )
+    assembled = ModelAssembly(
+        model=orchestration,
+        model_parts=[orchestration],
+        layouts=parallel_assembly.layouts,
+    )
 
     if load_initial_weights or cfg.model.initialization_device == "meta":
         materialization_error: BaseException | None = None
@@ -397,12 +358,11 @@ def prepare_parallel_model(
     *,
     environment: RuntimeEnvironment,
     loss_functions: LossFunctions | None = None,
-    pipeline_schedule_factory: PipelineScheduleFactory | None = None,
     on_model_acquired: Callable[[torch.nn.Module], None] | None = None,
 ) -> PreparedModel:
     """Construct, count and assemble a model without accessing a Trainer.
 
-    Keep counting before TP/EP/PP/FSDP and preserve the materialization/load
+    Keep counting before TP/EP/FSDP and preserve the materialization/load
     lifecycle in _apply_parallelism. No optimizer captures parameters until
     this builder has returned the final local layout. ``on_model_acquired``
     transfers cleanup ownership before transformations or materialization can
@@ -429,7 +389,6 @@ def prepare_parallel_model(
         load_initial_weights=load_initial_weights,
         error_group=environment.error_group,
         loss_functions=loss_functions,
-        pipeline_schedule_factory=pipeline_schedule_factory,
         on_model_acquired=on_model_acquired,
     )
     return PreparedModel(
@@ -446,7 +405,7 @@ def build_loss_functions(
     factory: Callable[[LLMTunerConfig], LossFunctions] | None = None,
     error_group: ProcessGroup | None = None,
 ) -> LossFunctions:
-    """Select and validate one loss service for both PP and ordinary execution."""
+    """Select and validate the configured loss service."""
     with synchronize_local_errors("Loss services construction", group=error_group):
         loss_functions = (
             factory(cfg)
@@ -476,10 +435,10 @@ def create_training_engine(
 ) -> TrainingEngine:
     """Bind execution dependencies without reading or mutating a Trainer.
 
-    The assembly owns model parts and pipeline metadata; optimizer services
+    The assembly owns model parts and layout metadata; optimizer services
     refer to the final parameter layout. This factory consumes both results
     without reselecting model or parallel strategies. ``error_group`` covers
-    all update participants, not only ranks sharing a DP or PP mesh axis.
+    all update participants, not only ranks sharing a DP mesh axis.
     """
     with synchronize_local_errors("Training engine construction", group=error_group):
         model_assembly.validate_layouts()
@@ -495,12 +454,10 @@ def create_training_engine(
             optimizer=optimizer_stack.optimizer,
             lr_scheduler=optimizer_stack.lr_scheduler,
             ema=optimizer_stack.ema,
-            pp_schedule=model_assembly.pp_schedule,
-            pp_has_first_stage=model_assembly.pp_has_first_stage,
-            pp_has_last_stage=model_assembly.pp_has_last_stage,
-            pp_loss_sentinel=model_assembly.pp_loss_sentinel,
-            pp_num_microbatches=cfg.parallel.pp_config.num_pp_microbatches,
             error_group=error_group,
+            max_norm=cfg.training.max_norm,
+            grad_norm_precision=cfg.training.grad_norm_precision,
+            expert_reduce_layout=cfg.parallel.fsdp_config.fsdp_expert_reduce_layout,
         )
 
 
@@ -540,9 +497,6 @@ def build_optimizer_stack(
         sharded_tensor_parallel=cfg.checkpoint.sharded_tensor_parallel,
         model_parts=model_parts,
         initialization_group=error_group,
-        pipeline_mesh=(
-            parallel_dims.get_optional_mesh("pp") if parallel_dims is not None else None
-        ),
         runtime_layouts=layouts,
         **(
             {"on_acquired": lambda owner: on_service_acquired("optimizer", owner)}
@@ -578,7 +532,7 @@ def build_optimizer_stack(
                 buffer_patterns=ema_config.buffer_patterns,
             )
         on_service_acquired("ema", ema)
-        # Container hooks run once per optimizer step, including multiple PP parts.
+        # Container hooks run once per optimizer step.
         register_aux_loss_metrics_hook(optimizer, model_parts=model_parts)
         register_moe_balancing_hook(
             optimizer, model_parts=model_parts, parallel_dims=parallel_dims
@@ -685,7 +639,6 @@ def build_metrics_processor(
             dump_folder=cfg.dump_folder,
             num_parameters=num_parameters,
             num_trainable_parameters=num_trainable_parameters,
-            pp_schedule=cfg.parallel.pp_config.pipeline_parallel_schedule,
             num_flops_per_token=flops_per_token(text_config, seq_len=cfg.max_seq_len),
         )
         on_service_acquired("metrics", metrics)

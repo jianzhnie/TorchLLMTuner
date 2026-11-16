@@ -95,14 +95,7 @@ def build_runtime_environment(
             training_dataset=cfg.dataloader.dataset,
         )
 
-    # Seed before model construction. PP stages use distinct seeds; ranks
-    # sharing a stage retain identical initialization.
     seed = cfg.seed
-    if parallel_dims is not None and parallel_dims.pp_enabled:
-        pp_mesh = parallel_dims.get_optional_mesh("pp")
-        seed = seeding.derive_distinct_seed(
-            seed, [(pp_mesh.get_local_rank(), pp_mesh.size())]
-        )
     seeding.seed_everything(
         seed, deterministic=cfg.deterministic, detect_anomaly=cfg.detect_anomaly
     )
@@ -111,11 +104,7 @@ def build_runtime_environment(
         f"{device_type}:{local_rank}" if device_type != "cpu" else "cpu"
     )
 
-    # PP needs the dense mesh for this stage, which covers only its ranks.
-    if parallel_dims is not None and parallel_dims.pp_enabled:
-        mesh = parallel_dims.spmd_dense_mesh()
-    else:
-        mesh = build_device_mesh(parallel_dims)
+    mesh = build_device_mesh(parallel_dims)
 
     seeding.initialize_dtensor_rng(mesh)
 

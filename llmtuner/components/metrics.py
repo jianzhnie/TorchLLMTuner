@@ -5,8 +5,8 @@ here; synchronized per-step and steady-window observations live in
 ``trainer.runtime.training_observer``. This module retains legacy log-window metrics for
 existing consumers and publishes the synchronized observations when available.
 
-Logging performs no collectives. The trainer synchronizes pipeline loss metrics
-before reporting; writer ownership and console rank filtering are independent.
+Logging performs no collectives. The trainer synchronizes loss metrics before
+reporting; writer ownership and console rank filtering are independent.
 Unknown device peaks suppress MFU, and empty loading windows report zero.
 External sinks live in ``utils.metric_loggers``. Each owns its resources and
 propagates configuration/runtime failures.
@@ -20,12 +20,6 @@ from collections import namedtuple
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
-
-from torch.distributed.pipelining.schedules import (
-    ScheduleDualPipeV,
-    ScheduleZBVZeroBubble,
-    get_schedule_class,
-)
 
 from ..accelerator.device import device_module, device_type
 from ..utils import metric_loggers
@@ -57,7 +51,6 @@ __all__ = [
     "DeviceMemoryMonitor",
     "MetricsProcessor",
     "build_device_memory_monitor",
-    "get_metrics_rank",
     "compute_utilization",
     "configured_tokens_per_step",
     "model_tflops",
@@ -230,37 +223,6 @@ def build_device_memory_monitor() -> DeviceMemoryMonitor:
     return monitor
 
 
-def is_v_schedule(pp_schedule: str) -> bool:
-    """V schedules put the last stage, which computes the loss, on pp rank 0.
-
-    Class-based like upstream (``_is_v_schedule``), not a string check: both
-    ScheduleZBVZeroBubble and ScheduleDualPipeV pair stage 0 with stage N-1 on
-    rank 0, and a string test would miss the second.
-    """
-    return get_schedule_class(pp_schedule) in (
-        ScheduleZBVZeroBubble,
-        ScheduleDualPipeV,
-    )
-
-
-def get_metrics_rank(*, parallel_dims: ParallelTopology, pp_schedule: str) -> int:
-    """Choose one rank for external metric writers.
-
-    Trainer metrics are synchronized across PP stages; selecting the last
-    stage for ordinary schedules preserves the established writer location.
-    V schedules select rank 0, which owns their last virtual stage.
-    """
-    if not parallel_dims.pp_enabled:
-        return 0
-    if is_v_schedule(pp_schedule):
-        return 0
-    # First rank of the last pipeline stage. Ranks are laid out
-    # [dp_replicate, dp_shard, cp, tp] within a stage, so this is the first
-    # rank of the final stage block.
-    pp_size = parallel_dims.pp
-    return (parallel_dims.world_size // pp_size) * (pp_size - 1)
-
-
 @dataclass(kw_only=True, slots=True)
 class DerivedMetrics:
     """The numbers a log call computes from its window, before naming."""
@@ -281,7 +243,6 @@ class MetricsProcessor:
         parallel_dims: the resolved parallelism, for the throughput divisor and
             the metrics rank. ``None`` in the single-process case.
         dump_folder: base directory for the TensorBoard event files.
-        pp_schedule: the pipeline schedule name, which decides the metrics rank.
         num_flops_per_token: model FLOPs per token, used for tflops and MFU. The
             caller sets this once the model exists. ``0`` -- the value
             :func:`~llmtuner.models.flops.flops_per_token` returns for a
@@ -299,7 +260,6 @@ class MetricsProcessor:
         *,
         parallel_dims: ParallelTopology | None,
         dump_folder: str = "./outputs",
-        pp_schedule: str = "1F1B",
         num_flops_per_token: int = 0,
         num_parameters: int | None = None,
         num_trainable_parameters: int | None = None,
@@ -323,7 +283,6 @@ class MetricsProcessor:
             config=config,
             parallel_dims=parallel_dims,
             dump_folder=dump_folder,
-            pp_schedule=pp_schedule,
             config_dict=config_dict,
             tag=config.tag if tag is None else tag,
         )
@@ -405,7 +364,6 @@ class MetricsProcessor:
         config: MetricsConfig,
         parallel_dims: ParallelTopology | None,
         dump_folder: str,
-        pp_schedule: str,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
     ) -> metric_loggers.BaseLogger:
@@ -421,9 +379,7 @@ class MetricsProcessor:
             if parallel_dims is None:
                 metrics_rank = 0
             else:
-                metrics_rank = get_metrics_rank(
-                    parallel_dims=parallel_dims, pp_schedule=pp_schedule
-                )
+                metrics_rank = 0
             if get_distributed_rank() != metrics_rank:
                 return metric_loggers.BaseLogger()
 

@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
-from torch.distributed.pipelining.schedules import get_schedule_class
 
 from llmtuner.config.utils import require_bool, require_integer_at_least
 from llmtuner.errors import (
@@ -26,7 +25,6 @@ __all__ = [
     "FSDPReshardPolicy",
     "FSDPSymmMemScope",
     "ParallelConfig",
-    "PipelineParallelConfig",
     "TensorParallelConfig",
     "validate_expert_dispatcher",
     "validate_router_aux_loss_coefficient",
@@ -312,53 +310,11 @@ class ExpertParallelConfig:
 
 
 @dataclass(kw_only=True, slots=True)
-class PipelineParallelConfig:
-    """Execution policy for PP; parallel degrees live in ParallelConfig."""
-
-    module_fqns_per_model_part: list[list[str]] | None = None
-    """Explicit module FQNs per pipeline chunk; nested lists are programmatic-only."""
-
-    pipeline_parallel_first_stage_less_layers: int = 1
-    """Layers removed from the first stage to offset embedding overhead."""
-
-    pipeline_parallel_last_stage_less_layers: int = 1
-    """Layers removed from the last stage to offset output-layer overhead."""
-
-    pipeline_parallel_layers_per_stage: int | None = None
-    """Layers per virtual stage; None infers the split from model and schedule."""
-
-    pipeline_parallel_schedule: str = "1F1B"
-    """PyTorch pipeline schedule name; must match the stage layout."""
-
-    pipeline_parallel_schedule_csv: str | None = ""
-    """Reserved CSV schedule path; non-empty values are unsupported."""
-
-    num_pp_microbatches: int = 1
-    """Pipeline splits per DP rank and accumulation iteration; ignored when PP = 1."""
-
-    def __post_init__(self) -> None:
-        require_integer_at_least(self, "num_pp_microbatches", group="parallel")
-        if self.pipeline_parallel_schedule_csv:
-            raise ConfigError(
-                "parallel.pipeline_parallel_schedule_csv is not supported; "
-                "use pipeline_parallel_schedule instead."
-            )
-        try:
-            get_schedule_class(self.pipeline_parallel_schedule)
-        except ValueError as exc:
-            raise ConfigError(
-                "Invalid parallel.pipeline_parallel_schedule "
-                f"{self.pipeline_parallel_schedule!r}: {exc}"
-            ) from exc
-
-
-@dataclass(kw_only=True, slots=True)
 class ParallelConfig:
     """Parallel degrees composed with TP/FSDP/EP/CP/PP execution plans."""
 
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     tp_config: TensorParallelConfig = field(default_factory=TensorParallelConfig)
-    pp_config: PipelineParallelConfig = field(default_factory=PipelineParallelConfig)
     cp_config: ContextParallelConfig = field(default_factory=ContextParallelConfig)
     ep_config: ExpertParallelConfig = field(default_factory=ExpertParallelConfig)
 
@@ -370,11 +326,6 @@ class ParallelConfig:
 
     tensor_parallel_size: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
-
-    pipeline_parallel_size: int = 1
-    """Physical pipeline ranks; virtual stages are inferred from the split and
-    schedule.
-    """
 
     context_parallel_kv_allgather_size: int = 1
     """Independent KV AllGather CP axis degree."""
@@ -394,12 +345,9 @@ class ParallelConfig:
     """Process-group timeout applied after the first training step, in seconds."""
 
     def non_dp_sizes(self) -> int:
-        """Product of fixed world-mesh degrees: dp_replicate*tp*pp*cp."""
+        """Product of fixed world-mesh degrees: dp_replicate*tp*cp."""
         return (
-            self.data_parallel_replicate_size
-            * self.tensor_parallel_size
-            * self.pipeline_parallel_size
-            * self.cp_size
+            self.data_parallel_replicate_size * self.tensor_parallel_size * self.cp_size
         )
 
     def derive_dp(self, world_size: int) -> int:
@@ -417,13 +365,13 @@ class ParallelConfig:
             if world_size % fixed != 0:
                 raise ConfigError(
                     f"world_size={world_size} not divisible by "
-                    f"dp_replicate*tp*pp*cp={fixed}"
+                    f"dp_replicate*tp*cp={fixed}"
                 )
             return world_size // fixed
         dp_shard = self.data_parallel_shard_size
         if dp_shard * fixed != world_size:
             raise ConfigError(
-                f"dp_shard*dp_replicate*tp*pp*cp = {dp_shard * fixed} "
+                f"dp_shard*dp_replicate*tp*cp = {dp_shard * fixed} "
                 f"!= world_size={world_size}"
             )
         return dp_shard
@@ -432,7 +380,6 @@ class ParallelConfig:
         for name, expected in (
             ("fsdp_config", FSDPConfig),
             ("tp_config", TensorParallelConfig),
-            ("pp_config", PipelineParallelConfig),
             ("cp_config", ContextParallelConfig),
             ("ep_config", ExpertParallelConfig),
         ):
@@ -443,7 +390,6 @@ class ParallelConfig:
             "train_timeout_seconds",
             "data_parallel_replicate_size",
             "tensor_parallel_size",
-            "pipeline_parallel_size",
             "context_parallel_kv_allgather_size",
             "context_parallel_ulysses_size",
             "context_parallel_kcp_size",
@@ -462,7 +408,7 @@ class ParallelConfig:
                 "parallel.data_parallel_shard_size must be >= 1 or -1 "
                 f"(derive), got {self.data_parallel_shard_size}"
             )
-        for name in ("fsdp_config", "tp_config", "pp_config", "cp_config", "ep_config"):
+        for name in ("fsdp_config", "tp_config", "cp_config", "ep_config"):
             getattr(self, name).__post_init__()
         if (
             self.tensor_parallel_size > 1
@@ -513,10 +459,6 @@ class ParallelConfig:
     @property
     def tp_size(self) -> int:
         return self.tensor_parallel_size
-
-    @property
-    def pp_size(self) -> int:
-        return self.pipeline_parallel_size
 
     @property
     def cp_size(self) -> int:

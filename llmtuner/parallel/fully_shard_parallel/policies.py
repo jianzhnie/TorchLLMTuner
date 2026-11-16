@@ -129,9 +129,7 @@ def enable_fsdp_symm_mem(model: nn.Module, scope: str | None = "all") -> None:
         module.set_symm_mem_for_comm()
 
 
-def get_fsdp_reshard_after_forward_policy(
-    reshard_after_forward_policy: str, pp_enabled: bool
-) -> bool:
+def get_fsdp_reshard_after_forward_policy(reshard_after_forward_policy: str) -> bool:
     """Resolve fsdp_reshard_after_forward policy string to a boolean.
 
     Args:
@@ -149,7 +147,7 @@ def get_fsdp_reshard_after_forward_policy(
         case "default":
             # For PP, by default do not reshard after forward to avoid per-microbatch
             # all-gathers, which can be expensive and non-overlapped
-            return not pp_enabled
+            return True
         case _:
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."

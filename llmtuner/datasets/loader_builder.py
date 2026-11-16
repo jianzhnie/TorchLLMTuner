@@ -18,7 +18,6 @@ from ..components.tokenizer.multimodal import MultimodalTokenizer
 from .collators import (
     CollatorFactory,
     ContextRowsCollator,
-    PipelineTextCollator,
     TextCollator,
 )
 from .contracts import (
@@ -162,31 +161,18 @@ def resolve_packing_geometry(
     dataloader_config = config.dataloader
     max_context_length = config.max_seq_len
     require_positive_integer("num_tokens_per_batch", num_tokens_per_batch)
-    num_microbatches = (
-        config.parallel.pp_config.num_pp_microbatches
-        if not is_multimodal and config.parallel.pipeline_parallel_size > 1
-        else 1
-    )
-    require_positive_integer("num_pp_microbatches", num_microbatches)
-    if num_tokens_per_batch % num_microbatches:
-        raise ValueError("token batch must be divisible by num_pp_microbatches")
-    packing_tokens_per_batch = num_tokens_per_batch // num_microbatches
+    packing_tokens_per_batch = num_tokens_per_batch
     global_rows = dataloader_config.global_context_rows
     if global_rows:
-        if (
-            is_multimodal
-            or config.parallel.pipeline_parallel_size > 1
-            or config.gradient_accumulation_steps != 1
-            or not repeat
-        ):
+        if is_multimodal or config.gradient_accumulation_steps != 1 or not repeat:
             raise ValueError(
-                "global_context_rows currently requires repeated text, PP=1 "
+                "global_context_rows currently requires repeated text, "
                 "and gradient_accumulation_steps=1"
             )
         if num_tokens_per_batch % max_context_length:
             raise ValueError("global_context_rows requires whole context rows")
         packing_tokens_per_batch = max_context_length
-    return packing_tokens_per_batch, num_microbatches, global_rows
+    return packing_tokens_per_batch, 1, global_rows
 
 
 def build_dataloader(
@@ -243,7 +229,7 @@ def build_dataloader(
         and dataset_name not in DATASETS
     )
 
-    packing_tokens_per_batch, num_microbatches, global_rows = resolve_packing_geometry(
+    packing_tokens_per_batch, _, global_rows = resolve_packing_geometry(
         config,
         is_multimodal=is_multimodal,
         num_tokens_per_batch=num_tokens_per_batch,
@@ -292,11 +278,7 @@ def build_dataloader(
         read_options=grain.ReadOptions(),
         max_num_documents=dataloader_config.max_num_documents,
     )
-    collator = (
-        partial(PipelineTextCollator, num_microbatches=num_microbatches)
-        if num_microbatches > 1
-        else resolved.collator
-    )
+    collator = resolved.collator
     if global_rows:
         collator = partial(
             ContextRowsCollator,

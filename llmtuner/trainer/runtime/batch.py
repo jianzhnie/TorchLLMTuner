@@ -34,12 +34,10 @@ if TYPE_CHECKING:
 def resolve_data_parallel_rank(
     parallel_dims: ParallelTopology | None,
 ) -> tuple[int, int]:
-    """Return the loader rank, using PP's stage-shared batch view when needed."""
+    """Return the rank and size of the data-parallel loader group."""
     if parallel_dims is None:
         return 0, 1
-    mesh = parallel_dims.get_optional_mesh(
-        "batch" if parallel_dims.pp_enabled else "dp", include_singleton_axes=True
-    )
+    mesh = parallel_dims.get_optional_mesh("dp", include_singleton_axes=True)
     return mesh.get_local_rank(), mesh.size()
 
 

@@ -36,7 +36,6 @@ from llmtuner.config.parallel_config import (
     ExpertParallelConfig,
     FSDPConfig,
     ParallelConfig,
-    PipelineParallelConfig,
     TensorParallelConfig,
 )
 from llmtuner.config.rope_config import RoPEConfig
@@ -46,7 +45,6 @@ from llmtuner.config.validation_config import ValidationConfig
 __all__ = [
     "FSDPConfig",
     "TensorParallelConfig",
-    "PipelineParallelConfig",
     "ContextParallelConfig",
     "ExpertParallelConfig",
     "CheckpointConfig",

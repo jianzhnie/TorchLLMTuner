@@ -41,7 +41,6 @@ from llmtuner.config.parallel_config import (
     ExpertParallelConfig,
     FSDPConfig,
     ParallelConfig,
-    PipelineParallelConfig,
     TensorParallelConfig,
 )
 from llmtuner.config.training_config import TrainingConfig
@@ -74,7 +73,6 @@ def parse_config(args: Sequence[str] | None = None) -> LLMTunerConfig:
         parallel=parsed[ParallelConfig],
         fsdp_config=parsed[FSDPConfig],
         tp_config=parsed[TensorParallelConfig],
-        pp_config=parsed[PipelineParallelConfig],
         cp_config=parsed[ContextParallelConfig],
         ep_config=parsed[ExpertParallelConfig],
         optimizer=parsed[OptimizerConfig],

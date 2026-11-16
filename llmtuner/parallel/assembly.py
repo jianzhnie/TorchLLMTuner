@@ -5,23 +5,18 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING
 
 from torch import nn
 
 from ..utils.module_names import canonical_fqn
 from .execution import ExecutionLayout
-from .pipeline_parallel.ownership import PipelineParameterOwnership
 from .replacements import ReplacementMap
 from .topology import ParallelTopologySnapshot
-
-if TYPE_CHECKING:
-    from .pipeline_parallel.pipeline_parallel import PipelineParallelSetup
 
 
 @dataclass(slots=True)
 class ModelPartLayout:
-    """One local part's PP origin, transformations, and registered aliases.
+    """One local model's transformations and registered aliases.
 
     Owns metadata only. Refresh after parameter materialization before creating
     optimizers; parameter identity changes are tracked by stable registrations,
@@ -30,13 +25,18 @@ class ModelPartLayout:
 
     execution: ExecutionLayout | None = None
     topology: ParallelTopologySnapshot | None = None
-    pipeline_ownership: PipelineParameterOwnership | None = None
     replacements: ReplacementMap = field(default_factory=ReplacementMap)
     parameter_bindings: dict[str, nn.Parameter] = field(default_factory=dict)
 
     def refresh(self, model: nn.Module) -> None:
+        """Rebind materialized parameters without changing their alias relation.
+
+        Structural split/merge transformations belong to explicit replacement
+        events before this snapshot, not to materialization inferred from FQNs.
+        """
         current = dict(model.named_parameters(remove_duplicate=False))
         targets: dict[nn.Parameter, nn.Parameter] = {}
+        sources: dict[nn.Parameter, nn.Parameter] = {}
         for path, source in self.parameter_bindings.items():
             if path not in current:
                 raise ValueError(f"Layout refresh lost parameter registration {path!r}")
@@ -46,6 +46,11 @@ class ModelPartLayout:
             previous = targets.setdefault(source, target)
             if previous is not target:
                 raise ValueError(f"Layout refresh split a parameter alias at {path!r}")
+            previous_source = sources.setdefault(target, source)
+            if previous_source is not source:
+                raise ValueError(
+                    f"Layout refresh merged distinct parameters at {path!r}"
+                )
         replacements = {
             source: (target,)
             for source, target in targets.items()
@@ -53,10 +58,6 @@ class ModelPartLayout:
         }
         self.replacements.record_replacements({}, replacements)
         self.parameter_bindings = current
-        if self.pipeline_ownership is not None:
-            self.pipeline_ownership = self.pipeline_ownership.remap_parameters(
-                self.replacements.parameter_targets
-            )
 
     @property
     def parameter_aliases(self) -> Mapping[nn.Parameter, tuple[str, ...]]:
@@ -123,12 +124,6 @@ class ModelPartLayout:
             for target in targets
         ):
             raise ValueError("Model layout replacement target is no longer registered")
-        if self.pipeline_ownership is not None and any(
-            target not in registered
-            for targets in self.pipeline_ownership.local_parameters.values()
-            for target in targets
-        ):
-            raise ValueError("Pipeline parameter target is no longer registered")
         # Every state consumer relies on an unambiguous wrapper-free name,
         # including consumers which only validate ownership before construction.
         _ = self.state_parameter_names
@@ -139,7 +134,6 @@ class ModelPartLayout:
             parameters=MappingProxyType(dict(self.parameter_bindings)),
             topology=self.topology,
             execution=self.execution,
-            pipeline_ownership=self.pipeline_ownership,
         )
 
 
@@ -150,7 +144,6 @@ class ModelPartLayoutSnapshot:
     parameters: Mapping[str, nn.Parameter]
     topology: ParallelTopologySnapshot | None
     execution: ExecutionLayout | None
-    pipeline_ownership: PipelineParameterOwnership | None
 
     def validate(self, layout: ModelPartLayout, *, consumer: str) -> None:
         current = layout.parameter_bindings
@@ -162,11 +155,7 @@ class ModelPartLayoutSnapshot:
                 f"{consumer} parameter ownership changed; rebuild the consumer "
                 "against the final model layout"
             )
-        if (
-            layout.topology != self.topology
-            or layout.execution != self.execution
-            or layout.pipeline_ownership is not self.pipeline_ownership
-        ):
+        if layout.topology != self.topology or layout.execution != self.execution:
             raise ValueError(
                 f"{consumer} layout metadata changed; rebuild the consumer "
                 "against the final model layout"
@@ -177,7 +166,7 @@ class ModelPartLayoutSnapshot:
 class ParallelAssembly:
     """Transformed execution objects plus layouts in local model-part order."""
 
-    execution: nn.Module | PipelineParallelSetup
+    execution: nn.Module
     layouts: tuple[ModelPartLayout, ...]
 
 

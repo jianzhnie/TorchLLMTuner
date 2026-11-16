@@ -29,7 +29,7 @@ __all__ = [
     "Collator",
     "CollatorFactory",
     "HAS_PIN_MEMORY",
-    "PipelineTextCollator",
+    "ContextBatchCollator",
     "TextCollator",
 ]
 
@@ -130,8 +130,8 @@ class TextCollator(Collator):
         }
 
 
-class PipelineTextCollator(Collator):
-    """Group independently packed rows into one pipeline schedule step."""
+class ContextBatchCollator(Collator):
+    """Group independently packed context rows into one batch."""
 
     def __init__(self, *, context: DatasetBuildContext, num_microbatches: int) -> None:
         require_positive_integer("num_microbatches", num_microbatches)
@@ -150,7 +150,7 @@ class PipelineTextCollator(Collator):
 
     def __call__(self, rows: Sequence[TextSequence]) -> TrainerBatch:
         if not 0 < len(rows) <= self._num_microbatches:
-            raise ValueError("pipeline batch must contain 1..num_microbatches rows")
+            raise ValueError("context batch must contain 1..num_microbatches rows")
         batches = [self._collator([row]) for row in rows]
         # Finite validation may end before a complete schedule step. Keep the
         # schedule shapes fixed with fully masked rows, without repeating data.
@@ -176,7 +176,7 @@ class PipelineTextCollator(Collator):
         return result
 
 
-class ContextRowsCollator(PipelineTextCollator):
+class ContextRowsCollator(ContextBatchCollator):
     """Flatten independent context rows with their document positions intact."""
 
     def __call__(self, rows: Sequence[TextSequence]) -> TrainerBatch:

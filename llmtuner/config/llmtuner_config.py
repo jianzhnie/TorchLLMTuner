@@ -19,7 +19,6 @@ from llmtuner.config.parallel_config import (
     ExpertParallelConfig,
     FSDPConfig,
     ParallelConfig,
-    PipelineParallelConfig,
     TensorParallelConfig,
 )
 from llmtuner.config.training_config import (
@@ -58,7 +57,6 @@ class LLMTunerConfig:
         profiler: ProfilerConfig,
         fsdp_config: FSDPConfig | None = None,
         tp_config: TensorParallelConfig | None = None,
-        pp_config: PipelineParallelConfig | None = None,
         cp_config: ContextParallelConfig | None = None,
         ep_config: ExpertParallelConfig | None = None,
     ) -> LLMTunerConfig:
@@ -70,7 +68,6 @@ class LLMTunerConfig:
             for name, plan in {
                 "fsdp_config": fsdp_config,
                 "tp_config": tp_config,
-                "pp_config": pp_config,
                 "cp_config": cp_config,
                 "ep_config": ep_config,
             }.items()
@@ -324,10 +321,6 @@ class LLMTunerConfig:
     @property
     def activation_swap_max_host_bytes(self) -> int:
         return self.training.activation_swap_max_host_bytes
-
-    @property
-    def pipeline_parallel_schedule(self) -> str:
-        return self.parallel.pp_config.pipeline_parallel_schedule
 
     @property
     def max_norm(self) -> float:

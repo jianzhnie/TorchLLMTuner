@@ -17,7 +17,6 @@ from .parallel_config import (
     ExpertParallelConfig,
     FSDPConfig,
     ParallelConfig,
-    PipelineParallelConfig,
     TensorParallelConfig,
 )
 from .training_config import TrainingConfig
@@ -32,7 +31,6 @@ PARSER_GROUPS: tuple[type, ...] = (
     ParallelConfig,
     FSDPConfig,
     TensorParallelConfig,
-    PipelineParallelConfig,
     ContextParallelConfig,
     ExpertParallelConfig,
     OptimizerConfig,
@@ -58,11 +56,8 @@ PROGRAMMATIC_ONLY: dict[type, frozenset[str]] = {
         }
     ),
     CheckpointConfig: frozenset({"purge_exempt"}),
-    ParallelConfig: frozenset(
-        {"fsdp_config", "tp_config", "pp_config", "cp_config", "ep_config"}
-    ),
+    ParallelConfig: frozenset({"fsdp_config", "tp_config", "cp_config", "ep_config"}),
     FSDPConfig: frozenset({"fsdp_apply_modules"}),
-    PipelineParallelConfig: frozenset({"module_fqns_per_model_part"}),
     TrainingConfig: frozenset(
         {
             "ema_config",
