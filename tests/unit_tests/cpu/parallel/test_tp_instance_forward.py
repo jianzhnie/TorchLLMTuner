@@ -43,8 +43,11 @@ def test_tp_boundary_preserves_instance_kernel_and_collective_order(monkeypatch)
     implementation.realize_moe_blocks_tp(
         [("block", block)], tp_size=2, tp_rank=0, group=object()
     )
-    monkeypatch.setattr(implementation, "all_gather_along", gather)
-    monkeypatch.setattr(implementation, "reduce_scatter_along", scatter)
+    boundary = importlib.import_module(
+        "llmtuner.parallel.tensor_parallel.sequence_boundary"
+    )
+    monkeypatch.setattr(boundary, "all_gather_along", gather)
+    monkeypatch.setattr(boundary, "reduce_scatter_along", scatter)
     value = torch.randn(1, 4, 16, requires_grad=True)
     result = block(value)
     assert events == ["gather", "kernel", "scatter"]
@@ -109,8 +112,11 @@ def test_attention_instance_kernel_survives_tp_assembly(monkeypatch):
             ParallelConfig(tensor_parallel_size=2),
             plan=plan,
         )
+        boundary = importlib.import_module(
+            "llmtuner.parallel.tensor_parallel.sequence_boundary"
+        )
         monkeypatch.setattr(
-            implementation,
+            boundary,
             "all_gather_along",
             lambda x, dim, group: torch.cat((x, x), dim=dim),
         )

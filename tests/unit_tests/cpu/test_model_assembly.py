@@ -318,7 +318,6 @@ def test_engine_factory_uses_explicit_dependencies_without_changing_rng() -> Non
     assert engine.pp_has_last_stage
     assert engine.pp_num_microbatches == 2
     assert engine.chunked_loss_num_chunks == 1
-    assert engine.max_context_length == cfg.max_seq_len
     assert model.weight is weight
     assert torch.equal(torch.get_rng_state(), rng)
 
@@ -420,11 +419,13 @@ def test_dataloader_factory_uses_explicit_rank_and_token_budget(monkeypatch) -> 
     cfg.training.global_batch_size = 8
     cfg.training.max_seq_len = 16
 
-    assert batch_runtime.build_training_dataloader(cfg, parallel_dims=None) is loader
+    assert batch_runtime.build_rank_dataloader(cfg, parallel_dims=None) is loader
     assert captured == {
         "dp_rank": 0,
         "dp_world_size": 1,
         "num_tokens_per_batch": 128,
+        "repeat": True,
+        "dataset": None,
     }
 
     mesh = SimpleNamespace(get_local_rank=lambda: 1, size=lambda: 2)
@@ -441,13 +442,13 @@ def test_dataloader_factory_uses_explicit_rank_and_token_budget(monkeypatch) -> 
 
 def test_production_assembly_uses_explicit_dataloader_factory(monkeypatch):
     calls = []
-    original = batch_runtime.build_training_dataloader
+    original = batch_runtime.build_rank_dataloader
 
     def tracked(cfg, *, parallel_dims):
         calls.append((cfg, parallel_dims))
         return original(cfg, parallel_dims=parallel_dims)
 
-    monkeypatch.setattr(batch_runtime, "build_training_dataloader", tracked)
+    monkeypatch.setattr(batch_runtime, "build_rank_dataloader", tracked)
     cfg = LLMTunerConfig()
     cfg.model.arch_overrides.update(
         vocab_size=19,

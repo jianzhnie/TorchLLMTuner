@@ -43,6 +43,22 @@ from llmtuner.parallel.replacements import ReplacementMap
 _VOCAB = 32
 
 
+def declared_decoder_stub() -> nn.Module:
+    model = nn.Module()
+    model.decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="tok_embeddings",
+        blocks="layers",
+        norm="norm",
+        head="lm_head",
+    )
+    model.tok_embeddings = nn.Identity()
+    model.layers = nn.ModuleList()
+    model.norm = nn.Identity()
+    model.lm_head = nn.Identity()
+    return model
+
+
 def test_fsdp_references_reject_partial_stack_after_prior_replacement():
     model = nn.ModuleDict(
         {"excluded": nn.Linear(4, 4, bias=False), "active": nn.Linear(4, 4, bias=False)}
@@ -133,7 +149,7 @@ def test_fsdp_module_mapping_precedes_reused_paths_and_preserves_wrappers(
                 if kind == "unit"
                 else {"": {"hook_module": original}}
                 if kind == "hook"
-                else {}
+                else {"": {}}
             ),
             fsdp_ignored_modules=["source"] if kind == "ignored" else [],
         )
@@ -152,7 +168,7 @@ def test_fsdp_module_mapping_precedes_reused_paths_and_preserves_wrappers(
         assert bound.fsdp_apply_modules[""]["hook_module"] is model["target"]
     else:
         assert bound.fsdp_ignored_modules == ["target"]
-        assert bound.fsdp_apply_modules == {}
+        assert bound.fsdp_apply_modules == {"": {}}
 
 
 @pytest.mark.parametrize("kind", ["unit", "hook", "ignored"])
@@ -166,7 +182,7 @@ def test_fsdp_module_mapping_rejects_unregistered_target_despite_reused_path(kin
                 if kind == "unit"
                 else {"": {"hook_module": original}}
                 if kind == "hook"
-                else {}
+                else {"": {}}
             ),
             fsdp_ignored_modules=["source"] if kind == "ignored" else [],
         )
@@ -261,7 +277,6 @@ _NUM_LAYERS = 3
 
 
 def test_hsdp_cp_mesh_reuses_existing_groups(monkeypatch):
-
     replicate_group = object()
     shard_group = object()
     selections = []
@@ -313,7 +328,6 @@ def test_hsdp_cp_mesh_reuses_existing_groups(monkeypatch):
 def test_decoder_fsdp_excludes_pipeline_identity_boundaries(
     monkeypatch, tied, first_stage
 ):
-
     model = nn.Module()
     model.decoder_structure = DecoderStructure(
         decoder="",
@@ -371,7 +385,6 @@ def build_model(*, tied: bool = False) -> Qwen3MoeForCausalLM:
 def test_chunked_boundaries_and_actual_aliases_are_owned_by_root(
     monkeypatch, tied, shared_layer
 ):
-
     model = build_model(tied=tied)
     model.model.config.tie_word_embeddings = not tied
     if shared_layer:
@@ -399,7 +412,6 @@ def test_chunked_boundaries_and_actual_aliases_are_owned_by_root(
 
 
 def test_decoder_keeps_a_root_alias_to_a_layer_child_in_the_root_state(monkeypatch):
-
     model = build_model()
     model.external_projection = model.layers[0].self_attn.q_proj
     calls = []
@@ -611,14 +623,7 @@ def test_separate_dtype_policy_uses_model_storage_dtype(monkeypatch, dtype):
 
 @pytest.mark.parametrize("names", [("missing",), "scale", ("scale", "other")])
 def test_invalid_separate_parameter_contract_fails_before_sharding(monkeypatch, names):
-    model = nn.Module()
-    model.decoder_structure = DecoderStructure(
-        decoder="",
-        embedding="tok_embeddings",
-        blocks="layers",
-        norm="norm",
-        head="lm_head",
-    )
+    model = declared_decoder_stub()
     model.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
     model.fsdp_separate_parameter_names = names
     original = model.scale
@@ -640,14 +645,7 @@ def test_invalid_separate_parameter_contract_fails_before_sharding(monkeypatch, 
 
 @pytest.mark.parametrize("alias", ["scale", "projection"])
 def test_separate_dtype_subtree_rejects_external_parameter_alias(monkeypatch, alias):
-    model = nn.Module()
-    model.decoder_structure = DecoderStructure(
-        decoder="",
-        embedding="tok_embeddings",
-        blocks="layers",
-        norm="norm",
-        head="lm_head",
-    )
+    model = declared_decoder_stub()
     block = nn.Module()
     block.fsdp_separate_parameter_names = ("scale",)
     block.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
@@ -672,14 +670,7 @@ def test_separate_dtype_subtree_rejects_external_parameter_alias(monkeypatch, al
 
 
 def test_separate_dtype_nested_declarations_fail_before_sharding(monkeypatch):
-    model = nn.Module()
-    model.decoder_structure = DecoderStructure(
-        decoder="",
-        embedding="tok_embeddings",
-        blocks="layers",
-        norm="norm",
-        head="lm_head",
-    )
+    model = declared_decoder_stub()
     model.fsdp_separate_parameter_names = ("scale",)
     model.scale = nn.Parameter(torch.ones(2, dtype=torch.float64))
     model.child = nn.Module()
@@ -707,14 +698,7 @@ def test_expert_placement_conflict_precedes_separate_dtype_sharding(monkeypatch)
         def size(self):
             return 4
 
-    model = nn.Module()
-    model.decoder_structure = DecoderStructure(
-        decoder="",
-        embedding="tok_embeddings",
-        blocks="layers",
-        norm="norm",
-        head="lm_head",
-    )
+    model = declared_decoder_stub()
     model.tok_embeddings = model.norm = model.lm_head = nn.Identity()
     model.enable_weight_tying = False
     separate = nn.Module()
@@ -1059,7 +1043,6 @@ def test_fine_grained_reduce_scatter_preserves_same_hook_and_tags_new_buffers(
 def test_custom_pattern_accepts_an_ancestor_hook_for_all_managed_units(
     monkeypatch, shared_weight
 ):
-
     from llmtuner.parallel.fully_shard_parallel import plan
 
     model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
@@ -1139,7 +1122,6 @@ def test_invalid_pattern_override_rejected_before_any_sharding(
 def test_invalid_pattern_reshard_value_rejected_before_any_sharding(
     monkeypatch, implementation, value
 ):
-
     from llmtuner.parallel.fully_shard_parallel import plan
 
     model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
@@ -1172,7 +1154,6 @@ def test_invalid_pattern_reshard_value_rejected_before_any_sharding(
 
 @pytest.mark.parametrize("value", [None, True, False, 1, 2, 4])
 def test_pattern_reshard_policy_uses_unit_mesh(monkeypatch, value):
-
     from llmtuner.parallel.fully_shard_parallel import plan
 
     model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
@@ -1210,7 +1191,6 @@ def test_pattern_reshard_policy_uses_unit_mesh(monkeypatch, value):
 def test_pattern_integer_reshard_with_spmd_rejected_before_sharding(
     monkeypatch, implementation
 ):
-
     from llmtuner.parallel.fully_shard_parallel import plan
 
     calls = []
@@ -1257,7 +1237,6 @@ def test_pattern_integer_reshard_with_spmd_rejected_before_sharding(
 def test_invalid_pattern_policy_rejected_before_sharding(
     monkeypatch, implementation, override, value
 ):
-
     from llmtuner.parallel.fully_shard_parallel import plan
 
     calls = []
@@ -1291,7 +1270,6 @@ def test_invalid_pattern_policy_rejected_before_sharding(
 def test_pattern_none_policy_follows_engine_contract(
     monkeypatch, policy, implementation
 ):
-
     from llmtuner.parallel.fully_shard_parallel import plan
 
     calls = []
@@ -1355,7 +1333,6 @@ def test_pattern_container_rejected_before_any_sharding(monkeypatch, container):
 
 
 def test_fsdp_pattern_overrides_replace_common_policy(monkeypatch):
-
     from llmtuner.config import ParallelConfig
     from llmtuner.parallel.fully_shard_parallel import plan
 
@@ -1532,7 +1509,9 @@ def test_pipeline_patterns_rebind_copied_hooks_and_excluded_parameters():
     assert configs[1].fsdp_config.fsdp_apply_modules == {"": {}}
     from llmtuner.parallel.fully_shard_parallel.plan import _resolve_pattern_units
 
-    _, units, _ = _resolve_pattern_units(second, configs[1])
+    _, units, _ = _resolve_pattern_units(
+        tuple(second.named_modules(remove_duplicate=False)), configs[1]
+    )
     assert units == {"": {}}
     assert cfg.fsdp_config.fsdp_apply_modules["0"]["hook_module"] is model
 
@@ -1596,14 +1575,15 @@ def test_fsdp_patterns_accept_logical_paths_after_checkpoint_and_compile(compile
             fsdp_ignored_modules=["0.1"],
         )
     )
-    modules, units, excluded = _resolve_pattern_units(model, cfg)
+    modules, units, excluded = _resolve_pattern_units(
+        tuple(model.named_modules(remove_duplicate=False)), cfg
+    )
     assert {modules[name] for name in units} == {block, first}
     assert excluded == set(ignored.parameters())
 
 
 @pytest.mark.parametrize("unit_ignored", [None, set()])
 def test_unit_override_cannot_clear_global_fsdp_exclusions(monkeypatch, unit_ignored):
-
     from llmtuner.config import ParallelConfig
     from llmtuner.parallel.fully_shard_parallel import plan
 
@@ -1652,7 +1632,7 @@ def test_fsdp_ignored_patterns_reject_invalid_selections(pattern, message):
         )
     )
     with pytest.raises(ValueError, match=message):
-        _resolve_pattern_units(model, cfg)
+        _resolve_pattern_units(tuple(model.named_modules(remove_duplicate=False)), cfg)
 
 
 def test_fsdp_apply_pattern_is_validated_when_every_module_is_ignored():
@@ -1666,7 +1646,7 @@ def test_fsdp_apply_pattern_is_validated_when_every_module_is_ignored():
         )
     )
     with pytest.raises(ValueError, match="invalid module pattern range"):
-        _resolve_pattern_units(model, cfg)
+        _resolve_pattern_units(tuple(model.named_modules(remove_duplicate=False)), cfg)
 
 
 def test_ignored_fsdp_module_excludes_its_descendants():
@@ -1685,7 +1665,9 @@ def test_ignored_fsdp_module_excludes_its_descendants():
             fsdp_apply_modules={"*": {}}, fsdp_ignored_modules=["ignored"]
         )
     )
-    _, selected, ignored = _resolve_pattern_units(model, cfg)
+    _, selected, ignored = _resolve_pattern_units(
+        tuple(model.named_modules(remove_duplicate=False)), cfg
+    )
     assert "ignored" not in selected
     assert "ignored.0" not in selected
     assert "kept.0" in selected
@@ -1698,7 +1680,6 @@ def test_ignored_fsdp_module_excludes_its_descendants():
     [("never", 1, False), ("always", 2, True), ("default", 2, False)],
 )
 def test_fsdp_patterns_honor_runtime_policies(monkeypatch, policy, pp, expected):
-
     from llmtuner.config import ParallelConfig
     from llmtuner.parallel.fully_shard_parallel import plan
 
@@ -1761,7 +1742,6 @@ def test_pattern_fsdp_with_ep_requires_sparse_mesh_before_mutation(monkeypatch):
 
 
 def test_pattern_ep_capability_failure_precedes_custom_unit_sharding(monkeypatch):
-
     from llmtuner.models.common.moe.experts import GroupedExperts
     from llmtuner.parallel.fully_shard_parallel import plan
 
@@ -1803,7 +1783,6 @@ def test_pattern_ep_capability_failure_precedes_custom_unit_sharding(monkeypatch
 def test_pattern_ep_none_placement_requires_default_capability_before_sharding(
     monkeypatch,
 ):
-
     from llmtuner.models.common.moe.experts import GroupedExperts
     from llmtuner.parallel.fully_shard_parallel import plan
 
@@ -1841,7 +1820,6 @@ def test_pattern_ep_none_placement_requires_default_capability_before_sharding(
 
 
 def test_pattern_ep_none_placement_uses_generated_expert_placement(monkeypatch):
-
     from torch.distributed.tensor import Shard
 
     from llmtuner.models.common.moe.experts import GroupedExperts
@@ -1929,7 +1907,6 @@ def test_shared_pattern_units_reject_conflicting_policies_before_sharding(monkey
 
 
 def test_shared_pattern_dependency_cycle_merges_states(monkeypatch):
-
     from llmtuner.parallel.fully_shard_parallel import plan
 
     model = nn.ModuleDict(
@@ -1968,7 +1945,6 @@ def test_shared_pattern_dependency_cycle_merges_states(monkeypatch):
 
 @pytest.mark.parametrize("excluded", [None, set()])
 def test_shared_pattern_units_compare_effective_exclusions(monkeypatch, excluded):
-
     from llmtuner.parallel.fully_shard_parallel import plan
 
     model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
@@ -2010,7 +1986,9 @@ def test_fsdp_ignored_pattern_resolves_shared_module_alias():
             fsdp_apply_modules={"kept": {}}, fsdp_ignored_modules=["alias"]
         )
     )
-    _, units, ignored = _resolve_pattern_units(model, cfg)
+    _, units, ignored = _resolve_pattern_units(
+        tuple(model.named_modules(remove_duplicate=False)), cfg
+    )
     assert units == {"kept": {}}
     assert ignored == set(shared.parameters())
 
@@ -2024,9 +2002,11 @@ def test_pattern_fsdp_groups_parents_of_an_aliased_child():
     shared = nn.Linear(2, 2)
     model = nn.Sequential(nn.Sequential(shared), nn.Sequential(shared))
     cfg = ParallelConfig(fsdp_config=FSDPConfig(fsdp_apply_modules={"0": {}, "1": {}}))
-    modules, options, ignored = _resolve_pattern_units(model, cfg)
+    modules, options, ignored = _resolve_pattern_units(
+        tuple(model.named_modules(remove_duplicate=False)), cfg
+    )
     groups = _resolve_shared_fsdp_units(
-        model,
+        tuple(model.named_modules(remove_duplicate=False)),
         named_modules=modules,
         unit_options=options,
         ignored_params=ignored,
@@ -2045,14 +2025,15 @@ def test_fsdp_apply_patterns_normalize_shared_module_aliases():
             fsdp_apply_modules={"1": {"reshard_after_forward": False}, "*": {}}
         )
     )
-    modules, units, ignored = _resolve_pattern_units(model, cfg)
+    modules, units, ignored = _resolve_pattern_units(
+        tuple(model.named_modules(remove_duplicate=False)), cfg
+    )
     assert modules["0"] is shared
     assert units == {"0": {"reshard_after_forward": False}}
     assert ignored == set()
 
 
 def test_fsdp_prefetch_windows_count_shared_states_once():
-
     from torch.distributed.fsdp import FSDPModule
 
     class Unit(FSDPModule, nn.Linear):
@@ -2083,7 +2064,6 @@ def test_pattern_fsdp_without_ep_shards_expert_features_when_degree_exceeds_expe
     base_degree,
     unit_degree,
 ):
-
     from torch.distributed.tensor import Shard
 
     from llmtuner.models.common.moe.experts import GroupedExperts
@@ -2195,7 +2175,6 @@ def test_fsdp_references_follow_replacement_and_transparent_wrappers(compiled):
 
 
 def test_fsdp_references_follow_all_parameter_aliases():
-
     model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
     model[1].weight = model[0].weight
     cfg = ParallelConfig(
@@ -2214,7 +2193,6 @@ def test_fsdp_references_follow_all_parameter_aliases():
 
 @pytest.mark.parametrize("override", ["hook_module", "ignored_params"])
 def test_fsdp_references_reject_removed_objects_instead_of_dropping_them(override):
-
     model = nn.Sequential(nn.Linear(4, 4, bias=False))
     value = model[0] if override == "hook_module" else {model[0].weight}
     cfg = ParallelConfig(
@@ -2232,7 +2210,6 @@ def test_fsdp_references_reject_removed_objects_instead_of_dropping_them(overrid
 
 @pytest.mark.parametrize("ignored", [False, True])
 def test_fsdp_references_follow_renamed_replacement_with_shared_aliases(ignored):
-
     model = nn.ModuleDict({"original": nn.Linear(4, 4, bias=False)})
     original = model["original"]
     cfg = ParallelConfig(
@@ -2259,7 +2236,6 @@ def test_fsdp_references_follow_renamed_replacement_with_shared_aliases(ignored)
 
 
 def test_fsdp_references_keep_objects_retained_under_new_paths():
-
     model = nn.Module()
     model.gate = nn.Linear(4, 4, bias=False)
     original = model.gate
@@ -2284,7 +2260,6 @@ def test_fsdp_references_keep_objects_retained_under_new_paths():
 def test_custom_fsdp_environment_is_checked_only_for_active_sharding(
     monkeypatch, dense_size, sparse_size
 ):
-
     calls = []
     monkeypatch.setattr(
         apply,

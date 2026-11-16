@@ -216,6 +216,7 @@ def test_native_flat_model_namespace(tmp_path, production_state):
     # Native backend merges wrapper FQNs at top level, not under a model root.
     contract = replace(
         contract,
+        model_prefix="",
         expected_fqns={f"model.{k}": v for k, v in contract.expected_fqns.items()},
         optimizer_kinds={"model.weight": "AdamW"},
     )

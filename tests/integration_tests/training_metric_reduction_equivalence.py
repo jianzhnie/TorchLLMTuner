@@ -62,9 +62,6 @@ def main():
                             sum(counts), dtype=dtype, device=device
                         ),
                         local_valid_tokens=counts[dp],
-                        local_valid_tokens_tensor=torch.tensor(
-                            counts[dp], dtype=dtype, device=device
-                        ),
                         reduction_meshes=meshes,
                         update=UpdateResult(
                             1, torch.tensor(2.0, device=device), True, True, False

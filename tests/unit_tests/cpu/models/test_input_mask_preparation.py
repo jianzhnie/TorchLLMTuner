@@ -79,7 +79,6 @@ def test_packed_input_requires_positions_before_parallel_lookup():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.bool])
 def test_nonintegral_positions_reject_before_mesh_lookup(dtype):
-
     def forbidden(axis):
         raise AssertionError("invalid position dtype reached mesh lookup")
 
@@ -264,7 +263,7 @@ def test_nonintegral_labels_reject_before_mesh_lookup(synthetic, dtype):
 def test_synthetic_labels_cannot_change_document_boundaries(shape):
     tokens = torch.arange(8).reshape(2, 4)
     labels = torch.ones(shape, dtype=torch.long)
-    with pytest.raises(ValueError, match="same shape as input_ids"):
+    with pytest.raises(ValueError, match="labels must"):
         prepare_text_inputs(
             Batch(input_ids=tokens, labels=labels),
             parallel_dims=None,

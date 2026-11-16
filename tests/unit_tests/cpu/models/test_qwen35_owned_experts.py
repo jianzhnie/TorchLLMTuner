@@ -131,7 +131,7 @@ def test_owned_moe_initialization_does_not_delegate_family_rules(monkeypatch):
     original = ReferencePreTrainedModel._init_weights
 
     def guarded(self, module):
-        if isinstance(module, (Qwen3_5MoeExperts, Qwen3_5MoeSparseMoeBlock)):
+        if isinstance(module, Qwen3_5MoeExperts | Qwen3_5MoeSparseMoeBlock):
             raise AssertionError("Owned MoE initialization delegated family rules")
         return original(self, module)
 

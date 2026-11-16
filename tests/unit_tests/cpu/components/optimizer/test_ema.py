@@ -278,7 +278,7 @@ def test_a_replaced_parameter_is_a_loud_error_not_a_keyerror() -> None:
     model = _model()
     ema = EMA(model_parts=[model])
     model[0].weight = nn.Parameter(torch.zeros(4, 4))
-    with pytest.raises(RuntimeError, match="no state for"):
+    with pytest.raises(ValueError, match="layout parameter bindings are stale"):
         ema.step(1)
 
 
@@ -364,7 +364,7 @@ def test_cold_start_rejects_replaced_parameter_without_partial_updates():
     before = {key: value.clone() for key, value in _ema_params(ema).items()}
     model[1].weight = nn.Parameter(torch.zeros_like(model[1].weight))
     replacement = model[1].weight
-    with pytest.raises(RuntimeError, match="no state for"):
+    with pytest.raises(ValueError, match="layout parameter bindings are stale"):
         ema.reset_from_model()
     assert replacement not in ema.optimizers[0].state
     for key, value in _ema_params(ema).items():
@@ -405,7 +405,7 @@ def test_repeated_model_part_is_rejected_before_allocating_averages(monkeypatch)
 
     monkeypatch.setattr(ema_module, "EMAStateOptimizer", fail_if_allocated)
     model = _model()
-    with pytest.raises(ValueError, match="more than one group"):
+    with pytest.raises(ValueError, match="ownership overlaps across model parts"):
         EMA(model_parts=[model, model])
 
 
@@ -608,7 +608,13 @@ def test_renamed_tensor_is_rejected_before_any_average_mutation(operation, kind)
         model.register_parameter("renamed_bias", tensor)
     else:
         model.register_buffer("renamed_history", tensor)
-    with pytest.raises(RuntimeError, match="checkpoint name changed"):
+    error = ValueError if kind == "parameter" else RuntimeError
+    message = (
+        "layout parameter bindings are stale"
+        if kind == "parameter"
+        else "checkpoint name changed"
+    )
+    with pytest.raises(error, match=message):
         if operation == "step":
             ema.step(1)
         elif operation == "cold_start":

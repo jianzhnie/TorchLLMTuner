@@ -69,6 +69,14 @@ def construct_test_model(config, *, explicit: bool = True) -> torch.nn.Module:
     if explicit and config.model_type == "qwen3_moe":
         return Qwen3MoeForCausalLM(config)
     model = AutoModelForCausalLM.from_config(config)
+    model.decoder_structure = DecoderStructure(
+        decoder="model",
+        embedding="model.embed_tokens",
+        blocks="model.layers",
+        norm="model.norm",
+        head="lm_head",
+        attention="self_attn",
+    )
     object.__setattr__(model, "layers", model.model.layers)
     # These are explicit test adapters for fixed reference families. The
     # production resolver neither selects these families nor infers semantics.
@@ -503,8 +511,8 @@ def test_swap_rejects_a_dense_model() -> None:
         swap_moe_blocks(model)
 
 
-def test_swap_rejects_a_model_without_layers() -> None:
-    with pytest.raises(UnsupportedCombinationError, match=r"\.layers"):
+def test_swap_rejects_a_model_without_decoder_structure() -> None:
+    with pytest.raises(TypeError, match="decoder_structure"):
         swap_moe_blocks(torch.nn.Linear(4, 4))
 
 
@@ -1734,7 +1742,9 @@ def test_ep_rebinds_ignored_module_subtree_without_object_overrides(
     swap_moe_blocks(model, on_replacement=references.record_replacements)
     grouped = model.layers[0].mlp.routed_experts.inner_experts
     rebound = references.bind(model)
-    _, _, exclusions = _resolve_pattern_units(model, rebound)
+    _, _, exclusions = _resolve_pattern_units(
+        tuple(model.named_modules(remove_duplicate=False)), rebound
+    )
     expected = (
         {
             parameter

@@ -36,8 +36,8 @@ def test_low_precision_delta_initializer_remains_finite(constructor, dtype):
     assert delta.A_log.count_nonzero() > 8000
     assert torch.equal(delta.dt_bias, torch.ones_like(delta.dt_bias))
     torch.manual_seed(73)
-    reference = torch.empty(8192).uniform_(0, 16)
-    reference.clamp_min_(torch.finfo(torch.float32).tiny).log_()
+    reference = torch.empty(8192).uniform_(0.01, 16)
+    reference.log_()
     torch.testing.assert_close(delta.A_log, reference.to(dtype), rtol=0, atol=0)
 
 

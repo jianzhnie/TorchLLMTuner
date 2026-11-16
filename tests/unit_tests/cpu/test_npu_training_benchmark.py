@@ -116,6 +116,7 @@ def test_local_report_failure_is_coordinated_before_gather(monkeypatch):
         metrics=SimpleNamespace(num_flops_per_token=1, gpu_peak_flops=1),
         device="npu:0",
         benchmark_rows=[],
+        activation_swap_resources=None,
         train=lambda: calls.append("train"),
         close=lambda: calls.append("close"),
     )

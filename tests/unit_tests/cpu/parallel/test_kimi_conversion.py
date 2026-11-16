@@ -533,7 +533,9 @@ def test_kimi_fsdp_references_preserve_complete_stacked_exclusions(whole_module)
     grouped = model.layers[0].block_sparse_moe.routed_experts.inner_experts
     rebound = references.bind(model)
     if whole_module:
-        _, _, ignored = _resolve_pattern_units(model, rebound)
+        _, _, ignored = _resolve_pattern_units(
+            tuple(model.named_modules(remove_duplicate=False)), rebound
+        )
         assert ignored == set(grouped.parameters())
     else:
         assert rebound.fsdp_config.fsdp_apply_modules[""]["ignored_params"] == {
@@ -594,7 +596,9 @@ def test_kimi_gate_module_exclusion_keeps_moved_bias_outside_router(
     swap_moe_blocks(model, on_replacement=references.record_replacements)
     converted = model.layers[0].block_sparse_moe
     rebound = references.bind(model)
-    _, units, ignored = _resolve_pattern_units(model, rebound)
+    _, units, ignored = _resolve_pattern_units(
+        tuple(model.named_modules(remove_duplicate=False)), rebound
+    )
     assert ignored == {converted.router.gate.weight}
     assert units[""]["ignored_params"] == {converted.expert_bias_E}
     assert converted.expert_bias_E.requires_grad is not frozen_bias

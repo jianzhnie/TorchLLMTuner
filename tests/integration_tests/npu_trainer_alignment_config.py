@@ -72,6 +72,7 @@ def alignment_runtime_manifest(module_names: Sequence[str]) -> dict[str, Any]:
     npu = getattr(torch_module, "npu", None)
     return {
         "python": sys.version,
+        "diagnostic_timeout_patch": False,
         "versions": versions,
         "sources": sources,
         "npu_allocator_config": os.environ.get("PYTORCH_NPU_ALLOC_CONF"),

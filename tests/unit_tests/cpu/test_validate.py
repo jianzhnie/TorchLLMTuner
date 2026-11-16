@@ -229,7 +229,8 @@ def _make_trainer(
         log_validation=lambda loss, step: logged.update(loss=loss, step=step),
     )
     monkeypatch.setattr(
-        "llmtuner.trainer.runtime.validation.build_dataloader", lambda *a, **k: loader
+        "llmtuner.trainer.runtime.validation.build_rank_dataloader",
+        lambda *a, **k: loader,
     )
     return trainer, logged
 
@@ -451,7 +452,7 @@ def test_validate_pp_drives_schedule_eval_and_reports_normalized_loss(
         add_tokens=lambda n: None,
         log_validation=lambda loss, step: logged.update(loss=loss, step=step),
     )
-    monkeypatch.setattr(validate_mod, "build_dataloader", lambda *a, **k: loader)
+    monkeypatch.setattr(validate_mod, "build_rank_dataloader", lambda *a, **k: loader)
     monkeypatch.setattr(
         "llmtuner.trainer.runtime.pipeline.spmd_context", lambda dims: nullcontext()
     )

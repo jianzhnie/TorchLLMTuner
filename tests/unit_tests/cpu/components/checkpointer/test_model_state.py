@@ -65,7 +65,6 @@ def test_state_hook_failure_reaches_completion_coordination(monkeypatch, operati
 
 @pytest.mark.parametrize("mode", ["full", "tp", "ep", "joint"])
 def test_restore_releases_export_cache_without_regathering(monkeypatch, mode):
-
     model = nn.Linear(2, 2, bias=False)
     chunked = mode != "full"
 
@@ -377,7 +376,9 @@ def test_invalid_model_part_is_rejected_before_shard_inspection() -> None:
 
 
 def test_overlapping_model_parts_are_rejected_instead_of_overwriting() -> None:
-    with pytest.raises(ValueError, match="overlap at part 1.*bias.*weight"):
+    with pytest.raises(
+        ValueError, match="checkpoint name.*collides across model parts 0 and 1"
+    ):
         ModelCheckpointState([nn.Linear(2, 2), nn.Linear(2, 2)])
 
 

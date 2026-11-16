@@ -163,7 +163,7 @@ def test_declared_mla_only_pipeline_part_binds_without_kda(monkeypatch):
 
 @pytest.mark.parametrize("layout", ["kda_state", "mla_ulysses", None, "standard"])
 def test_explicit_attention_selects_model_declared_layout(layout):
-    class DeclaredAttention(nn.Module):
+    class DeclaredAttention(KDA):
         def __init__(self):
             super().__init__()
             self.context_parallel_layout = layout

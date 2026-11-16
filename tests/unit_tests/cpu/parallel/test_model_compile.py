@@ -468,6 +468,8 @@ def test_compiled_ac_preserves_modes_identity_and_frozen_gradients(
                     for _ in range(2)
                 ]
             )
+            for layer in self.layers:
+                layer.moe_block_name = None
 
         def forward(self, inputs):
             for layer in self.layers:

@@ -65,7 +65,6 @@ def test_kimi_binds_declared_structure():
 
 
 def test_kimi_decoder_rejects_batched_document_resets_and_conflicting_masks():
-
     config = KimiLinearConfig(
         vocab_size=16,
         hidden_size=8,
@@ -100,7 +99,6 @@ def test_kimi_decoder_rejects_batched_document_resets_and_conflicting_masks():
 
 
 def test_registered_kimi_architecture_builds_from_training_config():
-
     config = build_model_config_for(
         LLMTunerConfig(model=ModelConfig(model_name_or_path="kimi_linear"))
     )
@@ -143,7 +141,6 @@ def test_kimi_dense_kda_training_and_state_roundtrip():
 
 
 def test_kimi_hybrid_padding_matches_unpadded_valid_tokens():
-
     config = build_model_config(
         "kimi_linear",
         seq_len=8,
@@ -214,7 +211,6 @@ def test_kimi_padding_matches_compacted_sequence():
 
 
 def test_kimi_decoder_rejects_cache_instead_of_silently_ignoring_it():
-
     config = KimiLinearConfig(
         vocab_size=16,
         hidden_size=8,
@@ -237,7 +233,6 @@ def test_kimi_decoder_rejects_cache_instead_of_silently_ignoring_it():
 
 
 def test_kimi_moe_layer_selection_matches_configured_dense_prefix_and_frequency():
-
     config = KimiLinearConfig(
         vocab_size=16,
         hidden_size=8,
@@ -273,7 +268,6 @@ def test_kimi_moe_layer_selection_matches_configured_dense_prefix_and_frequency(
 
 
 def test_kimi_meta_materialization_initializes_custom_parameters():
-
     config = build_model_config(
         "kimi_linear",
         seq_len=8,
@@ -369,7 +363,6 @@ def test_kimi_ep_meta_random_initialization_rejects_before_model_allocation(
 
 
 def test_kda_decay_parameters_remain_fp32_with_bf16_default():
-
     config = KimiLinearConfig(
         vocab_size=32,
         hidden_size=8,

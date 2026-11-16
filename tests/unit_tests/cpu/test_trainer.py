@@ -67,7 +67,7 @@ from llmtuner.models.configuration import build_model_config
 from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.runtime.batch import (
-    build_training_dataloader,
+    build_rank_dataloader,
     move_batch_to_device,
     prepare_model_inputs,
 )
@@ -77,6 +77,22 @@ from llmtuner.trainer.runtime.results import StepResult
 from llmtuner.trainer.trainer import Trainer
 from llmtuner.utils.seeding import seed_everything
 from llmtuner.utils.vocabulary import vocab_shard_bounds
+
+
+def bind_test_engine(trainer: Trainer) -> None:
+    """Bind real execution services for tests that bypass Trainer assembly."""
+    for model in trainer.model_parts:
+        model.execution_capabilities = ModelExecutionCapabilities()
+    trainer.training_engine = TrainingEngine(
+        model_parts=trainer.model_parts,
+        parallel_dims=getattr(trainer, "parallel_dims", None),
+        device=getattr(trainer, "device", torch.device("cpu")),
+        chunked_loss_num_chunks=1,
+        param_context=nullcontext,
+        optimizer=trainer.optimizer,
+        lr_scheduler=trainer.lr_scheduler,
+        ema=getattr(trainer, "ema", None),
+    )
 
 
 @pytest.mark.parametrize("mutable_state", ["running_stats", "embedding_weight"])
@@ -133,15 +149,7 @@ def test_train_step_finishes_staging_before_forward_mutates_model_state(mutable_
         loss.backward()
         return StepResult(loss.detach(), 1, kwargs["global_valid_tokens"])
 
-    trainer.training_engine = TrainingEngine(
-        model_parts=[model],
-        parallel_dims=None,
-        device=torch.device("cpu"),
-        chunked_loss_num_chunks=1,
-        param_context=nullcontext,
-        optimizer=trainer.optimizer,
-        lr_scheduler=trainer.lr_scheduler,
-    )
+    bind_test_engine(trainer)
     trainer.forward_backward_step = forward_backward
     assert trainer.train_step(iter([None])) is None
     torch.testing.assert_close(snapshot, expected, rtol=0, atol=0)
@@ -208,6 +216,7 @@ def test_nonfinite_step_preserves_model_optimizer_scheduler_and_ema(invalid):
         )
 
     trainer.forward_backward_step = forward_backward
+    bind_test_engine(trainer)
     with pytest.raises(RuntimeError, match="not finite"):
         trainer.train_step(iter([None]))
     after = (
@@ -239,6 +248,7 @@ def test_train_step_rejects_a_fully_masked_window_before_forward() -> None:
         "forward/backward must not run with zero valid tokens"
     )
 
+    bind_test_engine(trainer)
     with pytest.raises(RuntimeError, match="zero valid tokens"):
         trainer.train_step(iter([object()]))
 
@@ -1394,7 +1404,7 @@ def test_synthetic_loader_is_checkpointed_like_any_other() -> None:
     """
     cfg = _cfg_with_batch(global_batch_size=8, max_seq_len=16)
 
-    loader = build_training_dataloader(cfg, parallel_dims=None)
+    loader = build_rank_dataloader(cfg, parallel_dims=None)
 
     assert isinstance(loader, RandomTokenDataLoader)
 
@@ -1584,10 +1594,8 @@ def test_synthetic_batch_is_deterministic() -> None:
     """
     cfg = _cfg_with_batch(global_batch_size=8, max_seq_len=16, seed=42)
     trainer, reference = _bare_trainer(cfg), _bare_trainer(cfg)
-    trainer.dataloader = build_training_dataloader(
-        cfg, parallel_dims=trainer.parallel_dims
-    )
-    reference.dataloader = build_training_dataloader(
+    trainer.dataloader = build_rank_dataloader(cfg, parallel_dims=trainer.parallel_dims)
+    reference.dataloader = build_rank_dataloader(
         cfg, parallel_dims=reference.parallel_dims
     )
     first = next(trainer.data_iterator())
@@ -1606,9 +1614,7 @@ def test_dp_slice_partitions_global_batch() -> None:
     """
     cfg = _cfg_with_batch(global_batch_size=8, max_seq_len=16, seed=42)
     trainer = _bare_trainer(cfg)
-    trainer.dataloader = build_training_dataloader(
-        cfg, parallel_dims=trainer.parallel_dims
-    )
+    trainer.dataloader = build_rank_dataloader(cfg, parallel_dims=trainer.parallel_dims)
     batch = next(trainer.data_iterator())
 
     per_rank = cfg.global_batch_size // 2
@@ -1713,13 +1719,16 @@ def test_create_seed_checkpoint_writes_a_step_0_checkpoint_and_exits(tmp_path) -
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
-def test_close_releases_all_resources_even_when_one_fails(error_type) -> None:
+def test_close_releases_independent_resources_when_checkpoint_drain_fails(
+    error_type,
+) -> None:
     trainer = Trainer.__new__(Trainer)
     calls = []
 
     def fail():
         calls.append("checkpointer")
-        raise error_type("save failed")
+        if calls.count("checkpointer") == 1:
+            raise error_type("save failed")
 
     trainer.checkpointer = SimpleNamespace(close=fail)
     for name in ("metrics", "dataloader", "gc_handler"):
@@ -1728,9 +1737,20 @@ def test_close_releases_all_resources_even_when_one_fails(error_type) -> None:
         )
     with pytest.raises(error_type, match="save failed"):
         trainer.close()
-    assert calls == ["checkpointer", "metrics", "dataloader", "gc_handler"]
+    assert calls == ["checkpointer", "metrics", "gc_handler"]
+    assert trainer.dataloader is not None
+    assert trainer.checkpointer is not None
     trainer.close()
-    assert len(calls) == 4
+    trainer.close()
+    assert calls == [
+        "checkpointer",
+        "metrics",
+        "gc_handler",
+        "checkpointer",
+        "dataloader",
+    ]
+    assert trainer.dataloader is None
+    assert trainer.checkpointer is None
 
 
 def test_close_accepts_a_partially_initialized_trainer() -> None:
@@ -2213,6 +2233,7 @@ def test_incomplete_accumulation_window_never_updates_parameters():
         input_ids=torch.ones(1, 4, dtype=torch.long),
         labels=torch.ones(1, 4, dtype=torch.long),
     )
+    bind_test_engine(trainer)
     with pytest.raises(DataloaderExhaustedError):
         trainer.train_step(trainer.batch_generator([batch]))
     assert parameter.item() == 3.0
@@ -2476,10 +2497,21 @@ def test_data_exhaustion_saves_last_completed_step(monkeypatch, completed_steps)
         return None
 
     trainer.train_step = train_step
+
+    class ProfilerOwner:
+        def __enter__(self):
+            return SimpleNamespace(step=lambda: None)
+
+        def __exit__(self, *args):
+            return None
+
+        def close(self):
+            pass
+
     monkeypatch.setattr(
         trainer_module.assembly,
         "Profiler",
-        lambda *args, **kwargs: nullcontext(SimpleNamespace(step=lambda: None)),
+        lambda *args, **kwargs: ProfilerOwner(),
     )
     monkeypatch.setattr(
         trainer_module,
@@ -2523,6 +2555,7 @@ def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
 
     original = Trainer(config())
     loader = original.dataloader
+    optimizer, scheduler, ema = original.optimizer, original.lr_scheduler, original.ema
     # The real checkpointable source advances three batches: two update the
     # model, one is consumed in the canceled final accumulation window.
     original.data_iterator = lambda: islice(iter(loader), 3)
@@ -2536,9 +2569,9 @@ def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
         assert original.ntokens_seen == 48
         assert loader.state_dict()["steps"] == 3
         expected_model = deepcopy(original.model.state_dict())
-        expected_optimizer = deepcopy(original.optimizer.state_dict())
-        expected_scheduler = deepcopy(original.lr_scheduler.state_dict())
-        expected_ema = deepcopy(original.ema.state_dict())
+        expected_optimizer = deepcopy(optimizer.state_dict())
+        expected_scheduler = deepcopy(scheduler.state_dict())
+        expected_ema = deepcopy(ema.state_dict())
         expected_python = random.getstate()
         expected_numpy = np.random.get_state()
         expected_torch = torch.get_rng_state().clone()
@@ -2886,6 +2919,8 @@ def test_trainer_retains_loader_after_interrupted_iterator_cleanup(failure):
 
     loader = GrainDataLoader.__new__(GrainDataLoader)
     loader._iterator = SimpleNamespace(close=close_iterator)
+    loader._pending_probes = []
+    loader._iterator_closed = False
     trainer.dataloader = loader
     trainer.metrics = SimpleNamespace(close=lambda: calls.append("metrics"))
     trainer.gc_handler = SimpleNamespace(close=lambda: calls.append("gc"))
@@ -2941,6 +2976,7 @@ def test_new_train_step_discards_previous_routing_window(quantile):
         raise RuntimeError("checked new window boundary")
 
     trainer.lr_scheduler = SimpleNamespace(get_metrics=stop_after_reset)
+    bind_test_engine(trainer)
     with pytest.raises(RuntimeError, match="checked new window boundary"):
         trainer.train_step(iter(()))
 

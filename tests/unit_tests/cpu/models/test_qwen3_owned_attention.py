@@ -75,7 +75,6 @@ def test_attention_constructor_owns_parameters_and_kernel_metadata(bias, monkeyp
     actual = Qwen3MoeAttention(deepcopy(config), 0)
     assert torch.equal(rng, torch.get_rng_state())
     assert actual._modules.keys() == reference._modules.keys()
-    assert actual._hidden_kernels.keys() == reference._hidden_kernels.keys()
     assert actual.state_dict().keys() == reference.state_dict().keys()
     for name, value in actual.state_dict().items():
         torch.testing.assert_close(value, reference.state_dict()[name], rtol=0, atol=0)
@@ -97,7 +96,7 @@ def test_attention_constructor_owns_parameters_and_kernel_metadata(bias, monkeyp
 )
 def test_bad_geometry_fails_before_allocation(entry, field, value, monkeypatch):
     config = model_config()
-    setattr(config, field, value)
+    object.__setattr__(config, field, value)
     before = torch.get_rng_state().clone()
 
     def forbidden(*args, **kwargs):

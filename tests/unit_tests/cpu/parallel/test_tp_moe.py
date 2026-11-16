@@ -27,7 +27,11 @@ from transformers import AutoConfig
 
 from llmtuner.config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.contracts import GatedMLPStructure, MoEBlockContract
+from llmtuner.models.contracts import (
+    DecoderStructure,
+    GatedMLPStructure,
+    MoEBlockContract,
+)
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.tensor_parallel import linear as tp_linear
@@ -150,6 +154,9 @@ class _MoeModel(nn.Module):
             [nn.ModuleDict({"mlp": _MoeBlock(num_experts, dim, hidden, top_k=2)})]
         )
         self.layers[0].moe_block_name = "mlp"
+        self.decoder_structure = DecoderStructure(
+            decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
+        )
         self.tp_config = MOE_PLAN
 
 
@@ -648,6 +655,7 @@ def test_tp_rejects_shared_moe_shards_before_mutating_model(sharing):
     first = model.layers[0]["mlp"]
     second = _MoeBlock(4, 16, 8, top_k=2)
     model.layers.append(nn.ModuleDict({"mlp": second}))
+    model.layers[-1].moe_block_name = "mlp"
     if sharing == "experts_module":
         second.experts = first.experts
     elif sharing == "expert_parameter":

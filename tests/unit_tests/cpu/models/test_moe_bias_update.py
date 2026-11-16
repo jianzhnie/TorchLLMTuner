@@ -412,6 +412,13 @@ def test_hook_respects_real_swapped_model_routing_policy(architecture, monkeypat
             max_position_embeddings=128,
         )
         model = DeepseekV3Model(config).float().eval()
+        model.decoder_structure = DecoderStructure(
+            decoder="",
+            embedding="embed_tokens",
+            blocks="layers",
+            norm="norm",
+            head="head",
+        )
         for index, layer in enumerate(model.layers):
             layer.moe_block_name = (
                 "mlp" if index >= config.first_k_dense_replace else None
@@ -591,7 +598,6 @@ def test_shared_counter_updates_each_independent_bias_owner():
 
 
 def test_shared_quantile_bias_uses_joint_histogram_and_original_bias():
-
     layers = [
         MoE(
             4,
@@ -621,7 +627,6 @@ def test_shared_quantile_bias_uses_joint_histogram_and_original_bias():
 
 
 def test_shared_histogram_updates_independent_quantile_bias_owners():
-
     layers = [
         MoE(
             4,

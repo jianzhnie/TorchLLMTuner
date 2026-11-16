@@ -24,6 +24,7 @@ from llmtuner.parallel.stages import (
     STAGE_ORDER,
     STAGES,
 )
+from llmtuner.parallel.topology import ParallelTopology
 from tests.unit_tests.cpu.parallel.pipeline_stubs import stub_pipeline
 
 
@@ -205,8 +206,6 @@ def test_unsupported_mc2_degree_fails_in_ep_stage_before_conversion(monkeypatch)
 
 
 def test_pipeline_validates_tp_override_before_splitting(monkeypatch):
-    from types import SimpleNamespace
-
     from llmtuner.config.parallel_config import TensorParallelConfig
 
     cfg = ParallelConfig(
@@ -214,7 +213,10 @@ def test_pipeline_validates_tp_override_before_splitting(monkeypatch):
         pipeline_parallel_size=2,
         tp_config=TensorParallelConfig(tp_colwise_modules=["missing.*"]),
     )
-    topology = SimpleNamespace(pp_enabled=True, get_optional_mesh=lambda name: None)
+    topology = ParallelTopology(
+        dp_replicate=1, dp_shard=1, cp=1, tp=2, pp=2, ep=1, world_size=4
+    )
+    topology.get_optional_mesh = lambda name: None
 
     def unexpected_split(*args, **kwargs):
         pytest.fail("invalid global pattern reached pipeline splitting")
@@ -292,7 +294,6 @@ def test_assembly_executes_stages_in_order(monkeypatch, compile_enabled):
 def test_pipeline_assembly_rebinds_transformed_parts_before_schedule(
     monkeypatch, compile_enabled, injected_factory
 ):
-
     model = nn.Linear(2, 2)
     model.execution_capabilities = ModelExecutionCapabilities()
     model.vocab_size = 2
@@ -445,13 +446,20 @@ def test_fused_ep_dispatch_receives_stage_wide_error_group(monkeypatch, dispatch
     ep_group, loss_group = object(), object()
     ep_mesh = SimpleNamespace(get_group=lambda: ep_group)
     loss_mesh = SimpleNamespace(get_group=lambda: loss_group)
-    dims = SimpleNamespace(
-        pp_enabled=False,
-        get_optional_mesh=lambda name: ep_mesh if name == "ep" else None,
-        get_mesh=lambda name: loss_mesh,
-    )
     cfg = ParallelConfig(expert_parallel_size=8 if dispatcher == "mc2" else 2)
     cfg.ep_config.ep_token_dispatcher = dispatcher
+    dims = ParallelTopology(
+        dp_replicate=1,
+        dp_shard=cfg.ep_size,
+        cp=1,
+        tp=1,
+        pp=1,
+        ep=cfg.ep_size,
+        world_size=cfg.ep_size,
+    )
+    dims.get_optional_mesh = lambda name: ep_mesh if name == "ep" else None
+    dims.get_mesh = lambda name: loss_mesh
+
     # This test isolates mesh wiring; model geometry is covered separately.
     monkeypatch.setattr(parallelize, "resolve_ep_plan", lambda *args, **kwargs: None)
     observed = {}
@@ -556,7 +564,11 @@ def test_cp_preflight_uses_explicit_group_without_wrapping_execution(
 
     @contextmanager
     def boundary(phase, *, group):
-        assert has_topology and phase == "CP backend validation"
+        if phase != "CP backend validation":
+            assert group is None
+            yield
+            return
+        assert has_topology
         assert group is expected_group
         calls.append("enter")
         active["boundary"] = True
@@ -572,11 +584,18 @@ def test_cp_preflight_uses_explicit_group_without_wrapping_execution(
         calls.append("execute")
         return part
 
-    dims = SimpleNamespace(
-        pp_enabled=False,
-        get_optional_mesh=lambda name: None,
-        build_device_mesh=lambda: SimpleNamespace(get_group=get_group),
+    dims = ParallelTopology(
+        dp_replicate=1,
+        dp_shard=1,
+        cp=2,
+        tp=1,
+        pp=1,
+        ep=1,
+        world_size=2,
+        cp_ulysses=2 if backend == "compressor" else 1,
     )
+    dims.get_optional_mesh = lambda name: None
+    dims.build_device_mesh = lambda: SimpleNamespace(get_group=get_group)
     monkeypatch.setattr(parallelize, "synchronize_local_errors", boundary)
     monkeypatch.setattr(parallelize, "apply_cp", execute)
     for name in ("apply_tp", "apply_ep", "apply_ac", "apply_fsdp"):

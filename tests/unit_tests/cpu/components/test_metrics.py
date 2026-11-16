@@ -849,7 +849,7 @@ def test_metrics_releases_first_sink_when_second_sink_construction_fails(monkeyp
 
     calls = []
     monkeypatch.setattr(
-        metrics_module,
+        logger_module,
         "WandBLogger",
         lambda *args, **kwargs: SimpleNamespace(close=lambda: calls.append("wandb")),
     )

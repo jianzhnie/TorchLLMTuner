@@ -2860,6 +2860,7 @@ def test_optional_backend_coordinates_local_state_restore(tmp_path, monkeypatch,
     from llmtuner.components.checkpointer.backends import (
         torch_checkpointing_backend as tc,
     )
+    from llmtuner.components.checkpointer.core import state_adaptation
 
     manager, _, _ = _hf_manager_stub(
         tmp_path, monkeypatch, files={f"{tmp_path}/metadata.pkl"}
@@ -2879,10 +2880,12 @@ def test_optional_backend_coordinates_local_state_restore(tmp_path, monkeypatch,
             return {}
 
         def load_state_dict(self, state):
-            assert active == [f"Checkpoint {key} restoration"]
+            phase = "RNG" if key == "rng_state" else key
+            assert active == [f"Checkpoint {phase} restoration"]
             raise ValueError("local restore failed")
 
     monkeypatch.setattr(tc, "synchronize_local_errors", coordinate)
+    monkeypatch.setattr(state_adaptation, "synchronize_local_errors", coordinate)
     with pytest.raises(ValueError, match="local restore failed"):
         manager._load_checkpoint({key: LocalState()}, str(tmp_path), from_hf=False)
 

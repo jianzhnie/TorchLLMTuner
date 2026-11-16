@@ -490,7 +490,7 @@ def test_all_model_parts_are_validated_before_building_optimizers(
     if invalid_layout == "repeated_part":
         parts = [model, model]
         config = _cfg(_catch_all())
-        error = "more than one group"
+        error = "ownership overlaps across model parts"
     else:
         parts = [model, nn.Linear(8, 8)]
         config = _cfg(

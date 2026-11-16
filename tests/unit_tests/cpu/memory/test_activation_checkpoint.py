@@ -269,7 +269,8 @@ def test_region_annotates_the_hf_projections_and_checkpoints_each_block(
     )
 
     assert fake.checkpoints == [
-        (f"layers.{layer_id}", "default", False) for layer_id in range(_NUM_LAYERS)
+        (f"model.layers.{layer_id}", "default", False)
+        for layer_id in range(_NUM_LAYERS)
     ]
     vocabulary = region_names(model.layers[0])
     assert vocabulary == (
@@ -284,12 +285,12 @@ def test_region_annotates_the_hf_projections_and_checkpoints_each_block(
     # Block-qualified labels for torch_remat, block-relative names for the
     # patterns: the retained set is exactly the attention projections.
     assert [name for name, _ in fake.regions] == [
-        f"layers.{layer_id}.{region}"
+        f"model.layers.{layer_id}.{region}"
         for layer_id in range(_NUM_LAYERS)
         for region in vocabulary
     ]
     assert {
-        name.split(".", 2)[-1] for name, recompute in fake.regions if not recompute
+        name.split(".", 3)[-1] for name, recompute in fake.regions if not recompute
     } == {
         "self_attn.q_proj",
         "self_attn.k_proj",

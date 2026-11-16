@@ -132,7 +132,7 @@ def test_grouped_projection_preserves_empty_token_shape_and_gradients(shape):
 @pytest.mark.parametrize(
     ("name", "value"),
     [
-        ("num_local_experts", 0),
+        ("n_routed_experts", 0),
         ("num_experts_per_tok", 0),
         ("num_experts_per_tok", 5),
         ("num_experts_per_tok", True),
@@ -143,7 +143,7 @@ def test_invalid_routing_rejected_without_allocation(
     monkeypatch, model_class, name, value
 ):
     config = small_config()
-    setattr(config, name, value)
+    object.__setattr__(config, name, value)
     rng = torch.get_rng_state().clone()
 
     def reject_allocation(*args, **kwargs):
@@ -172,7 +172,7 @@ def test_invalid_schedule_rejected_before_allocation(
     monkeypatch, model_class, name, value
 ):
     config = small_config()
-    setattr(config, name, value)
+    object.__setattr__(config, name, value)
     rng = torch.get_rng_state().clone()
 
     def reject_allocation(*args, **kwargs):
@@ -210,7 +210,7 @@ def test_output_geometry_rejected_before_allocation(
     monkeypatch, model_class, name, value
 ):
     config = small_config()
-    setattr(config, name, value)
+    object.__setattr__(config, name, value)
 
     def reject_allocation(*args, **kwargs):
         raise AssertionError("Invalid geometry must fail before embedding allocation")
@@ -606,7 +606,7 @@ def test_owned_router_matches_nontrivial_selection_and_gradients(hash_routing):
         if hash_routing:
             native.tid2eid.copy_(
                 torch.arange(config.vocab_size * 2).reshape(-1, 2)
-                % config.num_local_experts
+                % config.n_routed_experts
             )
         else:
             native.e_score_correction_bias.copy_(torch.tensor([-0.7, 0.2, 0.9, -0.1]))

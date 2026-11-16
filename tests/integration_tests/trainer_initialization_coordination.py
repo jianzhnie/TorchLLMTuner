@@ -25,6 +25,7 @@ from llmtuner.config.observability_config import MetricsConfig
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.config.training_config import TrainingConfig
 from llmtuner.trainer.runtime import assembly
+from llmtuner.trainer.runtime import batch as batch_runtime
 from llmtuner.trainer.trainer import Trainer
 
 
@@ -150,7 +151,7 @@ def main():
                 flush=True,
             )
         # No rank may enter checkpointer construction while another loader failed.
-        original_loader = assembly.build_training_dataloader
+        original_loader = batch_runtime.build_rank_dataloader
         closed = []
         failure = ValueError("injected dataloader construction failure")
 
@@ -160,7 +161,7 @@ def main():
             return SimpleNamespace(close=lambda: closed.append(True))
 
         with (
-            patch.object(assembly, "build_training_dataloader", build_loader),
+            patch.object(batch_runtime, "build_rank_dataloader", build_loader),
             patch.object(assembly, "build_checkpointer") as checkpointer,
         ):
             try:
@@ -174,7 +175,7 @@ def main():
                 raise AssertionError("asymmetric loader unexpectedly succeeded")
             checkpointer.assert_not_called()
         assert closed == ([True] if rank == 1 else [])
-        assert assembly.build_training_dataloader is original_loader
+        assert batch_runtime.build_rank_dataloader is original_loader
         dist.barrier()
         print(
             f"rank={rank}: loader failure coordinated and peer loader closed",
@@ -348,7 +349,9 @@ def main():
                         assert rank == failing_rank
                         if case == "invalid_type":
                             assert "must be an nn.Module" in str(error)
-                        elif case in ("overlapping_keys", "hook_overlapping_keys"):
+                        elif case == "overlapping_keys":
+                            assert "collides across model parts 0 and 1" in str(error)
+                        elif case == "hook_overlapping_keys":
                             assert "overlap at part 1" in str(error)
                         else:
                             assert "different expert process groups" in str(error)
@@ -356,7 +359,7 @@ def main():
                         assert rank != failing_rank
                         phase = (
                             "model state merge"
-                            if case in ("overlapping_keys", "hook_overlapping_keys")
+                            if case == "hook_overlapping_keys"
                             else "model preparation"
                         )
                         assert str(error) == (
@@ -384,7 +387,7 @@ def main():
 
             with (
                 patch.object(assembly, "build_lr_scheduler", build_scheduler),
-                patch.object(assembly, "build_training_dataloader") as loader,
+                patch.object(batch_runtime, "build_rank_dataloader") as loader,
             ):
                 try:
                     failed_constructor(config())

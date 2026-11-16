@@ -23,9 +23,9 @@ def make_plan(model: torch.nn.Module, *, degree: int = 2) -> ParallelPlan:
     )
     model.decoder_structure = DecoderStructure(
         decoder="decoder",
-        embedding="embedding",
+        embedding="decoder.embedding",
         blocks="decoder.layers",
-        norm="norm",
+        norm="decoder.norm",
         head="head",
         attention="self_attn",
     )

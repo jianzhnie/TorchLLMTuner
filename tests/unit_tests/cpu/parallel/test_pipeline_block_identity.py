@@ -26,7 +26,7 @@ class Decoder(nn.Module):
             first=first,
             last=last,
             hidden_size=4,
-            activation_dtype=next(self.parameters()).dtype,
+            activation_dtype=torch.float32,
         )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:

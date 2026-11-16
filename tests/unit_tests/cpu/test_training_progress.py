@@ -2,7 +2,7 @@
 
 import pytest
 
-from llmtuner.trainer.runtime.progress import TrainingProgress
+from llmtuner.trainer.runtime.results import TrainingProgress
 
 
 def test_progress_load_preserves_native_keys_and_identity() -> None:

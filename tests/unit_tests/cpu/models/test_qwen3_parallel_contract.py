@@ -41,10 +41,10 @@ def test_qwen3_ep_never_uses_legacy_structure_or_source_probes(monkeypatch):
     assert routing.shared is None
     assert packed.gate_up is block.experts.gate_up_proj
 
-    assert swap_moe_blocks(model.model) == 1
-    plan = model.model.ep_parallel_plan
+    assert swap_moe_blocks(model) == 1
+    plan = model.ep_parallel_plan
     assert plan.stage == "ep"
-    assert plan.targets[0].path == "layers.0.mlp"
+    assert plan.targets[0].path == "model.layers.0.mlp"
     assert plan.targets[0].module is block
     assert plan.targets[0].layout == "fused_gate_up"
 

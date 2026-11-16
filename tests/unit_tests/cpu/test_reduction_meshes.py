@@ -1,11 +1,13 @@
 """Train and validation mesh ownership, without constructing process groups."""
 
 from itertools import product
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from llmtuner.trainer.runtime.reductions import (
+    logical_tokens_per_rank,
     resolve_loss_reduction_meshes,
     resolve_training_reduction_meshes,
 )
@@ -54,3 +56,17 @@ def test_single_process_requires_no_meshes():
     assert (meshes.dp_mesh, meshes.pp_mesh, meshes.loss_mesh, meshes.sequence_mesh) == (
         None,
     ) * 4
+
+
+@pytest.mark.parametrize(
+    ("cp", "tp", "expected"),
+    [(1, 1, 24), (2, 1, 12), (1, 3, 8), (2, 3, 4)],
+)
+def test_logical_token_count_removes_sequence_replicas(cp, tp, expected):
+    topology = SimpleNamespace(cp=cp, tp=tp, pp=4, ep=2)
+
+    assert logical_tokens_per_rank(24, topology) == expected
+
+
+def test_single_process_logical_token_count_is_unchanged():
+    assert logical_tokens_per_rank(24, None) == 24

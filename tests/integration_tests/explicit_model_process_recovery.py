@@ -50,7 +50,7 @@ def assert_equal(actual: Any, expected: Any, path: str = "state") -> None:
         assert actual.keys() == expected.keys(), path
         for key in expected:
             assert_equal(actual[key], expected[key], f"{path}.{key}")
-    elif isinstance(expected, (list, tuple)):
+    elif isinstance(expected, list | tuple):
         assert len(actual) == len(expected), path
         for i, (left, right) in enumerate(zip(actual, expected, strict=True)):
             assert_equal(left, right, f"{path}.{i}")

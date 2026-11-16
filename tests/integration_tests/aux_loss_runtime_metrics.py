@@ -77,7 +77,6 @@ def main():
             ),
             global_valid_tokens=torch.tensor(4),
             local_valid_tokens=4,
-            local_valid_tokens_tensor=torch.tensor(4),
             reduction_meshes=TrainingReductionMeshes(
                 dp_mesh=None, pp_mesh=mesh, loss_mesh=None, sequence_mesh=None
             ),

@@ -7,6 +7,7 @@ import torch
 
 import llmtuner.trainer.runtime.validation as validation_runtime
 from llmtuner.config.validation_config import ValidationConfig
+from llmtuner.trainer.runtime import batch as batch_runtime
 from llmtuner.trainer.runtime.batch import batch_generator, prepare_microbatch
 
 
@@ -44,7 +45,7 @@ def test_validation_loader_uses_explicit_batch_ownership(monkeypatch, steps):
         calls.append((config, kwargs))
         return loader
 
-    monkeypatch.setattr(validation_runtime, "build_dataloader", build)
+    monkeypatch.setattr(batch_runtime, "build_dataset_dataloader", build)
     validation = ValidationConfig(steps=steps)
     assert (
         validation_runtime.create_validation_dataloader(cfg, topology, validation)

@@ -38,7 +38,7 @@ def test_projection_initialization_matches_whole_model_reference(
 
     def guarded(self, module):
         if isinstance(
-            module, (nn.Linear, nn.Embedding, nn.Conv1d, Qwen3_5MoeTextRotaryEmbedding)
+            module, nn.Linear | nn.Embedding | nn.Conv1d | Qwen3_5MoeTextRotaryEmbedding
         ):
             pytest.fail("Explicit text initialization delegated to reference")
         return original(self, module)

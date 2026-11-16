@@ -83,7 +83,7 @@ def test_owned_gdn_cached_single_and_chunk_continuation_without_delegation(monke
 
 
 @pytest.mark.parametrize("construction_device", ["cpu", "meta"])
-def test_cpu_gdn_ignores_installed_cuda_only_extensions(
+def test_cpu_gdn_ignores_obsolete_cuda_extension_hooks(
     monkeypatch, construction_device
 ):
     config = text_config(Qwen3_5MoeForCausalLM.config_class)
@@ -105,12 +105,10 @@ def test_cpu_gdn_ignores_installed_cuda_only_extensions(
     monkeypatch.setattr(torch.cuda, "current_device", forbidden)
     for name in (
         "FusedRMSNormGated",
-        "causal_conv1d_fn",
-        "causal_conv1d_update",
         "chunk_gated_delta_rule",
         "fused_recurrent_gated_delta_rule",
     ):
-        monkeypatch.setattr(reference_kernels, name, forbidden)
+        monkeypatch.setattr(reference_kernels, name, forbidden, raising=False)
     with torch.device(construction_device):
         actual = Qwen3_5MoeGatedDeltaNet(config, 0)
     if construction_device == "meta":

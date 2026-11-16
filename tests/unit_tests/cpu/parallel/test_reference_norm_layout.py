@@ -7,7 +7,7 @@ from llmtuner.models.common.gradient_norm import (
     packed_expert_reference_norm_group,
     qkv_reference_norm_group,
 )
-from llmtuner.trainer.runtime.reference_norm_layout import (
+from llmtuner.trainer.runtime.gradients import (
     clip_grad_norm_,
     reference_norm_gradients,
 )

@@ -342,7 +342,7 @@ def test_dense_evaluation_preserves_context_and_injected_loss():
         assert not torch.is_grad_enabled()
         assert not kwargs
         calls.append("loss")
-        return cross_entropy_loss(logits.flatten(0, 1), targets.flatten()) * 2
+        return cross_entropy_loss(logits, targets) * 2
 
     model.prepare_inputs = prepare
     with torch.no_grad():
