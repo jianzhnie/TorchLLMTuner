@@ -7,7 +7,7 @@
 
 默认保留 93 层及全部专家、隐藏维度和注意力配置，采用 BF16、FSDP、full AC、
 Host-backed optimizer 状态及同步 DCP。完整模型约 2.78T 参数，已记录 8 卡
-完整结构 OOM。当前复测中，四层纯 FSDP 在单层 all-gather 额外申请 55.48GiB
+完整结构 OOM。2026-11-09 复测中，四层纯 FSDP 在单层 all-gather 额外申请 55.48GiB
 时 OOM，四层 EP8 在反向 reduce-scatter 额外申请 13.78GiB 时 OOM。
 旧两层 EP8 独立恢复虽退出0，但第52步起数值偏离，恢复验收失败；原因是
 同步 DCP 对 virtual moment 局部视图读写零值。修复后重新生成检查点，连续100步
@@ -33,7 +33,7 @@ export OUTPUT_PATH=/tmp/kimi-k3-run
 隔离环境需要 torch-npu、tiktoken、Triton-Ascend 和
 `triton_ascend_kernels.attention.fla.kda`。KDA 源码按 FSDPTurbo 的 Atlas A2/A3
 说明选择 A2/A3 适用实现。历史运行使用 commit `66be562e4e9cec7f03c8088de399dad1d08bdc38`；
-当前复测固定本地源码 commit `7acb9c40a6ca827e885d902b7eaee5d45457b230`，
+2026-11-09 复测固定本地源码 commit `7acb9c40a6ca827e885d902b7eaee5d45457b230`，
 以显式 `PYTHONPATH` 加载，配合离线 Triton-Ascend 3.2.1。
 该源码的旧依赖声明不能作为当前软件栈已兼容的证据，须以实际运行验证。
 缺失依赖会在 Trainer 分配模型参数前明确报错，不会回退 CPU recurrence。
@@ -46,8 +46,10 @@ bash examples/kimi_k3/train.sh --layers 2 --ep 8 --steps 100 \
   --sequence-length 2048 --batch 8 --checkpoint-interval 50
 ```
 
-拓扑参数为 `--dp-shard`、`--dp-replicate`、`--tp`、`--ep`、`--pp`、`--cp`；
+拓扑参数为 `--dp-shard`、`--dp-replicate`、`--tp`、`--ep`、`--cp`；
 多节点使用 `NNODES`、`NODE_RANK`、`MASTER_ADDR`、`MASTER_PORT`。`--ac` 配置
 重计算，`--compile-backend none|aot_eager|inductor` 配置编译，`--load-step`
 恢复 checkpoint。选项暴露不等于组合已经验收，现有能力检查会拒绝不支持的组合。
 运行证据与失败记录见 [NPU验收记录](../../docs/npu_acceptance_20261109.md)。
+PP 已迁至 [实验目录](../../experiments/pipeline_parallel/README.md)，
+此训练入口不提供 PP 参数。

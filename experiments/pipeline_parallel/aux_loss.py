@@ -73,5 +73,3 @@ def collect_aux_loss_metrics(
                 continue
         metrics[f"{tag}/mean"] = float(total.item()) / count
     return metrics
-
-

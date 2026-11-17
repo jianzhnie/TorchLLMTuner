@@ -78,13 +78,13 @@ from llmtuner.models.common.attention import (
     build_dense_attention_mask,
     temporary_attention_mask,
 )
-from llmtuner.models.common.linear import build_lm_head
 from llmtuner.models.common.gradient_norm import (
     ReferenceNormGroup,
     packed_expert_reference_norm_group,
     qkv_reference_norm_group,
 )
 from llmtuner.models.common.input_preparation import prepare_text_inputs
+from llmtuner.models.common.linear import build_lm_head
 from llmtuner.models.common.moe.layer import collect_moe_layers
 from llmtuner.models.configuration import (
     configure_reference_experts,
