@@ -47,11 +47,12 @@ def main() -> None:
         caught = None
         try:
             apply_ep(model, cfg, ep_group=dist.group.WORLD)
-        except (UnsupportedCombinationError, RuntimeError) as error:
+        except (TypeError, RuntimeError) as error:
             caught = error
         assert caught is not None
         if rank == 0:
-            assert isinstance(caught, UnsupportedCombinationError)
+            assert isinstance(caught, TypeError)
+            assert "model-owned decoder_structure" in str(caught)
         else:
             assert "EP assembly validation failed on another rank" in str(caught)
         for invalid_option in ("dispatcher", "pre_down"):

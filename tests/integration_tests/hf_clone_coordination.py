@@ -24,10 +24,8 @@ from torch.distributed.tensor import (
 )
 from torch.distributed.tensor.debug import CommDebugMode
 
-from llmtuner.components.checkpointer.model_state import (
-    ModelStateDictAdapter,
-    clone_local_state_tensor,
-)
+from llmtuner.accelerator.tensor_tree import clone_local_tensor
+from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
 
 
 def main() -> None:
@@ -44,7 +42,7 @@ def main() -> None:
                 else distribute_tensor(dense, mesh, [placement])
             )
             with CommDebugMode() as communication:
-                cloned = clone_local_state_tensor(tensor)
+                cloned = clone_local_tensor(tensor)
             assert communication.get_total_counts() == 0
             assert cloned.placements == tensor.placements
             assert cloned.shape == tensor.shape

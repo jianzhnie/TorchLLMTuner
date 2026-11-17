@@ -11,10 +11,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from llmtuner.models.common.moe.experts import GroupedExperts
 from llmtuner.models.common.linear import RouterGateLinear
+from llmtuner.models.common.moe.experts import GroupedExperts
 from llmtuner.models.common.moe.routing import TokenChoiceTopKRouter
-
 
 # -- RouterGateLinear --------------------------------------------------------
 

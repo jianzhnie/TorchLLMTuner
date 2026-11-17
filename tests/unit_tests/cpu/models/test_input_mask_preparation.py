@@ -126,7 +126,7 @@ def test_preserved_rows_rebind_packed_mask_and_metadata(monkeypatch):
 
     def observed(positions, **kwargs):
         calls.append(positions.numel())
-        assert positions.numel() == 4
+        assert positions.shape == (2, 4)
         return build_mask(positions, **kwargs)
 
     monkeypatch.setattr(input_preparation, "build_dense_attention_mask", observed)
@@ -144,7 +144,7 @@ def test_preserved_rows_rebind_packed_mask_and_metadata(monkeypatch):
     )
     assert inputs.shape == labels.shape == (8,)
     assert extra["input_batch_shape"] == (2, 4)
-    assert calls == [4, 4]
+    assert calls == [8]
     assert torch.equal(extra["positions"], positions)
     assert torch.equal(extra["padding_mask"], padding)
     mask = extra["attention_masks"]

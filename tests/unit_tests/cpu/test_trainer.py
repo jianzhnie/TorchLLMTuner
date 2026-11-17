@@ -2248,7 +2248,6 @@ def test_clip_norm_counts_shared_parameter_across_model_parts_once(
     monkeypatch, precision, has_expert_gradients
 ):
     from llmtuner.trainer.runtime import gradients
-    from llmtuner.trainer.runtime.reductions import TrainingReductionMeshes
 
     shared = nn.Parameter(torch.zeros(1))
     first = nn.Module()
@@ -2309,7 +2308,6 @@ def test_clip_norm_counts_shared_parameter_across_model_parts_once(
         expert_reduce_layout="storage",
         step=7,
         error_group=expected_group,
-        reduction_meshes=TrainingReductionMeshes(None, None, None),
         loss_is_finite=torch.ones((), dtype=torch.int32),
     )
     assert len(captured["parameters"]) == (1 if precision == "float32" else 3)
@@ -3346,3 +3344,56 @@ def test_batch_transfer_moves_nested_inputs_without_mutating_host_batch():
     assert batch["input"].device.type == "cpu"
     assert batch["media"][0]["frames"][0].pixels.device.type == "cpu"
     assert batch["media"][1].device.type == "cpu"
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
+def test_close_retains_optimizer_dependents_until_fsdp_communication_drains(failure):
+    trainer = Trainer.__new__(Trainer)
+    calls = []
+    error = failure("communication drain interrupted")
+
+    def drain():
+        calls.append("communication")
+        if calls.count("communication") == 1:
+            raise error
+
+    trainer.fsdp_communication_resources = SimpleNamespace(close=drain)
+    for name in (
+        "checkpointer",
+        "activation_swap_resources",
+        "metrics",
+        "dataloader",
+        "ema",
+        "lr_scheduler",
+        "optimizer",
+        "gc_handler",
+    ):
+        setattr(
+            trainer, name, SimpleNamespace(close=lambda name=name: calls.append(name))
+        )
+    retained = {
+        name: getattr(trainer, name)
+        for name in ("activation_swap_resources", "ema", "optimizer")
+    }
+    with pytest.raises(failure) as caught:
+        trainer.close()
+    assert caught.value is error
+    assert calls == [
+        "checkpointer",
+        "communication",
+        "metrics",
+        "dataloader",
+        "lr_scheduler",
+        "gc_handler",
+    ]
+    assert all(getattr(trainer, name) is owner for name, owner in retained.items())
+    trainer.close()
+    trainer.close()
+    assert calls[6:] == [
+        "communication",
+        "activation_swap_resources",
+        "ema",
+        "optimizer",
+    ]
+    assert trainer.fsdp_communication_resources is None
+    assert all(getattr(trainer, name) is None for name in retained)

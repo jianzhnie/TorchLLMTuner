@@ -1,6 +1,5 @@
 """Coordinate rank-local custom FSDP import failures after mesh construction."""
 
-import argparse
 import importlib
 from dataclasses import replace
 
@@ -15,8 +14,6 @@ from tests.integration_tests.harness import init_distributed
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    args = parser.parse_args()
     init_distributed()
     module = importlib.import_module(
         "llmtuner.parallel.fully_shard_parallel.fully_shard_parallel"
@@ -24,7 +21,7 @@ def main():
     original = module.load_custom_fsdp_engine
     try:
         world_size = dist.get_world_size()
-        assert world_size == 2 * args.pp_size
+        assert world_size == 2
         rank = dist.get_rank()
         cfg = ParallelConfig(
             data_parallel_shard_size=2,
@@ -57,7 +54,7 @@ def main():
         module.load_custom_fsdp_engine = lambda: None
         module.validate_fsdp_environment(cfg, dims)
         # Native assembly must not acquire the optional import or a new
-        # coordination collective, even with active DP and pipeline meshes.
+        # coordination collective, with an active DP mesh.
         module.load_custom_fsdp_engine = resolve
         native = replace(cfg, fsdp_config=FSDPConfig(fsdp_implementation="native"))
         with CommDebugMode() as debug:

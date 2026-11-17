@@ -49,7 +49,22 @@ def test_explicit_qwen_tp_resolution_never_probes_hf_layouts(ep_degree):
     # A contract on an unrelated child does not grant it decoder ownership.
     model.unowned = nn.Module()
     model.unowned.moe_contract = model.layers[0].mlp.moe_contract
+    model.eval()
+    tokens = torch.tensor([[1, 3, 7, 2]])
+    with torch.no_grad():
+        logits = model(tokens, use_cache=False).logits.clone()
     parameters = tuple(model.parameters())
+    buffers = tuple(model.buffers())
+    state = {name: value.clone() for name, value in model.state_dict().items()}
+    storage = [
+        (value, value.untyped_storage().data_ptr(), value.clone())
+        for value in (*parameters, *buffers)
+    ]
+    modules = tuple(model.named_modules())
+    forwards = [
+        (module, getattr(module.forward, "__func__", module.forward))
+        for _, module in modules
+    ]
     rng = torch.get_rng_state().clone()
 
     plan = resolve_tp_plan(
@@ -66,7 +81,19 @@ def test_explicit_qwen_tp_resolution_never_probes_hf_layouts(ep_degree):
         for target in plan.targets
     )
     assert all(a is b for a, b in zip(parameters, model.parameters(), strict=True))
+    assert all(a is b for a, b in zip(buffers, model.buffers(), strict=True))
+    assert tuple(model.named_modules()) == modules
     assert torch.equal(rng, torch.get_rng_state())
+    for value, pointer, original in storage:
+        assert value.untyped_storage().data_ptr() == pointer
+        torch.testing.assert_close(value, original, rtol=0, atol=0)
+    for module, forward in forwards:
+        assert getattr(module.forward, "__func__", module.forward) is forward
+    torch.testing.assert_close(model.state_dict(), state, rtol=0, atol=0)
+    with torch.no_grad():
+        torch.testing.assert_close(
+            model(tokens, use_cache=False).logits, logits, rtol=0, atol=0
+        )
 
 
 @pytest.mark.parametrize("ep_degree", [1, 2])

@@ -247,7 +247,7 @@ def test_owned_csa_preserves_empty_slots_and_indexer_mask(monkeypatch, sequence)
         for parameter in native.parameters():
             parameter.normal_(std=0.2)
     owned.load_state_dict(native.state_dict(), strict=True)
-    hidden = torch.randn(2, sequence, config.hidden_size)
+    hidden = torch.randn(2, sequence, config.hidden_size, requires_grad=True)
     residual = torch.randn(2, sequence, config.q_lora_rank)
     positions = torch.arange(sequence).unsqueeze(0).expand(2, -1)
     expected = native(hidden, residual, positions, None, 0)
@@ -265,6 +265,18 @@ def test_owned_csa_preserves_empty_slots_and_indexer_mask(monkeypatch, sequence)
         assert actual[0].isfinite().all() and actual[0].count_nonzero()
         assert actual[1][:, :, 0].isneginf().all()
         assert (actual[1][:, :, -1] == 0).any()
+
+        probe = torch.randn_like(actual[0])
+        observed_gradients = torch.autograd.grad(
+            actual[0], (hidden, *owned.parameters()), probe, allow_unused=True
+        )
+        reference_gradients = torch.autograd.grad(
+            expected[0], (hidden, *native.parameters()), probe, allow_unused=True
+        )
+        for observed, baseline in zip(
+            observed_gradients, reference_gradients, strict=True
+        ):
+            torch.testing.assert_close(observed, baseline, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("sequence", [1, 7])

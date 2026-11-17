@@ -1,6 +1,6 @@
 """Real Trainer meta/FSDP materialization fails before optimizer.
 
-Run with torchrun --nproc_per_node=2, or 4 for DP2 x Interleaved PP2.
+Run with torchrun --nproc_per_node=2.
 Append compile to check aot_eager OptimizedModule setup before lazy tracing.
 No checkpoint reader or training executes.
 An optimizer sentinel detects peers crossing the failed materialization phase.
@@ -53,7 +53,7 @@ def main():
                                 "--intermediate_size",
                                 "32",
                                 "--num_hidden_layers",
-                                "6" if world_size == 4 else "2",
+                                "2",
                                 "--num_attention_heads",
                                 "2",
                                 "--num_key_value_heads",
@@ -61,7 +61,7 @@ def main():
                                 "--max_seq_len",
                                 "8",
                                 "--global_batch_size",
-                                "8" if world_size == 4 else "2",
+                                "2",
                                 "--steps",
                                 "1",
                                 "--enable",

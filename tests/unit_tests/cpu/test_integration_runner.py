@@ -18,6 +18,7 @@ def test_discovery_excludes_support_modules_without_dropping_runnable_scripts():
             "alignment_history.py",
             "alignment_module_trace.py",
             "harness.py",
+            "checkpoint_scenarios.py",
             "npu_trainer_alignment_config.py",
         }
     )

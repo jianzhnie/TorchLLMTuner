@@ -933,7 +933,7 @@ def verify_source_identity(contract: dict) -> dict:
         file_hash(Path(build_config.__code__.co_filename)) == contract["recipe_sha256"]
     )
     return {
-        "source_contract_version": 2,
+        "source_contract_version": contract["source_contract_version"],
         "verified": True,
         "contract_sha256": hashlib.sha256(
             json.dumps(contract, sort_keys=True).encode()
@@ -973,54 +973,16 @@ def source_contract(args: argparse.Namespace) -> dict:
     }
     assert tokenizer, "Missing original tokenizer assets"
     root = Path(__file__).resolve().parents[2]
-    numerical_sources = (
-        "llmtuner/models/hf/attention_backend.py",
-        "llmtuner/parallel/expert_parallel/token_dispatch.py",
-        "llmtuner/models/hf/expert_kernels.py",
-        "llmtuner/models/qwen3_5/experts.py",
-        "llmtuner/models/hf/gdn_numerics.py",
-        "llmtuner/models/qwen3_5/gdn_numerics.py",
-        "llmtuner/models/hf/padding_metadata.py",
-        "llmtuner/models/qwen/qwen3_5/padding_metadata.py",
-        "llmtuner/models/common/linear.py",
-        "llmtuner/models/qwen/qwen3/qkv_projection.py",
-        "llmtuner/models/qwen3_5/rotary.py",
-        "llmtuner/models/qwen/qwen3/normalization_setup.py",
-        "llmtuner/models/qwen/qwen3/normalization.py",
-        "llmtuner/models/qwen/qwen3/residual_normalization.py",
-        "llmtuner/models/hf/linear_attention.py",
-        "llmtuner/models/qwen3_5/linear_attention.py",
-        "llmtuner/models/hf/model.py",
-        "llmtuner/models/hf/model_setup.py",
-        "llmtuner/models/hf/materialization.py",
-        "llmtuner/models/hf/state_dict_adapter.py",
-        "llmtuner/accelerator/collectives.py",
-        "llmtuner/parallel/fully_shard_parallel/fully_shard_parallel.py",
-        "llmtuner/parallel/fully_shard_parallel/plan.py",
-        "llmtuner/parallel/fully_shard_parallel/policies.py",
-        "llmtuner/trainer/runtime/assembly.py",
-        "llmtuner/trainer/runtime/batch.py",
-        "llmtuner/trainer/runtime/reductions.py",
-        "llmtuner/trainer/runtime/gradients.py",
-        "llmtuner/components/loss.py",
-        "llmtuner/components/optimizer/optimizer.py",
-        "llmtuner/memory/activation_checkpoint.py",
-        "llmtuner/components/checkpointer/core/base.py",
-        "llmtuner/components/checkpointer/core/random_state.py",
-        "llmtuner/components/checkpointer/backends/distributed_checkpoint.py",
-        "llmtuner/datasets/dataloader.py",
-    )
-    # Capture complete local behavior trees, including transitive data/runtime
-    # helpers, rather than only the public entry files.
-    source_paths = set(numerical_sources)
-    source_paths.update(
+    # Hash the complete framework tree. A hand-maintained subset is redundant
+    # and retains invalid paths after module deletion or relocation.
+    source_paths = {
         str(path.relative_to(root)) for path in (root / "llmtuner").rglob("*.py")
-    )
+    }
     helper_hashes = {name: file_hash(root / name) for name in sorted(source_paths)}
     import_sources = hf_source_paths()
     external_hashes = {name: file_hash(path) for name, path in import_sources.items()}
     return {
-        "source_contract_version": 2,
+        "source_contract_version": 3,
         "resolved_attention_backend": "sdpa",
         "hf_sources_sha256": external_hashes,
         "horizon": 100,

@@ -1,16 +1,14 @@
 """Real compressor CP Trainer checkpoint full/resume on CPU/Gloo ranks.
 
 Run each phase with torchrun --nproc_per_node=2, arguments: full|resume workdir.
-Reuses strict pre-update state and continued-training checks from the PP harness.
-Set LLMTUNER_TEST_PP_SIZE=1 LLMTUNER_TEST_EMA=dynamic in both phases.
+Checks complete loaded state and continued training using the current snapshot oracle.
 CP2/DP1 by default; set LLMTUNER_TEST_HCA_DP_SIZE=2 and world size 4
 for FSDP2. Set LLMTUNER_TEST_CSA=1 to append CSA and
 LLMTUNER_TEST_SLIDING=1 to prepend sliding attention. All-HCA by default;
-TP/PP/EP1 and AC/compile disabled.
+TP/EP1 and AC/compile disabled.
 """
 
 import os
-from unittest.mock import patch
 
 from llmtuner.config.model_config import ModelConfig
 from llmtuner.config.parallel_config import (
@@ -18,15 +16,11 @@ from llmtuner.config.parallel_config import (
     FSDPConfig,
     ParallelConfig,
 )
-from tests.integration_tests import pp_checkpoint_equivalence as harness
-
-base_config = harness._cfg
+from tests.integration_tests.checkpoint_scenarios import VOCAB, build_config, run_phase
 
 
-def config(workdir, *, packed=False):
-    if packed:
-        raise ValueError("HCA Trainer scenario requires unpacked input")
-    cfg = base_config(workdir, packed=False)
+def config(workdir):
+    cfg = build_config(workdir)
     mixed = os.environ.get("LLMTUNER_TEST_CSA") == "1"
     layers = ["heavily_compressed_attention"]
     if mixed:
@@ -35,7 +29,7 @@ def config(workdir, *, packed=False):
         layers.insert(0, "sliding_attention")
     cfg.model = ModelConfig(
         model_name_or_path="deepseek_v4",
-        vocab_size=harness.VOCAB,
+        vocab_size=VOCAB,
         hidden_size=16,
         intermediate_size=16,
         num_hidden_layers=len(layers),
@@ -74,9 +68,13 @@ def config(workdir, *, packed=False):
         ),
         cp_config=ContextParallelConfig(context_parallel_strategy="ulysses"),
     )
+    # CP preserves one row per microbatch; accumulation keeps the global batch.
+    cfg.training.gradient_accumulation_steps = (
+        cfg.training.global_batch_size // cfg.parallel.data_parallel_shard_size
+    )
+    cfg.training.global_batch_size = cfg.parallel.data_parallel_shard_size
     return cfg
 
 
 if __name__ == "__main__":
-    with patch.object(harness, "_cfg", config):
-        harness.main()
+    run_phase(config)

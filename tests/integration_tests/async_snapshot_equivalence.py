@@ -7,13 +7,12 @@ Run full/resume in separate two-rank torchrun invocations with a shared WORKDIR:
     PYTHONPATH=. torchrun --nproc_per_node=2 \
         tests/integration_tests/async_snapshot_equivalence.py resume WORKDIR
 
-Uses the explicit Qwen3 Trainer/AdamW/EMA recovery oracle with PP1/FSDP2. Staging
+Uses the explicit Qwen3 Trainer/AdamW/EMA recovery oracle with native FSDP. Staging
 is held until the manager's staging wait, exposing forward-buffer races without
 timing assumptions. Real DefaultStager shared CPU copies and PROCESS uploads
 are used. Pinning/nonblocking device copies are disabled; no device guarantee.
 """
 
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
@@ -29,7 +28,7 @@ from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
 )
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.trainer.trainer import Trainer
-from tests.integration_tests.pp_checkpoint_equivalence import _run
+from tests.integration_tests.checkpoint_scenarios import build_config, run_phase
 
 
 class DelayedCPUStager:
@@ -79,11 +78,13 @@ class DelayedCPUStager:
         self.closed = True
 
 
+def config(workdir):
+    cfg = build_config(workdir)
+    cfg.checkpoint.async_mode = "async_with_pinned_mem"
+    return cfg
+
+
 def main():
-    if os.environ.get("LLMTUNER_TEST_PP_SIZE", "1") != "1":
-        raise ValueError("The mutable root-buffer scenario requires PP1")
-    os.environ["LLMTUNER_TEST_PP_SIZE"] = "1"
-    os.environ["LLMTUNER_TEST_ASYNC_MODE"] = "async_with_pinned_mem"
     stagers: list[DelayedCPUStager] = []
 
     def make_stager(options):
@@ -126,7 +127,7 @@ def main():
             DistributedCheckpointManager, "_maybe_wait_for_staging", release_staging
         ),
     ):
-        _run()
+        run_phase(config)
     if sys.argv[1] == "full":
         assert len(stagers) >= 2, "Expected manager-owned stager replacement"
         assert any(count > 0 for stager in stagers for count in stager.counts), (

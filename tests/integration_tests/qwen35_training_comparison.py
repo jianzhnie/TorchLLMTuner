@@ -242,11 +242,12 @@ def scalar(value):
 
 
 def validate_source_evidence(root, contract, complete):
-    if contract.get("source_contract_version", 1) != 2:
+    version = contract.get("source_contract_version", 1)
+    if version not in (2, 3):
         return
     loaded = read_json(root / "loaded-source-identity.json")
     expected = {
-        "source_contract_version": 2,
+        "source_contract_version": version,
         "verified": True,
         "contract_sha256": hashlib.sha256(
             json.dumps(contract, sort_keys=True).encode()
@@ -264,12 +265,12 @@ def validate_source_evidence(root, contract, complete):
 
 def validate_contract(contract, *, allow_legacy=False):
     version = contract.get("source_contract_version", 1)
-    require(version in (1, 2), "Unknown source contract version")
+    require(version in (1, 2, 3), "Unknown source contract version")
     require(
-        version == 2 or allow_legacy,
+        version in (2, 3) or allow_legacy,
         "Legacy source coverage requires --allow-legacy-source-contract",
     )
-    if version == 2:
+    if version in (2, 3):
         require(
             contract.get("resolved_attention_backend") == "sdpa",
             "Expected resolved SDPA",
@@ -278,11 +279,21 @@ def validate_contract(contract, *, allow_legacy=False):
             bool(contract.get("hf_sources_sha256")), "Missing actual HF source hashes"
         )
         required = {
-            "llmtuner/models/hf/attention_backend.py",
-            "llmtuner/models/hf/padding_metadata.py",
-            "llmtuner/models/qwen/qwen3_5/padding_metadata.py",
+            "llmtuner/models/qwen/qwen3_5_moe/model.py",
+            "llmtuner/models/qwen/qwen3_5_moe/gated_delta.py",
+            "llmtuner/models/qwen/qwen3_5_moe/rotary.py",
+            "llmtuner/models/common/input_preparation.py",
+            "llmtuner/models/common/linear.py",
             "llmtuner/parallel/expert_parallel/token_dispatch.py",
         }
+        if version == 2:
+            # Historical contracts describe the pre-owned-model source layout.
+            required = {
+                "llmtuner/models/hf/attention_backend.py",
+                "llmtuner/models/hf/padding_metadata.py",
+                "llmtuner/models/qwen/qwen3_5/padding_metadata.py",
+                "llmtuner/parallel/expert_parallel/token_dispatch.py",
+            }
         require(
             required <= contract["numerical_sources_sha256"].keys(),
             "Incomplete source coverage",
@@ -1097,7 +1108,7 @@ def main():
     parser.add_argument(
         "--allow-legacy-source-contract",
         action="store_true",
-        help="Allow old partial coverage; no v2 provenance claim",
+        help="Allow legacy partial coverage without full source provenance",
     )
     parser.add_argument("--candidate-resume", type=Path)
     parser.add_argument("--reference-resume", type=Path)
@@ -1110,9 +1121,9 @@ def main():
     report = {
         "legacy_source_contract_allowed": args.allow_legacy_source_contract,
         "source_provenance_scope": (
-            "legacy partial coverage allowed; no v2 provenance claim"
+            "legacy partial coverage allowed; full source provenance not required"
             if args.allow_legacy_source_contract
-            else "v2 load/completion source verification"
+            else "versioned load/completion source verification (v2 or v3)"
         ),
         "status": "ERROR",
         "passed": False,

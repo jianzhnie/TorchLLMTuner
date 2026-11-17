@@ -11,9 +11,9 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.models.common.aux_loss import AuxLoss
-from llmtuner.models.common.moe import layout
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.models.qwen.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
+from llmtuner.parallel.expert_parallel import bindings as layout
 from llmtuner.parallel.expert_parallel import model_replacement
 from llmtuner.parallel.expert_parallel import plan as ep_plan
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep

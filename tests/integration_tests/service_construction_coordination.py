@@ -5,6 +5,7 @@ Run with four ranks. Parameter planning or scheduler construction failure in
 still update weights.
 """
 
+from contextlib import ExitStack
 from datetime import timedelta
 from itertools import product
 from unittest.mock import patch
@@ -60,13 +61,22 @@ def main() -> None:
                 if phase == "parameters"
                 else build_scheduler
             )
-            with patch.object(owner, attribute, replacement):
+            services = {}
+            with ExitStack() as resources, patch.object(owner, attribute, replacement):
+
+                def retain(name, service, services=services, resources=resources):
+                    services[name] = service
+                    close = getattr(service, "close", None)
+                    if callable(close):
+                        resources.callback(close)
+
                 try:
                     stack = assembly.build_optimizer_stack(
                         LLMTunerConfig(),
                         model_parts=[model],
                         parallel_dims=None,
                         error_group=group,
+                        on_service_acquired=retain,
                     )
                 except ValueError as error:
                     assert rank == failing_rank and error is failure
@@ -79,6 +89,9 @@ def main() -> None:
                     stack.optimizer.step()
                     assert torch.isfinite(model.weight).all().item()
                     assert not torch.equal(model.weight, before)
+            assert "optimizer" in services
+            if phase == "scheduler" and rank != failing_rank:
+                assert "lr_scheduler" in services
             if rank < 2:
                 torch.testing.assert_close(model.weight, before, rtol=0, atol=0)
             dist.barrier()

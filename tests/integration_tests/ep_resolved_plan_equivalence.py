@@ -96,11 +96,11 @@ def main() -> None:
                 side_effect=AssertionError("EP execution rediscovered decoder slots"),
             ),
             patch(
-                "llmtuner.models.common.moe.layout.resolve_packed_experts",
+                "llmtuner.parallel.expert_parallel.bindings.resolve_packed_experts",
                 side_effect=AssertionError("EP execution rediscovered packed layout"),
             ),
             patch(
-                "llmtuner.models.common.moe.layout.resolve_moe_routing",
+                "llmtuner.parallel.expert_parallel.bindings.resolve_moe_routing",
                 side_effect=AssertionError("EP execution rediscovered routing"),
             ),
         ):

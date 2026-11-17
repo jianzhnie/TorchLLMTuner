@@ -8,12 +8,12 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.models.common.moe import layout
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM, Qwen3MoeSparseMoeBlock
 from llmtuner.models.qwen.qwen3_5_moe.model import (
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeSparseMoeBlock,
 )
+from llmtuner.parallel.expert_parallel import bindings as layout
 from llmtuner.parallel.expert_parallel import block_conversion
 from llmtuner.parallel.tensor_parallel.tensor_parallel import resolve_tp_plan
 from tests.unit_tests.cpu.models.test_qwen3_model_contract import model_config
@@ -52,7 +52,6 @@ def test_standalone_routing_resolves_without_inspection(family, monkeypatch):
                 routing,
                 tp_enabled=False,
                 quantile_balancing=False,
-                token_dispatcher="alltoall",
                 has_ep_group=False,
             )
     else:

@@ -11,7 +11,7 @@ from transformers import PretrainedConfig
 from llmtuner.errors import EnvironmentUnsupportedError
 from llmtuner.kernel.ops import kda
 from llmtuner.models.kimi.kimi_k3 import delta_attention
-from llmtuner.models.kimi.kimi_k3.configuration import KimiLinearConfig
+from llmtuner.models.kimi.kimi_k3.configuration import KimiK3Config, KimiLinearConfig
 
 
 def kda_config():
@@ -95,3 +95,32 @@ def test_cuda_provider_preserves_missing_dependency_cause(monkeypatch):
     with pytest.raises(EnvironmentUnsupportedError, match="fla.ops.kda") as exc:
         kda.require_kda_kernel(torch.device("cuda"))
     assert exc.value.__cause__ is cause
+
+
+@pytest.mark.parametrize("initialization_device", ["cpu", "meta"])
+@pytest.mark.parametrize("composite", [False, True], ids=["text", "multimodal"])
+def test_assembly_rejects_missing_kda_before_model_allocation(
+    monkeypatch, initialization_device, composite
+):
+    from llmtuner.config import LLMTunerConfig, ModelConfig
+    from llmtuner.models.kimi.kimi_k3.model import KimiLinearForCausalLM
+    from llmtuner.trainer.runtime import assembly
+
+    config = kda_config()
+    if composite:
+        config = KimiK3Config(text_config=config)
+    cfg = LLMTunerConfig(
+        model=ModelConfig(
+            model_name_or_path="kimi_linear",
+            initialization_device=initialization_device,
+        )
+    )
+    monkeypatch.setattr(assembly, "build_model_config_for", lambda cfg: config)
+    monkeypatch.setattr(kda, "npu_chunk_kda", None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Missing KDA runtime reached model parameter allocation")
+
+    monkeypatch.setattr(KimiLinearForCausalLM, "__init__", forbidden)
+    with pytest.raises(EnvironmentUnsupportedError, match="triton_ascend_kernels"):
+        assembly.build_model(cfg, parallel_dims=None, device=torch.device("npu"))

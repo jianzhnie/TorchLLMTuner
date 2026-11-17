@@ -1,8 +1,11 @@
-"""Production TP2/EP2/FSDP2 assembly versus the direct ordered stage calls.
+"""Production TP/EP/FSDP assembly versus the direct ordered stage calls.
 
 Run on four ranks. Compares three updates with asymmetric inputs and two
 accumulation groups. Exact equality checks assembly-only changes; this is not
 an independent mathematical oracle or a performance benchmark.
+Use --tp-degree 1 for EP2/FSDP4 without a preceding TP transformation.
+Add --deterministic for a zero-tolerance check with deterministic device kernels;
+default non-deterministic accumulation can differ between repeated executions.
 """
 
 from argparse import ArgumentParser
@@ -28,6 +31,7 @@ from llmtuner.parallel.parallelize import parallelize_model
 from llmtuner.parallel.tensor_parallel.tensor_parallel import apply_tp
 from llmtuner.parallel.topology import ParallelTopology, build_device_mesh
 from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
+from llmtuner.utils.seeding import set_deterministic_algorithms
 from tests.integration_tests.harness import init_distributed
 
 
@@ -39,17 +43,21 @@ def local_tensor(value: torch.Tensor) -> torch.Tensor:
 def main() -> None:
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--ac", choices=("none", "full"), default="none")
+    parser.add_argument("--tp-degree", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--deterministic", action="store_true")
     args = parser.parse_args()
+    if args.deterministic:
+        set_deterministic_algorithms()
     device = init_distributed(timeout=timedelta(seconds=120))
     previous_checkpoint_device = DefaultDeviceType.get_device_type()
     DefaultDeviceType.set_device_type(device.type)
     try:
         if dist.get_world_size() != 4:
-            raise ValueError("This check requires four ranks for TP2/EP2/FSDP2")
+            raise ValueError("This check requires four ranks for EP2 with TP1 or TP2")
         cfg = ParallelConfig(
-            tensor_parallel_size=2,
+            tensor_parallel_size=args.tp_degree,
             expert_parallel_size=2,
-            data_parallel_shard_size=2,
+            data_parallel_shard_size=4 // args.tp_degree,
         )
         topology = ParallelTopology.from_config(cfg, dist.get_world_size())
         mesh = build_device_mesh(topology)
@@ -88,7 +96,9 @@ def main() -> None:
             for layer in model.layers:
                 experts = layer.mlp.routed_experts.inner_experts
                 assert experts.w1_EFD.shape[0] == 2
-                assert layer.self_attn.q_proj.weight.shape[0] == 16
+                assert layer.self_attn.q_proj.weight.shape[0] == (
+                    config.num_attention_heads * config.head_dim // args.tp_degree
+                )
         optimizers = [
             torch.optim.SGD(m.parameters(), lr=0.01, momentum=0.9, foreach=False)
             for m in (direct, planned)
@@ -159,7 +169,10 @@ def main() -> None:
                             msg=name,
                         )
                 if dist.get_rank() == 0:
-                    print(f"PASS: TP2/EP2/FSDP2 AC={args.ac} exact update {step + 1}")
+                    print(
+                        f"PASS: TP{args.tp_degree}/EP2/FSDP{4 // args.tp_degree} "
+                        f"AC={args.ac} exact update {step + 1}"
+                    )
             assert exchange.call_count > 0
     finally:
         try:

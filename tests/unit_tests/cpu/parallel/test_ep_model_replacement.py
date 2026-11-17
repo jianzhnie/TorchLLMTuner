@@ -51,6 +51,10 @@ from llmtuner.parallel.expert_parallel import (
     swap_moe_blocks,
 )
 from llmtuner.parallel.expert_parallel import plan as ep_plan
+from llmtuner.parallel.expert_parallel.bindings import (
+    resolve_moe_routing,
+    resolve_packed_experts,
+)
 from llmtuner.parallel.expert_parallel.block_conversion import (
     restore_fp32_state_buffers,
 )
@@ -1364,6 +1368,50 @@ def test_swap_preserves_moe_block_sharing_across_layers():
     torch.testing.assert_close(actual, expected, atol=TOL, rtol=TOL)
 
 
+def test_swap_preserves_shared_compute_modules_and_observer_hooks():
+    model = (
+        construct_test_model(
+            _config(norm_topk_prob=True, aux_coeff=0.0), explicit=False
+        )
+        .to(torch.float64)
+        .eval()
+    )
+    first, second = [layer.mlp for layer in model.layers]
+    second.experts = first.experts
+    second.gate = first.gate
+    first.experts.train()
+    first.gate.train()
+    source_experts, source_gate = first.experts, first.gate
+    ids, positions = _data()
+    with torch.no_grad():
+        expected = logits(model, ids, positions)
+    calls = []
+    mappings = {}
+
+    def observe(modules, parameters):
+        mappings.update(modules)
+        modules[source_experts].register_forward_hook(
+            lambda module, args, output: calls.append("experts")
+        )
+        modules[source_gate].register_forward_hook(
+            lambda module, args, output: calls.append("gate")
+        )
+
+    swap_moe_blocks(model, on_replacement=observe)
+    first, second = [layer.mlp for layer in model.layers]
+    assert first.routed_experts.inner_experts is second.routed_experts.inner_experts
+    assert first.router.gate is second.router.gate
+    assert mappings[source_experts] is first.routed_experts.inner_experts
+    assert mappings[source_gate] is first.router.gate
+    assert first.routed_experts.inner_experts.training
+    assert first.router.gate.training
+    assert first.router is not second.router
+    with torch.no_grad():
+        actual = logits(model, ids, positions)
+    torch.testing.assert_close(actual, expected, atol=TOL, rtol=TOL)
+    assert calls.count("experts") == calls.count("gate") == 2
+
+
 @pytest.mark.parametrize("projection", ["router", "gate_up_proj", "down_proj"])
 def test_swap_preserves_projection_sharing_and_accumulated_gradients(projection):
     reference = _model(_config(norm_topk_prob=True, aux_coeff=0.0))
@@ -1543,7 +1591,7 @@ def test_direct_swap_rejects_fixed_quantile_conflict_before_replacing_blocks():
     )
 
 
-def test_fixed_router_ep1_public_assembly_runs_constant_routing():
+def test_fixed_router_ep1_public_assembly_runs_constant_routing(monkeypatch):
     from llmtuner.config.parallel_config import ExpertParallelConfig, ParallelConfig
     from llmtuner.parallel.parallelize import parallelize_model
     from tests.integration_tests.fixed_router_ep_equivalence import explicit_reference
@@ -1555,6 +1603,11 @@ def test_fixed_router_ep1_public_assembly_runs_constant_routing():
     expected, _, _ = explicit_reference(
         reference.layers[0].mlp, inputs, torch.zeros(5, dtype=torch.bool)
     )
+
+    def unexpected_resolution(*args, **kwargs):
+        pytest.fail("EP execution repeated the unchanged global plan resolution")
+
+    monkeypatch.setattr(ep_plan, "resolve_ep_plan", unexpected_resolution)
     result = parallelize_model(
         target,
         cfg=ParallelConfig(ep_config=ExpertParallelConfig(fixed_router=True)),
@@ -1611,6 +1664,7 @@ def test_ancestor_checkpoint_registration_preserves_relative_paths(owner_kind):
     layer = model.layers[0]
     block = layer.mlp
     block.shared_expert = torch.nn.Linear(64, 64, bias=False, dtype=torch.float64)
+    block.moe_contract = replace(block.moe_contract, shared_expert="shared_expert")
     owner = {"model": model, "layer": layer, "block": block}[owner_kind]
     prefix = next(
         name + "." if name else ""
@@ -1634,7 +1688,7 @@ def test_ancestor_checkpoint_registration_preserves_relative_paths(owner_kind):
         f"{prefix}routed_experts.inner_experts.w3_EFD": (1, False, group),
         f"{prefix}routed_experts.inner_experts.w2_EDF": (2, False, group),
         f"{prefix}shared_experts.weight": (0, False, group),
-        f"{prefix}gate.weight": (0, False, group),
+        f"{prefix}router.gate.weight": (0, False, group),
     }
     assert layouts[f"{prefix}experts.gate_up_proj"] == (1, True, group)
 
@@ -1852,6 +1906,8 @@ def test_quantile_incompatibility_is_rejected_before_expert_allocation(monkeypat
     with pytest.raises(NotImplementedError, match="sigmoid"):
         block_conversion.convert_block(
             block,
+            routing=resolve_moe_routing(block),
+            packed_experts=resolve_packed_experts(block, degree=1),
             ep_group=None,
             aux_loss_coeff=1e-3,
             load_balance_coeff=None,

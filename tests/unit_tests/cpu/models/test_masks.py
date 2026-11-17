@@ -38,9 +38,7 @@ def test_dense_causal_mask_blocks_future_tokens() -> None:
         torch.arange(3), dtype=torch.float32, block_causal=False
     )
     expected = torch.tensor(
-        [[0.0, -torch.inf, -torch.inf],
-         [0.0, 0.0, -torch.inf],
-         [0.0, 0.0, 0.0]]
+        [[0.0, -torch.inf, -torch.inf], [0.0, 0.0, -torch.inf], [0.0, 0.0, 0.0]]
     )
     torch.testing.assert_close(mask[0, 0], expected, rtol=0, atol=0)
 
@@ -50,9 +48,11 @@ def test_dense_block_causal_mask_blocks_other_documents() -> None:
         torch.tensor([0, 1, 0, 1]), dtype=torch.float32, block_causal=True
     )
     expected = torch.tensor(
-        [[0.0, -torch.inf, -torch.inf, -torch.inf],
-         [0.0, 0.0, -torch.inf, -torch.inf],
-         [-torch.inf, -torch.inf, 0.0, -torch.inf],
-         [-torch.inf, -torch.inf, 0.0, 0.0]]
+        [
+            [0.0, -torch.inf, -torch.inf, -torch.inf],
+            [0.0, 0.0, -torch.inf, -torch.inf],
+            [-torch.inf, -torch.inf, 0.0, -torch.inf],
+            [-torch.inf, -torch.inf, 0.0, 0.0],
+        ]
     )
     torch.testing.assert_close(mask[0, 0], expected, rtol=0, atol=0)

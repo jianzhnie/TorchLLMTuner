@@ -10,7 +10,6 @@ from llmtuner.components.loss import cross_entropy_loss
 from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.trainer.runtime.engine import TrainingEngine
-from llmtuner.trainer.runtime.reductions import resolve_training_reduction_meshes
 from llmtuner.trainer.runtime.results import AccumulationResult, StepResult
 
 
@@ -341,7 +340,6 @@ def test_finish_step_matches_independent_clipped_update(
     update = engine.finish_step(
         1,
         accumulation=accumulation,
-        reduction_meshes=resolve_training_reduction_meshes(None),
         collect_metrics=collect_metrics,
         before_gradient_clipping=before_clipping,
     )
@@ -382,7 +380,6 @@ def test_finish_step_failure_does_not_advance_training_services(failure):
             accumulation=AccumulationResult(
                 None, torch.tensor(failure != "loss", dtype=torch.int32)
             ),
-            reduction_meshes=resolve_training_reduction_meshes(None),
             collect_metrics=False,
             before_gradient_clipping=before_clipping,
         )

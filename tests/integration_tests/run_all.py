@@ -85,6 +85,7 @@ def discover() -> list[Path]:
         "alignment_history.py",
         "alignment_module_trace.py",
         "harness.py",
+        "checkpoint_scenarios.py",
         "npu_trainer_alignment_config.py",
         "run_all.py",
     }

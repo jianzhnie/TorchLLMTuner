@@ -27,8 +27,22 @@ from llmtuner.models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.expert_parallel.token_dispatch import LocalTokenDispatcher
 from tests.integration_tests.harness import init_distributed
+
+
+def _model_part(moe: MoE) -> torch.nn.Module:
+    """Declare the same decoder/MoE ownership consumed by production hooks."""
+    layer = torch.nn.Module()
+    layer.moe_block_name = "mlp"
+    layer.mlp = moe
+    part = torch.nn.Module()
+    part.decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
+    )
+    part.layers = torch.nn.ModuleList([layer])
+    return part
 
 
 def main():
@@ -70,10 +84,7 @@ def main():
             totals = torch.stack(selected_counts).sum(0)
             delta = 0.05 * torch.sign(totals.mean() - totals)
             expected_bias = delta - delta.mean()
-            part = torch.nn.Module()
-            layer = torch.nn.Module()
-            layer.mlp = moe_sign
-            part.layers = torch.nn.ModuleList([layer])
+            part = _model_part(moe_sign)
             optimizer = OptimizersContainer(
                 OptimizerConfig(implementation="for-loop"), model_parts=[part]
             )
@@ -194,10 +205,7 @@ def main():
                 return estimate(histogram, bias)
 
             balancer.estimate_expert_bias = checked_estimate
-            layer_quantile = torch.nn.Module()
-            layer_quantile.mlp = moe
-            part_quantile = torch.nn.Module()
-            part_quantile.layers = torch.nn.ModuleList([layer_quantile])
+            part_quantile = _model_part(moe)
             optimizer_quantile = OptimizersContainer(
                 OptimizerConfig(implementation="for-loop"), model_parts=[part_quantile]
             )

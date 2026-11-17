@@ -380,6 +380,7 @@ def test_source_identity_actual_file_mutation_detected(tmp_path):
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
     contract = {
+        "source_contract_version": 3,
         "entry_sha256": digest(entry),
         "trainer_sha256": digest(trainer),
         "recipe_sha256": digest(recipe),

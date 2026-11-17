@@ -5,7 +5,6 @@ microbatches; its DP peer has four. Only one two-microbatch update may commit.
 The invalid phase checks coordinated rejection of a rank-zero corrupt cursor.
 """
 
-import os
 import sys
 from copy import deepcopy
 from itertools import islice
@@ -22,17 +21,13 @@ from llmtuner.config.model_config import ModelConfig
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.config.training_config import TrainingConfig
 from llmtuner.trainer.trainer import Trainer
-from tests.integration_tests.pp_checkpoint_equivalence import (
-    _compare_loaded_state,
-    _runtime_state,
-    _train_steps,
-)
+from tests.integration_tests.checkpoint_scenarios import train_steps
+from tests.integration_tests.cli_checkpoint_equivalence import assert_state_equal
+from tests.integration_tests.trainer_ema_process_resume import snapshot
 
 
 def main():
     phase, directory = sys.argv[1:]
-    os.environ["LLMTUNER_TEST_RNG_STATE"] = "1"
-    os.environ["LLMTUNER_TEST_LOADER_STATE"] = "1"
     cfg = LLMTunerConfig(
         model=ModelConfig(
             vocab_size=32,
@@ -41,6 +36,7 @@ def main():
             num_hidden_layers=1,
             num_attention_heads=2,
             num_key_value_heads=2,
+            arch_overrides={"head_dim": 8},
         ),
         parallel=ParallelConfig(data_parallel_shard_size=2),
         training=TrainingConfig(
@@ -72,12 +68,12 @@ def main():
                     assert trainer.step == 1
                     assert trainer.ntokens_seen == 24
                     assert loader.state_dict()["steps"][str(rank)] == 3 + rank
-                    torch.save(deepcopy(_runtime_state(trainer)), path)
+                    torch.save(deepcopy(snapshot(trainer)), path)
                     # Continue the same live runtime from the exhaustion boundary.
                     # Keep each rank's consumed cursor; do not replay discarded input.
-                    losses = _train_steps(trainer, iter(loader), 2)
+                    losses = train_steps(trainer, iter(loader), 2)
                     torch.save(
-                        {"state": deepcopy(_runtime_state(trainer)), "losses": losses},
+                        {"state": deepcopy(snapshot(trainer)), "losses": losses},
                         continuation,
                     )
                 original_close()
@@ -94,7 +90,7 @@ def main():
             if rank == 0:
                 saved["dataloader"]["steps"]["0"] = -1
             dcp.save(saved, checkpoint_id=checkpoint)
-            before = deepcopy(_runtime_state(trainer))
+            before = deepcopy(snapshot(trainer))
             error = None
             try:
                 trainer.checkpointer._load_checkpoint(
@@ -107,24 +103,17 @@ def main():
             assert error is not None, "Peer accepted a corrupt rank-local cursor"
             expected_error = "steps" if rank == 0 else "dataloader preflight validation"
             assert expected_error in str(error), str(error)
-            failures = []
-            _compare_loaded_state(_runtime_state(trainer), before, failures, "rejected")
-            assert not failures, failures
+            assert_state_equal(snapshot(trainer), before, "rejected")
             print(f"rank={rank}: invalid cursor rejected without mutation", flush=True)
         elif phase == "resume":
             expected = torch.load(path, weights_only=False)
             assert trainer.checkpointer.load(1)
-            failures = []
-            _compare_loaded_state(_runtime_state(trainer), expected, failures, "finite")
-            assert not failures, failures
+            assert_state_equal(snapshot(trainer), expected, "finite")
             print(f"rank={rank}: finite checkpoint complete state restored", flush=True)
             reference = torch.load(continuation, weights_only=False)
-            losses = _train_steps(trainer, iter(trainer.dataloader), 2)
-            _compare_loaded_state(
-                _runtime_state(trainer), reference["state"], failures, "continued"
-            )
+            losses = train_steps(trainer, iter(trainer.dataloader), 2)
+            assert_state_equal(snapshot(trainer), reference["state"], "continued")
             assert losses == reference["losses"], (losses, reference["losses"])
-            assert not failures, failures
             print(
                 f"rank={rank}: continued state and losses match: {losses}", flush=True
             )

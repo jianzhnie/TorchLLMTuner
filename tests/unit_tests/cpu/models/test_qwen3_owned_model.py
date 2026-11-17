@@ -26,14 +26,16 @@ from llmtuner.models.qwen.qwen3.model import (
 @pytest.mark.parametrize("tied", [False, True])
 @pytest.mark.parametrize("backend", ["eager", "sdpa"])
 @pytest.mark.parametrize("experts", [None, "eager"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_owned_qwen3_matches_reference_initialization_and_update(
-    tied, backend, experts, monkeypatch
+    tied, backend, experts, dtype, monkeypatch
 ):
     config = Qwen3MoeConfig(
         vocab_size=32,
         hidden_size=16,
         intermediate_size=24,
-        moe_intermediate_size=12,
+        # The automatic CPU grouped GEMM requires 16-byte BF16 strides.
+        moe_intermediate_size=16 if dtype == torch.bfloat16 else 12,
         num_hidden_layers=2,
         num_attention_heads=2,
         num_key_value_heads=1,
@@ -48,7 +50,7 @@ def test_owned_qwen3_matches_reference_initialization_and_update(
     config._experts_implementation = experts
     assert resolve_model_class(config) is Qwen3MoeForCausalLM
     torch.manual_seed(37)
-    expected = ReferenceModel(deepcopy(config))
+    expected = ReferenceModel(deepcopy(config)).to(dtype)
     reference_rng = torch.get_rng_state().clone()
 
     def forbidden(*args, **kwargs):
@@ -56,7 +58,7 @@ def test_owned_qwen3_matches_reference_initialization_and_update(
 
     monkeypatch.setattr(ReferencePreTrainedModel, "_init_weights", forbidden)
     torch.manual_seed(37)
-    actual = Qwen3MoeForCausalLM(deepcopy(config))
+    actual = Qwen3MoeForCausalLM(deepcopy(config)).to(dtype)
     assert (
         actual.config._experts_implementation == expected.config._experts_implementation
     )
@@ -78,6 +80,7 @@ def test_owned_qwen3_matches_reference_initialization_and_update(
         optimizer.step()
     assert torch.equal(outputs[0].logits, outputs[1].logits)
     assert torch.equal(outputs[0].loss, outputs[1].loss)
+    assert actual.model.layers[0].mlp.gate.weight.grad.count_nonzero() > 0
     for (name, reference), (_, owned) in zip(
         expected.named_parameters(), actual.named_parameters(), strict=True
     ):

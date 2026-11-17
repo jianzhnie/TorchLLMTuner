@@ -46,7 +46,7 @@ def test_profiler_factory_returns_unentered_owner_with_explicit_cleanup():
         cfg,
         global_step=7,
         base_folder="traces",
-        builders=TrainingBuilders(profiler=factory),
+        factory=factory,
     )
     assert result is owner
     assert calls == []
@@ -62,7 +62,7 @@ def test_profiler_factory_rejects_context_without_cleanup_owner():
             LLMTunerConfig().profiler,
             global_step=0,
             base_folder="",
-            builders=builders,
+            factory=builders.profiler,
         )
 
 
@@ -479,3 +479,87 @@ def test_trainer_retains_optimizer_when_construction_cleanup_needs_retry(monkeyp
     assert owner.optimizer is None
     assert len(attempts) == 3
     assert all(optimizer is attempts[0] for optimizer in attempts)
+
+
+def test_default_and_injected_optimizer_services_preserve_state_and_rng():
+    from copy import deepcopy
+
+    from llmtuner.config.ema_config import EMAConfig
+
+    cfg = LLMTunerConfig()
+    cfg.training.ema_config = EMAConfig(decay=0.75)
+    model = nn.Linear(3, 2)
+    models = [model, deepcopy(model)]
+    acquired = [[], []]
+    factory_calls = []
+    created = {}
+
+    def optimizer_factory(*args, **kwargs):
+        factory_calls.append("optimizer")
+        created["optimizer"] = assembly.OptimizersContainer(*args, **kwargs)
+        return created["optimizer"]
+
+    def scheduler_factory(*args, **kwargs):
+        factory_calls.append("scheduler")
+        assert kwargs["optimizers"] == list(created["optimizer"])
+        return assembly.build_lr_scheduler(*args, **kwargs)
+
+    def ema_factory(**kwargs):
+        factory_calls.append("ema")
+        assert kwargs["model_parts"] == [models[1]]
+        return assembly.EMA(**kwargs)
+
+    builders = TrainingBuilders(
+        optimizer=optimizer_factory, scheduler=scheduler_factory, ema=ema_factory
+    )
+    stacks = []
+    try:
+        for index, factories in enumerate((None, builders)):
+            rng = torch.get_rng_state().clone()
+            stacks.append(
+                assembly.build_optimizer_stack(
+                    cfg,
+                    model_parts=[models[index]],
+                    parallel_dims=None,
+                    builders=factories,
+                    on_service_acquired=lambda name, owner, index=index: acquired[
+                        index
+                    ].append((name, owner)),
+                )
+            )
+            assert torch.equal(torch.get_rng_state(), rng)
+            stack = stacks[-1]
+            assert acquired[index] == [
+                ("optimizer", stack.optimizer),
+                ("lr_scheduler", stack.lr_scheduler),
+                ("ema", stack.ema),
+            ]
+            assert {
+                id(parameter)
+                for optimizer in stack.optimizer
+                for group in optimizer.param_groups
+                for parameter in group["params"]
+            } == {id(parameter) for parameter in models[index].parameters()}
+            for parameter in models[index].parameters():
+                parameter.grad = torch.full_like(parameter, 0.25)
+            stack.optimizer.step()
+            stack.lr_scheduler.step()
+            stack.ema.step(1)
+            assert torch.equal(torch.get_rng_state(), rng)
+        assert factory_calls == ["optimizer", "scheduler", "ema"]
+        for name in ("optimizer", "lr_scheduler", "ema"):
+            torch.testing.assert_close(
+                getattr(stacks[0], name).state_dict(),
+                getattr(stacks[1], name).state_dict(),
+                rtol=0,
+                atol=0,
+            )
+        torch.testing.assert_close(
+            models[0].state_dict(), models[1].state_dict(), rtol=0, atol=0
+        )
+    finally:
+        for resources in acquired:
+            for _, resource in reversed(resources):
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    close()

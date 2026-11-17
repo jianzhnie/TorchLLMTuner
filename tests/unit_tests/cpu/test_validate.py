@@ -473,6 +473,85 @@ def test_validate_restores_mixed_module_modes(monkeypatch, fail) -> None:
     assert not model.frozen.training
 
 
+@pytest.mark.parametrize("phase", ["gradient", "model_context"])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_validate_finishes_independent_cleanup_after_restore_failure(
+    monkeypatch, phase, error_type
+):
+    original = error_type(f"{phase} restore failed")
+
+    class FailingGradient(torch.nn.Parameter):
+        fail_restore = False
+
+        def __setattr__(self, name, value):
+            if name == "grad" and self.fail_restore:
+                self.fail_restore = False
+                raise original
+            super().__setattr__(name, value)
+
+    model = _EchoModel()
+    model.register_parameter("weight", FailingGradient(torch.ones(3)))
+    gradient = torch.ones_like(model.weight)
+    model.weight.grad = gradient
+    model.add_module("frozen", torch.nn.Dropout())
+    model.frozen.eval()
+    modes = {module: module.training for module in model.modules()}
+    mask_policy = ["training"]
+    closed_contexts = []
+
+    @contextmanager
+    def validation_context(*, mask_type):
+        mask_policy[0] = "validation"
+        try:
+            yield
+        finally:
+            mask_policy[0] = "training"
+            closed_contexts.append(model)
+            if phase == "model_context":
+                raise original
+
+    monkeypatch.setattr(model, "validation_context", validation_context)
+    loader = _ListLoader([_batch(2)])
+    trainer, logged = _make_trainer(
+        monkeypatch,
+        validation=ValidationConfig(steps=1),
+        loader=loader,
+        model=model,
+    )
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state().clone()
+
+    def evaluate(engine, batch):
+        assert engine is trainer.training_engine
+        assert not any(module.training for module in model.modules())
+        assert mask_policy == ["validation"]
+        random.random()
+        np.random.random()
+        torch.rand(4)
+        model.weight.grad = None
+        model.weight.fail_restore = phase == "gradient"
+        return torch.tensor(2.0)
+
+    monkeypatch.setattr(TrainingEngine, "evaluate", evaluate)
+    with pytest.raises(error_type) as caught:
+        trainer.validate(1)
+
+    assert caught.value is original
+    assert loader.closed
+    assert logged == {"loss": 1.0, "step": 1}
+    assert closed_contexts == [model]
+    assert mask_policy == ["training"]
+    assert {module: module.training for module in model.modules()} == modes
+    assert model.weight.grad is (None if phase == "gradient" else gradient)
+    assert random.getstate() == python_state
+    actual_numpy = np.random.get_state()
+    assert actual_numpy[0] == numpy_state[0]
+    np.testing.assert_array_equal(actual_numpy[1], numpy_state[1])
+    assert actual_numpy[2:] == numpy_state[2:]
+    torch.testing.assert_close(torch.get_rng_state(), torch_state, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt, SystemExit])
 def test_validate_restores_modes_after_partial_eval_setup(monkeypatch, error_type):
     from llmtuner.trainer.runtime import validation as validation_runtime

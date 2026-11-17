@@ -3,11 +3,11 @@
 import pytest
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from llmtuner.models.common.moe.layout import (
+from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.parallel.expert_parallel.bindings import (
     resolve_moe_routing,
     resolve_packed_experts,
 )
-from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 
 

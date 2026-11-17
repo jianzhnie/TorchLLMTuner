@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib
 import json
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -344,8 +343,11 @@ def main():
     args = parser.parse_args()
     assert args.execute and args.repeats >= 2 and not args.output.exists()
     # Explicit opt-in only: importing this file for CPU contracts uses no NPU.
-    actual = importlib.import_module(
-        "tests.integration_tests.qwen35_gdn_module_alignment"
+    import torchtitan_npu  # noqa: F401 -- activate reference patches before registry
+    from torchtitan_npu.models.qwen3_5 import model_registry
+    from transformers import AutoConfig
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeGatedDeltaNet,
     )
 
     payload = torch.load(args.capture, map_location="cpu", weights_only=True, mmap=True)
@@ -360,11 +362,11 @@ def main():
     assert torch.equal(weight, payload["weight"]), (
         "Capture weight differs from shared initial"
     )
-    config = actual.AutoConfig.from_pretrained(args.model, local_files_only=True)
+    config = AutoConfig.from_pretrained(args.model, local_files_only=True)
     config = getattr(config, "text_config", config)
-    spec = actual.model_registry("35B-A3B")
+    spec = model_registry("35B-A3B")
     with torch.device("meta"):
-        hf = actual.Qwen3_5MoeGatedDeltaNet(config, 0).bfloat16().conv1d
+        hf = Qwen3_5MoeGatedDeltaNet(config, 0).bfloat16().conv1d
         reference = spec.model.layers[0].delta_net.build()
     # Retain original reference convolution modules only, no full GDN allocation.
     separate = torch.nn.ModuleList(

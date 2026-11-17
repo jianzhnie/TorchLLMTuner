@@ -279,7 +279,7 @@ def worker(
                     assert expert.to_local().numel() * 2 == expert.numel()
                 assert block.routed_experts.token_dispatcher.ep_group.size() == ep_size
         if implementation == "custom":
-            from llmtuner.parallel.fully_shard_parallel.fine_grained_state import (
+            from llmtuner.parallel.fully_shard_parallel.fine_grained.fine_grained_state import (  # noqa: E501
                 FineGrainedFSDPState,
             )
 
