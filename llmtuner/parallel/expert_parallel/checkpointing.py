@@ -30,6 +30,8 @@ from typing import Any, Literal
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...accelerator.distributed import get_rank, get_world_size
@@ -38,13 +40,6 @@ from ...components.checkpointer.core.chunked_tensor import (
     chunk_layout,
 )
 from ...utils.module_names import canonical_fqn
-
-try:  # torch >= 2.4; the FSDP path (DTensor expert weights) needs it.
-    from torch.distributed.tensor import DTensor, distribute_tensor
-    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
-except ImportError:  # pragma: no cover - old torch, plain-tensor path only
-    DTensor = None
-    distribute_tensor = None
 
 __all__ = [
     "EP_GROUP_ATTR",
@@ -138,12 +133,14 @@ def iter_expert_state_entries(
       ``load_expert_state``. Scalars fall out on ndim.
     """
     for key, value in state_dict.items():
+        if not isinstance(value, torch.Tensor):
+            continue
         candidates = ((key, shard_map[key]),) if key in shard_map else shard_map.items()
         for fqn, group in candidates:
             if key != fqn and not key.startswith(f"state.{fqn}."):
                 continue
             param = params.get(fqn)
-            if param is None or not isinstance(value, torch.Tensor):
+            if param is None:
                 continue
             shape_matches = (
                 value.shape == param.shape
@@ -202,7 +199,7 @@ def gather_expert_state(
                     tuple(out[key].shape),
                     str(out[key].dtype),
                     str(out[key].layout),
-                    isinstance(out[key], DTensor) if DTensor is not None else False,
+                    isinstance(out[key], DTensor),
                 )
                 for key, owner, _ in entries
                 if owner is group
@@ -240,7 +237,7 @@ def gather_expert_state(
             if owner is not group:
                 continue
             value = out[key]
-            if DTensor is not None and isinstance(value, DTensor):
+            if isinstance(value, DTensor):
                 value = value.full_tensor()
             world = get_world_size(group)
             gathered = value.new_empty((world * value.shape[0],) + value.shape[1:])
@@ -286,7 +283,7 @@ def load_expert_state(
                 "different expert layout."
             )
         local = full.narrow(0, rank * num_local, num_local)
-        if DTensor is not None and isinstance(param, DTensor):
+        if isinstance(param, DTensor):
             local = distribute_tensor(
                 local.contiguous(), param.device_mesh, param.placements
             )
@@ -312,7 +309,7 @@ def shard_expert_state(
     ):
         value = state_dict[key]
         shape = list(value.shape)
-        if DTensor is not None and isinstance(value, DTensor):
+        if isinstance(value, DTensor):
             if any(placement.is_partial() for placement in value.placements):
                 raise ValueError(f"EP checkpoint cannot serialize Partial state: {key}")
             _, offset = compute_local_shape_and_global_offset(

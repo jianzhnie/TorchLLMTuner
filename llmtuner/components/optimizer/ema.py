@@ -28,6 +28,7 @@ from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
 from ...accelerator.collectives import synchronize_local_errors
+from ...accelerator.tensor_tree import clone_local_tensor
 from ...config.ema_config import validate_ema_schedule
 from ...parallel.assembly import ModelPartLayout
 from ...utils.logging import get_logger
@@ -59,18 +60,7 @@ class EMAStateOptimizer(Optimizer):
             )
         super().__init__([{"params": tensors, "param_names": names}], {})
         for t in tensors:
-            if isinstance(t, DTensor):
-                average = DTensor.from_local(
-                    t.to_local().detach().clone(),
-                    device_mesh=t.device_mesh,
-                    placements=t.placements,
-                    run_check=False,
-                    shape=t.shape,
-                    stride=t.stride(),
-                )
-            else:
-                average = t.detach().clone()
-            self.state[t]["ema_params"] = average
+            self.state[t]["ema_params"] = clone_local_tensor(t, detach=True)
 
     def step(self, closure=None) -> None:
         raise RuntimeError(

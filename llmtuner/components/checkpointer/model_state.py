@@ -14,9 +14,9 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
-from torch.distributed.tensor import DTensor
 
 from ...accelerator.collectives import synchronize_local_errors
+from ...accelerator.tensor_tree import clone_local_tensor
 from ...models.registry import resolve_state_format
 from ...parallel.assembly import ModelPartLayout
 from .core.checkpoint_keys import SAFETENSORS_INDEX
@@ -25,25 +25,6 @@ from .hf.hf_expert_storage import (
     GroupedExpertHuggingFaceStorageReader,
 )
 from .hf.hf_storage import IndexedHuggingFaceStorageReader, read_hf_weight_map
-
-
-def clone_local_state_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Copy owned checkpoint storage without redistributing DTensor layouts.
-
-    DTensor clone dispatch may reduce Partial placements. Export keys can belong
-    to only some ranks, so storage cloning must not introduce a collective.
-    Explicit shape/stride also preserve uneven-shard metadata without checks.
-    """
-    if isinstance(tensor, DTensor):
-        return DTensor.from_local(
-            tensor.to_local().clone(),
-            device_mesh=tensor.device_mesh,
-            placements=tensor.placements,
-            run_check=False,
-            shape=tensor.shape,
-            stride=tensor.stride(),
-        )
-    return tensor.clone()
 
 
 class ModelStateDictAdapter:
@@ -147,9 +128,7 @@ class ModelStateDictAdapter:
         ):
             snapshot.validate(layout, consumer="HF checkpoint adapter")
 
-    def _map_state_keys(
-        self, state: dict[str, Any], *, to_hf: bool
-    ) -> dict[str, Any]:
+    def _map_state_keys(self, state: dict[str, Any], *, to_hf: bool) -> dict[str, Any]:
         """Map canonical runtime names and external names without losing aliases."""
         mapped = {}
         for key, value in state.items():
@@ -197,10 +176,7 @@ class ModelStateDictAdapter:
             missing = self._hf_keys - requested
             unexpected = requested - self._hf_keys
             # A tied lm_head is legitimately omitted from a HF checkpoint.
-            if (
-                tied_embeddings
-                and "lm_head.weight" not in self._hf_keys
-            ):
+            if tied_embeddings and "lm_head.weight" not in self._hf_keys:
                 unexpected.discard("lm_head.weight")
                 hf_state.pop("lm_head.weight", None)
             if missing or unexpected:
@@ -221,7 +197,7 @@ class ModelStateDictAdapter:
                 ):
                     # Safetensors cannot serialize aliases within one shard.
                     # HF restores parameter sharing from its configuration.
-                    hf_state["lm_head.weight"] = clone_local_state_tensor(
+                    hf_state["lm_head.weight"] = clone_local_tensor(
                         hf_state["lm_head.weight"]
                     )
         return hf_state
@@ -274,9 +250,7 @@ class ModelStateDictAdapter:
             if isinstance(value, ChunkedCheckpointTensor):
                 for target in targets:
                     del result[target]
-                chunks_by_target: dict[
-                    str, list[tuple[torch.Size, torch.Tensor]]
-                ] = {}
+                chunks_by_target: dict[str, list[tuple[torch.Size, torch.Tensor]]] = {}
                 for offset, local in value.chunks:
                     for index in range(local.shape[0]):
                         target = targets[offset[0] + index]

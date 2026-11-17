@@ -1,4 +1,4 @@
-"""Model-owned MoE routing and packed-expert layout bindings."""
+"""Resolve EP routing and packed-storage bindings from model declarations."""
 
 from __future__ import annotations
 
@@ -8,8 +8,29 @@ from typing import NamedTuple
 import torch
 import torch.nn as nn
 
-from ....errors import UnsupportedCombinationError
-from ...contracts import MoEBlockContract
+from ...errors import UnsupportedCombinationError
+from ...models.contracts import MoEBlockContract
+
+
+def _require_moe_contract(block: nn.Module, *, requirement: str) -> MoEBlockContract:
+    contract = getattr(block, "moe_contract", None)
+    if contract is None:
+        raise UnsupportedCombinationError(
+            f"{requirement} a model-owned MoEBlockContract"
+        )
+    if not isinstance(contract, MoEBlockContract):
+        raise TypeError("moe_contract must be a MoEBlockContract")
+    return contract
+
+
+def _validate_expert_bias(owner: nn.Module) -> None:
+    if any(
+        name == "bias" or name.endswith("_bias")
+        for name, _ in owner.named_parameters(recurse=False)
+    ):
+        raise NotImplementedError(
+            "EP grouped experts do not support expert bias vectors"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,13 +52,22 @@ class MoERoutingBinding:
         """Reject changed routing modules or declarations before conversion."""
         if block is not self.source:
             raise ValueError("MoE routing binding belongs to another block")
-        current = resolve_moe_routing(block)
+        contract = getattr(block, "moe_contract", None)
+        if not isinstance(contract, MoEBlockContract):
+            raise ValueError("Stale EP routing contract")
+        router, _, shared = contract.bind(block)
+        shared_gate = (
+            block._modules[contract.shared_expert_gate]
+            if contract.shared_expert_gate is not None
+            else None
+        )
         if (
-            current.router is not self.router
-            or current.shared is not self.shared
-            or current.shared_gate is not self.shared_gate
+            contract.group_routing == "single_best"
+            or router is not self.router
+            or shared is not self.shared
+            or shared_gate is not self.shared_gate
             or any(
-                getattr(current, name) != getattr(self, name)
+                getattr(contract, name) != getattr(self, name)
                 for name in (
                     "top_k",
                     "score_func",
@@ -53,13 +83,7 @@ class MoERoutingBinding:
 
 def resolve_moe_routing(block: nn.Module) -> MoERoutingBinding:
     """Bind routing from the model-owned contract without inspecting forward."""
-    contract = getattr(block, "moe_contract", None)
-    if contract is None:
-        raise UnsupportedCombinationError(
-            "MoE conversion requires a model-owned MoEBlockContract"
-        )
-    if not isinstance(contract, MoEBlockContract):
-        raise TypeError("moe_contract must be a MoEBlockContract")
+    contract = _require_moe_contract(block, requirement="MoE conversion requires")
     if contract.group_routing == "single_best":
         raise NotImplementedError(
             "EP group-limited greedy selects a single best expert per group; "
@@ -109,8 +133,12 @@ class PackedExpertBinding:
 
     def validate(self, block: nn.Module) -> None:
         """Reject replaced parameters or geometry before allocating conversion state."""
+        contract = getattr(block, "moe_contract", None)
         if (
             block is not self.source
+            or not isinstance(contract, MoEBlockContract)
+            or contract.activation != "silu"
+            or contract.num_experts != self.shape[0]
             or block._modules.get("experts") is not self.owner
             or self.owner._parameters.get("gate_up_proj") is not self.gate_up
             or self.owner._parameters.get("down_proj") is not self.down
@@ -119,6 +147,16 @@ class PackedExpertBinding:
             != (self.shape[0], self.shape[2], self.shape[1] // 2)
         ):
             raise ValueError("Stale EP packed expert binding")
+        _validate_expert_bias(self.owner)
+        router, _, _ = contract.bind(block)
+        weight = router._parameters.get("weight")
+        if (
+            not isinstance(weight, nn.Parameter)
+            or tuple(weight.shape) != (self.shape[0], self.shape[2])
+            or weight.device != self.gate_up.device
+            or self.down.device != self.gate_up.device
+        ):
+            raise ValueError("Stale EP packed expert router geometry or device")
 
     def projections(self, block: nn.Module) -> PackedExpertViews:
         """Create only role-specific views of the validated live parameters."""
@@ -136,13 +174,7 @@ def resolve_packed_experts(block: nn.Module, *, degree: int) -> PackedExpertBind
     """Bind fused parameter storage described by the model contract."""
     if type(degree) is not int or degree < 1:
         raise ValueError("EP degree must be a positive integer")
-    contract = getattr(block, "moe_contract", None)
-    if contract is None:
-        raise UnsupportedCombinationError(
-            "EP packed experts require a model-owned MoEBlockContract"
-        )
-    if not isinstance(contract, MoEBlockContract):
-        raise TypeError("moe_contract must be a MoEBlockContract")
+    contract = _require_moe_contract(block, requirement="EP packed experts require")
     owner = block._modules.get("experts")
     if owner is None:
         raise ValueError("Declared fused experts require an experts child module")
@@ -154,13 +186,7 @@ def resolve_packed_experts(block: nn.Module, *, degree: int) -> PackedExpertBind
         )
     if gate_up.ndim != 3 or down.ndim != 3:
         raise ValueError("EP fused gate/up requires rank-3 expert parameters")
-    if any(
-        name == "bias" or name.endswith("_bias")
-        for name, _ in owner.named_parameters(recurse=False)
-    ):
-        raise NotImplementedError(
-            "EP grouped experts do not support expert bias vectors"
-        )
+    _validate_expert_bias(owner)
     if contract.activation != "silu":
         raise UnsupportedCombinationError(
             f"EP grouped experts require SiLU, but the model declares "

@@ -172,8 +172,7 @@ def swap_moe_blocks(
         raise ValueError("EP plan does not match the requested execution")
     execution_plan.validate_binding(model)
     candidates = []
-    routing_bindings = {}
-    packed_bindings = {}
+    conversion_bindings: dict[int, MoEConversionTarget] = {}
     for target in execution_plan.targets:
         binding = target.spec
         if target.kind != "moe" or not isinstance(binding, MoEConversionTarget):
@@ -233,9 +232,8 @@ def swap_moe_blocks(
                 quantile_balancing=quantile_balancing,
                 has_ep_group=ep_group is not None,
             )
-            routing_bindings[id(target.module)] = binding.routing
             binding.packed_experts.validate(target.module)
-            packed_bindings[id(target.module)] = binding.packed_experts
+        conversion_bindings[id(target.module)] = binding
     if not candidates:
         raise ValueError("EP plan must contain conversion targets")
     # EP replaces every declared sparse slot, in decoder order. A caller
@@ -275,7 +273,6 @@ def swap_moe_blocks(
     converted_blocks: dict[int, MoE] = {}
     converted_parameters: dict[int, tuple[nn.Parameter, ...]] = {}
     module_targets: dict[nn.Module, nn.Module] = {}
-    stacked_projection_sources: dict[int, tuple[int, ...]] = {}
     original_parameters = (
         {
             id(parameter): parameter
@@ -289,6 +286,8 @@ def swap_moe_blocks(
         else {}
     )
     converted_biases: dict[int, torch.Tensor] = {}
+    expert_replacements: dict[nn.Module, nn.Module] = {}
+    router_replacements: dict[nn.Module, nn.Module] = {}
     aux_group_counts = dict(AuxLoss._group_counts)
     validate_model_expert_ownership(candidates, module_paths, external_parameters)
     try:
@@ -298,7 +297,8 @@ def swap_moe_blocks(
             if id(block) in converted_blocks:
                 replacements.append((layer, attr, converted_blocks[id(block)]))
                 continue
-            if uses_model_expert_conversion(block):
+            binding = conversion_bindings[id(block)]
+            if binding.model_conversion:
                 moe = convert_model_block(
                     block,
                     ep_group=ep_group,
@@ -317,7 +317,9 @@ def swap_moe_blocks(
                 converted_blocks[id(block)] = moe
                 replacements.append((layer, attr, moe))
                 continue
-            router_gate = routing_bindings[id(block)].router
+            routing = binding.routing
+            packed = binding.packed_experts
+            router_gate = routing.router
             load_balance_coeff = (
                 float(default_coeff)
                 if getattr(router_gate, "e_score_correction_bias", None) is not None
@@ -325,8 +327,8 @@ def swap_moe_blocks(
             )
             moe = convert_block(
                 block,
-                routing=routing_bindings[id(block)],
-                packed_experts=packed_bindings.get(id(block)),
+                routing=routing,
+                packed_experts=packed,
                 ep_group=ep_group,
                 aux_loss_coeff=aux_loss_coeff,
                 load_balance_coeff=load_balance_coeff,
@@ -339,22 +341,33 @@ def swap_moe_blocks(
             # source maps to two parameters, which must be reused as a pair.
             # Bind after dtype/device conversion, before installing any block.
             grouped = moe.routed_experts.inner_experts
-            projections: list[
-                tuple[nn.Module, tuple[str, ...], tuple[torch.Tensor, ...]]
-            ] = [
-                (moe.router.gate, ("weight",), (router_gate.weight,)),
-                (grouped, ("w1_EFD", "w3_EFD"), (block.experts.gate_up_proj,)),
-                (grouped, ("w2_EDF",), (block.experts.down_proj,)),
+            projections: list[tuple[nn.Module, tuple[str, ...], nn.Parameter]] = [
+                (moe.router.gate, ("weight",), router_gate.weight),
+                (grouped, ("w1_EFD", "w3_EFD"), packed.gate_up),
+                (grouped, ("w2_EDF",), packed.down),
             ]
-            for owner, names, sources in projections:
+            for owner, names, source in projections:
                 bind_shared_projection(
                     owner,
                     names,
-                    sources,
+                    source,
                     converted_parameters=converted_parameters,
-                    stacked_projection_sources=stacked_projection_sources,
                     external_parameters=external_parameters,
                 )
+            shared_gate = router_replacements.get(router_gate)
+            if shared_gate is None:
+                moe.router.gate.train(router_gate.training)
+                router_replacements[router_gate] = moe.router.gate
+            else:
+                moe.router.gate = shared_gate
+            # Preserve module aliases as well as parameter aliases. FSDP units
+            # and hook_module references must resolve to one shared boundary.
+            shared_grouped = expert_replacements.get(packed.owner)
+            if shared_grouped is None:
+                grouped.train(packed.owner.training)
+                expert_replacements[packed.owner] = grouped
+            else:
+                moe.routed_experts.inner_experts = shared_grouped
             # Shared bias consumers contribute counts or histograms to one
             # policy-specific update in bias_update.py.
             source_bias = getattr(router_gate, "e_score_correction_bias", None)
@@ -386,19 +399,22 @@ def swap_moe_blocks(
             converted_blocks[id(block)] = moe
             replacements.append((layer, attr, moe))
         converted_layouts = plan_tp_checkpoint_layouts(
-            module_paths, candidates, converted_blocks, replaced_roots
+            module_paths,
+            expert_replacements,
+            converted_blocks,
+            replaced_roots,
+            router_replacements=router_replacements,
         )
 
         if on_replacement is not None:
-            for _, _, block, _ in candidates:
-                routing = routing_bindings.get(id(block))
-                if routing is None:
+            module_targets.update(expert_replacements)
+            module_targets.update(router_replacements)
+            for identity, binding in conversion_bindings.items():
+                if binding.model_conversion:
                     # Model-owned conversions already supplied their identities.
                     continue
-                moe = converted_blocks[id(block)]
-                module_targets[block] = moe
-                module_targets[block.experts] = moe.routed_experts.inner_experts
-                module_targets[routing.router] = moe.router.gate
+                moe = converted_blocks[identity]
+                module_targets[binding.routing.source] = moe
             on_replacement(
                 module_targets,
                 {

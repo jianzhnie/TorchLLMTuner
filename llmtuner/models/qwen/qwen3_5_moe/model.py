@@ -28,14 +28,14 @@ from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
 from ....errors import UnsupportedCombinationError
-from ...common.linear import build_lm_head
+from ...common.attention import temporary_attention_mask
 from ...common.gradient_norm import (
     ReferenceNormGroup,
     packed_expert_reference_norm_group,
     qkv_reference_norm_group,
 )
 from ...common.input_preparation import prepare_text_inputs, restore_text_batch_rows
-from ...common.attention import temporary_attention_mask
+from ...common.linear import build_lm_head
 from ...configuration import (
     configure_reference_experts,
     validate_attention_backend,
@@ -44,6 +44,7 @@ from ...configuration import (
 from ...contracts import DecoderStructure, GatedMLPStructure, MoEBlockContract
 from ...execution import ModelExecutionCapabilities
 from ..checkpoint import qwen35_text_configuration
+from ..ops import eager_experts_forward
 from ..routing import (
     Qwen3_5MoeFP32TopKRouter,
     Qwen3_5MoeTopKRouter,
@@ -240,22 +241,7 @@ class Qwen3_5MoeExperts(reference.Qwen3_5MoeExperts):
     def forward(
         self, hidden_states: Tensor, top_k_index: Tensor, top_k_weights: Tensor
     ) -> Tensor:
-        output = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            mask = nn.functional.one_hot(
-                top_k_index, num_classes=self.num_experts
-            ).permute(2, 1, 0)
-            active = (mask.sum(dim=(-1, -2)) > 0).nonzero()
-        for expert in active:
-            index = expert[0]
-            slots, tokens = torch.where(mask[index])
-            gate, up = nn.functional.linear(
-                hidden_states[tokens], self.gate_up_proj[index]
-            ).chunk(2, dim=-1)
-            values = nn.functional.linear(self.act_fn(gate) * up, self.down_proj[index])
-            values = values * top_k_weights[tokens, slots, None]
-            output.index_add_(0, tokens, values.to(output.dtype))
-        return output
+        return eager_experts_forward(self, hidden_states, top_k_index, top_k_weights)
 
 
 class Qwen3_5MoeSparseMoeBlock(reference.Qwen3_5MoeSparseMoeBlock):

@@ -1,7 +1,7 @@
 """Apply TP/EP/CP and memory transformations to explicit whole models.
 
 Stages follow the single STAGE_ORDER and return final local layout metadata.
-Pipeline execution is isolated in experiment/pipeline_parallel.
+Pipeline execution is isolated in experiments/pipeline_parallel.
 """
 
 from __future__ import annotations
@@ -180,10 +180,11 @@ def parallelize_model(
             global_cp_plan = resolve_cp_plan(model, cfg=cfg)
             global_bindings = model_bindings_from_plan(global_cp_plan)
 
+    global_ep_plan = None
     if cfg.ep_size > 1 or cfg.ep_config.fixed_router:
         # Reject invalid expert layouts before TP replaces parameters.
-        # This is metadata-only; the execution stage
-        # resolves again against its post-TP instance, never this snapshot.
+        # This is metadata-only. TP execution invalidates these bindings;
+        # without TP the EP stage can consume this exact plan.
         # Include the world, rather than only one EP group, because other
         # stages/ranks may subsequently enter shared FSDP collectives.
         with synchronize_local_errors(
@@ -270,6 +271,7 @@ def parallelize_model(
                 ep_group=ep_group,
                 error_group=ep_error_group,
                 on_replacement=record_replacements,
+                resolved_plan=global_ep_plan if cfg.tp_size == 1 else None,
             )
         elif name == "cp":
             part = apply_cp(part, mesh=mesh, cfg=cfg)

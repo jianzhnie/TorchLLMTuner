@@ -93,6 +93,24 @@ def validate_disjoint_tp_ep_checkpoint_ownership(
         )
 
 
+def _checkpoint_groups(
+    model_parts: list[nn.Module], *, include_expert_groups: bool = False
+) -> list[dist.ProcessGroup]:
+    """Discover communication owners without requiring valid parameter metadata."""
+    groups = set()
+    for model in model_parts:
+        for module in model.modules():
+            groups.update(
+                layout[2]
+                for layout in module.__dict__.get("_tp_checkpoint_layouts", {}).values()
+            )
+            if include_expert_groups:
+                group = getattr(module, EP_GROUP_ATTR, None)
+                if group is not None:
+                    groups.add(group)
+    return sorted(groups, key=lambda group: tuple(dist.get_process_group_ranks(group)))
+
+
 @contextmanager
 def _coordinate_chunk_errors(model_parts, phase, *, include_expert_groups=False):
     """Coordinate local errors across the selected TP and EP ownership groups."""
@@ -101,21 +119,8 @@ def _coordinate_chunk_errors(model_parts, phase, *, include_expert_groups=False)
         yield
     except BaseException as caught:
         error = caught
-    groups = {
-        layout[2]
-        for model in model_parts
-        for module in model.modules()
-        for layout in module.__dict__.get("_tp_checkpoint_layouts", {}).values()
-    }
-    if include_expert_groups:
-        groups.update(
-            group
-            for model in model_parts
-            for module in model.modules()
-            if (group := getattr(module, EP_GROUP_ATTR, None)) is not None
-        )
-    groups = sorted(
-        groups, key=lambda group: tuple(dist.get_process_group_ranks(group))
+    groups = _checkpoint_groups(
+        model_parts, include_expert_groups=include_expert_groups
     )
     failed = error is not None
     # Joint owners form overlapping TP/EP groups. Repeated reports propagate
@@ -137,7 +142,9 @@ def _index_layouts(model_parts: list[nn.Module]):
     layouts: dict[str, TPLayout] = {}
     parameters: dict[str, torch.Tensor] = {}
     for model in model_parts:
-        for path, module in model.named_modules():
+        # State dictionaries retain every registered alias. Local layout
+        # registrations must be expanded at each path of a shared module too.
+        for path, module in model.named_modules(remove_duplicate=False):
             prefix = canonical_fqn(path)
             registered = module.__dict__.get("_tp_checkpoint_layouts", {})
             for name, layout in registered.items():
@@ -150,6 +157,23 @@ def _index_layouts(model_parts: list[nn.Module]):
             if name in parameters and parameters[name] is not parameter:
                 raise ValueError(f"Conflicting TP checkpoint parameter: {name!r}")
             parameters[name] = parameter
+    parameter_layouts: dict[int, TPLayout] = {}
+    for name, layout in layouts.items():
+        parameter = parameters.get(name)
+        if parameter is None:
+            raise ValueError(f"TP checkpoint layout has no live parameter: {name!r}")
+        previous = parameter_layouts.setdefault(id(parameter), layout)
+        if previous != layout:
+            raise ValueError(
+                f"Shared parameter has conflicting TP checkpoint layouts: {name!r}"
+            )
+    # A tied Parameter can be registered under different modules, with a
+    # layout recorded at only one path. Every serialized alias owns the same
+    # physical slice and must receive the same checkpoint transformation.
+    for name, parameter in parameters.items():
+        layout = parameter_layouts.get(id(parameter))
+        if layout is not None:
+            layouts.setdefault(name, layout)
     return layouts, parameters
 
 
@@ -158,11 +182,12 @@ def _entries(state: dict[str, Any], layouts, parameters):
     for key, value in state.items():
         if not isinstance(value, torch.Tensor):
             continue
-        for name, layout in layouts.items():
+        if value.ndim == 0 and key not in layouts:
+            continue  # Optimizer step counters are replicated scalars.
+        candidates = ((key, layouts[key]),) if key in layouts else layouts.items()
+        for name, layout in candidates:
             if key != name and not key.startswith(f"state.{name}."):
                 continue
-            if key != name and value.ndim == 0:
-                continue  # Optimizer step counters are replicated scalars.
             entries.append((key, layout, parameters[name]))
             break
     return sorted(entries, key=lambda entry: entry[0])
@@ -171,22 +196,16 @@ def _entries(state: dict[str, Any], layouts, parameters):
 def _prepare_state(state, model_parts, *, loading: bool):
     # Discover communication ownership before validating canonical names. Even
     # a rank with invalid parameter metadata must join its peers' error reports.
-    groups = sorted(
-        {
-            layout[2]
-            for model in model_parts
-            for module in model.modules()
-            for layout in module.__dict__.get("_tp_checkpoint_layouts", {}).values()
-        },
-        key=lambda group: tuple(dist.get_process_group_ranks(group)),
-    )
+    groups = _checkpoint_groups(model_parts)
     local_error = None
     entries = []
     try:
         layouts, parameters = _index_layouts(model_parts)
         expert_groups = expert_shard_map(model_parts)
-        parameter_names = {
-            id(parameter): name for name, parameter in parameters.items()
+        parameter_expert_groups = {
+            id(parameters[name]): group
+            for name, group in expert_groups.items()
+            if name in parameters
         }
         entries = _entries(state, layouts, parameters)
         for key, (dim, packed, group), parameter in entries:
@@ -199,7 +218,7 @@ def _prepare_state(state, model_parts, *, loading: bool):
                     f"TP checkpoint {key!r} requires a strided tensor layout"
                 )
             expected = list(parameter.shape)
-            expert_group = expert_groups.get(parameter_names[id(parameter)])
+            expert_group = parameter_expert_groups.get(id(parameter))
             if expert_group is not None:
                 # EP is gathered before TP, and sliced after TP on restore.
                 # Its expert axis therefore stays global during both TP passes.
@@ -256,14 +275,14 @@ def _prepare_state(state, model_parts, *, loading: bool):
         raise local_error
     if peer_error is not None:
         raise peer_error
-    return entries
+    return entries, set(parameter_expert_groups)
 
 
 def gather_tensor_parallel_state(
     state: dict[str, Any], *, model_parts: list[nn.Module]
 ) -> dict[str, Any]:
     """Gather global TP weights and parameter-shaped optimizer/EMA state."""
-    entries = _prepare_state(state, model_parts, loading=False)
+    entries, _ = _prepare_state(state, model_parts, loading=False)
     result = dict(state)
     groups = sorted(
         {layout[2] for _, layout, _ in entries},
@@ -294,7 +313,7 @@ def shard_tensor_parallel_state(
     EP expert entries must already follow the existing global expert-axis
     contract. Callers select it with the TP-sharded checkpoint policy.
     """
-    entries = _prepare_state(state, model_parts, loading=False)
+    entries, _ = _prepare_state(state, model_parts, loading=False)
     with _coordinate_chunk_errors(model_parts, "TP checkpoint chunk construction"):
         result = _build_chunked_state(state, entries)
     return result
@@ -385,13 +404,7 @@ def load_tensor_parallel_state(
     state: dict[str, Any], *, model_parts: list[nn.Module]
 ) -> dict[str, Any]:
     """Slice global tensors and restore each parameter's live DP layout."""
-    entries = _prepare_state(state, model_parts, loading=True)
-    expert_groups = expert_shard_map(model_parts)
-    expert_parameters = {
-        id(parameter)
-        for name, parameter in _index_layouts(model_parts)[1].items()
-        if name in expert_groups
-    }
+    entries, expert_parameters = _prepare_state(state, model_parts, loading=True)
     result = dict(state)
     for key, (dim, packed, group), parameter in entries:
         value = state[key]

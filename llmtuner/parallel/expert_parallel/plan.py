@@ -21,12 +21,6 @@ from ...models.common.moe.layer import (
     declared_expert_layout,
     declared_moe_block,
 )
-from ...models.common.moe.layout import (
-    MoERoutingBinding,
-    PackedExpertBinding,
-    resolve_moe_routing,
-    resolve_packed_experts,
-)
 from ...models.contracts import DecoderStructure, MoEBlockContract
 from ..plan import (
     FullPlanBindings,
@@ -34,6 +28,12 @@ from ..plan import (
     PlanTarget,
     first_paths_by_identity,
     snapshot_model_bindings,
+)
+from .bindings import (
+    MoERoutingBinding,
+    PackedExpertBinding,
+    resolve_moe_routing,
+    resolve_packed_experts,
 )
 from .block_conversion import validate_moe_conversion
 from .model_conversion import uses_model_expert_conversion
@@ -167,9 +167,7 @@ def validate_packed_expert_aliases(
         packed = binding.packed_experts
         if packed is None:
             continue
-        parameters = (
-            (packed.gate_up, packed.down) if degree > 1 else (packed.gate_up,)
-        )
+        parameters = (packed.gate_up, packed.down) if degree > 1 else (packed.gate_up,)
         for parameter in parameters:
             changed.add(id(parameter))
             if type(parameter) is nn.Parameter and parameter.layout == torch.strided:

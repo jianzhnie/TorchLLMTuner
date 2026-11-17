@@ -63,10 +63,10 @@ rank 和参数。
 
 ### 3.1 异常分类
 
-| 异常 | 同时继承 | 用途 |
-|---|---|---|
-| `ConfigError` | `ValueError` | 字段值或配置无效 |
-| `UnsupportedCombinationError` | `NotImplementedError` | 单项合法，但组合不受支持 |
+| 异常                          | 同时继承              | 用途                                   |
+| ----------------------------- | --------------------- | -------------------------------------- |
+| `ConfigError`                 | `ValueError`          | 字段值或配置无效                       |
+| `UnsupportedCombinationError` | `NotImplementedError` | 单项合法，但组合不受支持               |
 | `EnvironmentUnsupportedError` | `NotImplementedError` | 环境缺少所需版本或能力，并给出解锁条件 |
 
 可选第三方包缺失仍使用 `ImportError`。错误信息应说明影响范围和可行修复方式。
@@ -92,11 +92,11 @@ rank 和参数。
 
 ### 3.4 公开接口
 
-| 层级 | 入口 | 约定 |
-|---|---|---|
-| 用户接口 | `llmtuner.LLMTunerConfig`、`Trainer`、`config.*`、`python -m llmtuner` | 常规训练使用 |
-| 集成接口 | `parallelize_model`、stage、组合矩阵、能力注册表 | 扩展作者使用，稳定性较弱 |
-| 内部实现 | 未列出的模块与私有符号 | 不承诺兼容，测试可直接使用 |
+| 层级     | 入口                                                                   | 约定                       |
+| -------- | ---------------------------------------------------------------------- | -------------------------- |
+| 用户接口 | `llmtuner.LLMTunerConfig`、`Trainer`、`config.*`、`python -m llmtuner` | 常规训练使用               |
+| 集成接口 | `parallelize_model`、stage、组合矩阵、能力注册表                       | 扩展作者使用，稳定性较弱   |
+| 内部实现 | 未列出的模块与私有符号                                                 | 不承诺兼容，测试可直接使用 |
 
 实现代码从定义符号的叶子模块导入，避免引入不必要的引擎依赖。
 
@@ -251,17 +251,20 @@ PP 由 schedule 驱动 microbatch。validation 使用 eval 和 `no_grad`，复�
 
 运行时职责集中在以下位置，避免新增同义入口：
 
-| 模块 | 职责 |
-|---|---|
-| `trainer/trainer.py` | 恢复、训练循环、验证时机、保存与资源关闭 |
-| `trainer/runtime/assembly.py` | 构造模型和训练服务，连接显式依赖 |
-| `trainer/runtime/engine.py` | 前后向、累积、梯度同步与更新 |
-| `trainer/runtime/batch.py` | 统一训练/验证 loader 构造及 batch 适配 |
-| `trainer/runtime/results.py` | 进度计数与步骤结果类型 |
-| `trainer/runtime/gradients.py` | 梯度校验、归约及参考范数布局 |
+| 模块                           | 职责                                                        |
+| ------------------------------ | ----------------------------------------------------------- |
+| `trainer/trainer.py`           | 恢复、训练循环、验证时机、保存与资源关闭                    |
+| `trainer/runtime/assembly.py`  | 构造模型和训练服务，连接显式依赖                            |
+| `trainer/runtime/engine.py`    | 前后向、累积、梯度同步、裁剪及 optimizer/scheduler/EMA 更新 |
+| `trainer/runtime/batch.py`     | 统一训练/验证 loader 构造及 batch 适配                      |
+| `trainer/runtime/results.py`   | 进度计数与步骤结果类型                                      |
+| `trainer/runtime/gradients.py` | 梯度校验、归约及参考范数布局                                |
 
 训练与验证均使用 `build_rank_dataloader()`，由 `repeat` 和可选 dataset 区分。
 `TrainingBuilders` 只注入组件工厂，组件不读取或改写完整 Trainer。
+裁剪策略在引擎装配时绑定；Trainer 通过 `finish_step()` 提交更新，诊断 hook
+仍观察同步后、裁剪前的梯度。迁移与对照方式见
+[训练执行边界迁移记录](refactoring_runtime_execution.md)。
 
 ### 6.2 数据与 mask
 
@@ -342,14 +345,14 @@ DistMuon 的参数组选项校验由 `validate_param_groups()` 统一定义，�
 `optimizer_reshard.py` 路径保留类型导出。运行时实现位于
 `components/optimizer/flex_shard/`，按职责拆分：
 
-| 模块 | 职责 |
-|---|---|
-| `dist_muon.py` | optimizer 接口、构造与更新编排 |
-| `muon_math.py` | momentum、Newton-Schulz 与参数更新数学 |
-| `muon_layout.py` | 存储到计算布局的解析与约束 |
-| `muon_redistribution.py` | 根据 Muon 矩阵边界生成重分布计划 |
+| 模块                            | 职责                                     |
+| ------------------------------- | ---------------------------------------- |
+| `dist_muon.py`                  | optimizer 接口、构造与更新编排           |
+| `muon_math.py`                  | momentum、Newton-Schulz 与参数更新数学   |
+| `muon_layout.py`                | 存储到计算布局的解析与约束               |
+| `muon_redistribution.py`        | 根据 Muon 矩阵边界生成重分布计划         |
 | `optimizer_reshard_schedule.py` | tensor-region 路由与 collective 调度规划 |
-| `optimizer_reshard_runtime.py` | 打包缓冲区、异步通信与计算执行 |
+| `optimizer_reshard_runtime.py`  | 打包缓冲区、异步通信与计算执行           |
 
 普通模块名不意味着内部计划类型成为公开 API；辅助符号的私有边界仍以其职责为准。
 
@@ -443,12 +446,12 @@ pre-commit run --all-files
 旧 positional optimizer 布局按 stage 内参数位置编号，PP 下会产生同名键。
 当前统一使用扁平 FQN：
 
-| 内容 | 当前键示例 |
-|---|---|
-| Adam 一阶矩 | `state.<fqn>.exp_avg` |
+| 内容        | 当前键示例               |
+| ----------- | ------------------------ |
+| Adam 一阶矩 | `state.<fqn>.exp_avg`    |
 | Adam 二阶矩 | `state.<fqn>.exp_avg_sq` |
-| step | `state.<fqn>.step` |
-| 参数组 | `param_groups.<fqn>.lr` |
+| step        | `state.<fqn>.step`       |
+| 参数组      | `param_groups.<fqn>.lr`  |
 
 旧 positional checkpoint 不提供自动转换，加载应明确失败，不能静默冷启动
 optimizer。该布局不改变模型权重、trainer 计数器或 dataloader cursor。

@@ -151,9 +151,7 @@ class TrainingEngine:
             layout=layout,
         )
         self._dense_backward = (
-            self._backward_chunked
-            if chunked_loss
-            else self._backward_logits
+            self._backward_chunked if chunked_loss else self._backward_logits
         )
 
     @property
@@ -175,7 +173,7 @@ class TrainingEngine:
         self, local_routing_tokens: int, *, dp_group: ProcessGroup | None
     ) -> None:
         """Normalize router loss over non-padding inputs, including masked prompts."""
-        if not AuxLoss.has_pending_counts():
+        if not AuxLoss.has_pending_counts(model_parts=self.model_parts):
             return
         global_routing_tokens = torch.tensor(
             local_routing_tokens, dtype=torch.int64, device=self.device

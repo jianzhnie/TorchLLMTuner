@@ -322,9 +322,7 @@ class Trainer:
         )
         # The loader batch is replicated across CP/TP. Commit this rank's
         # share only after every local counter has passed group validation.
-        self.ntokens_seen += logical_tokens_per_rank(
-            num_tokens, self.parallel_dims
-        )
+        self.ntokens_seen += logical_tokens_per_rank(num_tokens, self.parallel_dims)
         return prepared
 
     def forward_backward_step(
@@ -622,11 +620,12 @@ class Trainer:
             with synchronize_local_errors(
                 "Training profiler initialization", group=self.error_group
             ):
+                builders = getattr(self, "_builders", None)
                 profiler_context = assembly.build_profiler(
                     self.cfg.profiler,
                     global_step=self.step,
                     base_folder=self.cfg.dump_folder,
-                    builders=getattr(self, "_builders", None),
+                    factory=None if builders is None else builders.profiler,
                 )
                 # Own cleanup before entry, including partially started traces.
                 self.profiler_resource = profiler_context

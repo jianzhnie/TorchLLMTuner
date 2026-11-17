@@ -57,6 +57,7 @@ from llmtuner.memory.activation_swap import ActivationSwapResources
 from llmtuner.parallel.fully_shard_parallel.resources import FSDPCommunicationResources
 from llmtuner.parallel.model_compile import rollback_compile_settings_on_error
 from llmtuner.trainer.runtime import validation as validation_runtime
+from llmtuner.trainer.runtime.assembly import build_profiler
 from llmtuner.trainer.runtime.gradients import check_step_condition
 from llmtuner.trainer.runtime.results import StepResult, TrainingProgress
 from llmtuner.trainer.runtime.training_observer import (
@@ -631,11 +632,12 @@ class Trainer:
             with synchronize_local_errors(
                 "Training profiler initialization", group=self.error_group
             ):
-                profiler_context = assembly.build_profiler(
+                builders = getattr(self, "_builders", None)
+                profiler_context = build_profiler(
                     self.cfg.profiler,
                     global_step=self.step,
                     base_folder=self.cfg.dump_folder,
-                    builders=getattr(self, "_builders", None),
+                    factory=None if builders is None else builders.profiler,
                 )
                 # Own cleanup before entry, including partially started traces.
                 self.profiler_resource = profiler_context

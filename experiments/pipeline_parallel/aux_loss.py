@@ -1,6 +1,5 @@
 """Experimental cross-stage auxiliary-loss metrics."""
 
-from collections import Counter
 from collections.abc import Sequence
 
 import torch
@@ -10,7 +9,10 @@ from torch import nn
 from experiments.pipeline_parallel.collectives import all_reduce
 from experiments.pipeline_parallel.topology import ParallelTopology
 from llmtuner.accelerator.device import device_type
-from llmtuner.models.common.aux_loss import AuxLoss, rollup_aux_loss_metrics
+from llmtuner.models.common.aux_loss import (
+    AuxLoss,
+    snapshot_aux_loss_metrics,
+)
 
 
 def collect_aux_loss_metrics(
@@ -27,27 +29,9 @@ def collect_aux_loss_metrics(
     the constructor registry; the trainer always supplies its current parts.
     """
     pp_mesh = parallel_dims.get_optional_mesh("pp")
-    counts = dict(AuxLoss._group_counts)
     runtime_totals: dict[tuple[str, str], torch.Tensor] = {}
     if model_parts is not None:
-        instances = {
-            id(module): module
-            for part in model_parts
-            for module in part.modules()
-            if isinstance(module, AuxLoss)
-        }
-        counts = Counter(
-            (module.reduce_mesh, module.metric_name) for module in instances.values()
-        )
-        for module in instances.values():
-            key = (module.reduce_mesh, module.metric_name)
-            value = module._step_metric
-            if value is None:
-                continue
-            if key not in runtime_totals:
-                runtime_totals[key] = value.clone()
-            else:
-                runtime_totals[key].add_(value)
+        counts, runtime_totals = snapshot_aux_loss_metrics(model_parts)
         if pp_mesh is not None:
             # Stage-local groups may differ, including a stage with none.
             # Agree on keys before issuing the per-group tensor collectives.
@@ -56,15 +40,14 @@ def collect_aux_loss_metrics(
                 stage_keys, sorted(counts), group=pp_mesh.get_group()
             )
             counts = {key: counts.get(key, 0) for keys in stage_keys for key in keys}
+    else:
+        counts = dict(AuxLoss._group_counts)
 
+    totals = AuxLoss.group_acc if model_parts is None else runtime_totals
     metrics = {}
     for key, count in sorted(counts.items()):
         mesh_name, tag = key
-        total = (
-            runtime_totals.get(key)
-            if model_parts is not None
-            else AuxLoss.group_acc.get(key)
-        )
+        total = totals.get(key)
         if total is None:
             # A stage with no local instance still joins every collective.
             total = torch.zeros((), dtype=torch.float32, device=device_type)
@@ -92,17 +75,3 @@ def collect_aux_loss_metrics(
     return metrics
 
 
-def register_aux_loss_metrics_hook(
-    optimizer: torch.optim.Optimizer,
-    *,
-    model_parts: Sequence[nn.Module],
-) -> None:
-    """Register the step pre-hook that rolls ``instance_acc`` into ``group_acc``.
-
-    This roll-up is local; distributed metric reduction happens later in
-    ``collect_aux_loss_metrics``.
-    """
-    tracked_parts = tuple(model_parts)
-    optimizer.register_step_pre_hook(
-        lambda *args, **kwargs: rollup_aux_loss_metrics(tracked_parts)
-    )

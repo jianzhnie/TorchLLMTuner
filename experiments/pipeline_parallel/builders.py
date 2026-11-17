@@ -7,8 +7,6 @@ from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from types import TracebackType
-
     from torch import nn
     from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
@@ -34,9 +32,10 @@ if TYPE_CHECKING:
     from llmtuner.components.optimizer.lr_scheduler import LRSchedulersContainer
     from llmtuner.config.checkpoint_config import CheckpointConfig
     from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
-    from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
+    from llmtuner.config.observability_config import MetricsConfig
     from llmtuner.config.optimizer_config import OptimizerConfig
     from llmtuner.parallel.assembly import ModelPartLayout
+    from llmtuner.trainer.runtime.builders import ProfilerFactory
 
 
 class PipelineScheduleFactory(Protocol):
@@ -116,29 +115,6 @@ class OptimizerFactory(Protocol):
     ) -> OptimizersContainer: ...
 
 
-class StepProfiler(Protocol):
-    """The entered observation service required by the training loop."""
-
-    def step(self) -> None: ...
-
-
-class ProfilerOwner(Protocol):
-    """Own tracing resources across failed entry and retryable shutdown."""
-
-    def __enter__(self) -> StepProfiler: ...
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> bool | None: ...
-
-    def close(self) -> None:
-        """Release resources; retain failed releases for a later close attempt."""
-        ...
-
-
 class SchedulerFactory(Protocol):
     """Build schedules over the actual inner optimizers, without Trainer."""
 
@@ -174,23 +150,6 @@ class CheckpointFactory(Protocol):
         folder: str,
         sd_adapter: ModelStateDictAdapter,
     ) -> BaseCheckpointManager: ...
-
-
-class ProfilerFactory(Protocol):
-    """Return a context owner with explicit, retryable close semantics.
-
-    The entered value may differ from the context owner and only needs step().
-    Factories own partial construction and context owners clean failed entry.
-    """
-
-    def __call__(
-        self,
-        config: ProfilerConfig,
-        /,
-        *,
-        global_step: int,
-        base_folder: str,
-    ) -> ProfilerOwner: ...
 
 
 @dataclass(frozen=True, slots=True)

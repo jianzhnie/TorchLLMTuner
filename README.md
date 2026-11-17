@@ -1,12 +1,12 @@
 # TorchLLMTuner
 
 > **Hybrid-parallel training for HuggingFace models over a Torch DeviceMesh** —
-> a compact, readable distributed-training framework (FSDP2 / TP / PP / CP / EP),
+> a compact, readable distributed-training framework (FSDP2 / TP / CP / EP),
 > semantically aligned with TorchTitan.
 
 `llmtuner` 用 `transformers` 的模型本体（`AutoModelForCausalLM`，离线可用
 `AutoConfig.for_model` 构造小模型），并行化的硬活集中在 `parallel/`：声明式
-TP、专家并行的 HF MoE 置换、CP 内核、PP 调度、FSDP2 包装，全部按一张显式的
+TP、专家并行的 HF MoE 置换、CP 内核、FSDP2 包装，全部按一张显式的
 装配顺序表（`parallel/stages.py`）组合，不支持的组合在配置期或装配期
 loud-raise（组合裁决集中在 `parallel/compatibility.py`），绝不静默退化。
 
@@ -19,8 +19,9 @@ loud-raise（组合裁决集中在 `parallel/compatibility.py`），绝不静默
 - **TP**：序列并行构造（HF tp_plan 驱动，`ColumnParallelLinear` / `RowParallelLinear`
   自带通信边界）；MoE-under-TP（专家 F 维分片 + 块边界 AG/RS）；可选逐 block
   compile、async TP、regional inductor（`parallel/model_compile.py`）。
-- **PP**：1F1B / Interleaved1F1B；first-stage modules 并入；validation 走 schedule
-  的 eval 通路；打包真实语料的 positions 随 microbatch 穿管。
+- **实验 PP**：实现、装配、执行入口及配置已迁入
+  [`experiments/pipeline_parallel`](experiments/pipeline_parallel/README.md)。
+  生产 Trainer 只接受 PP=1，PP 专用测试已删除。
 - **CP**：`kv_allgather` 与 `ulysses` 双策略，headtail 负载均衡；
   Ulysses 支持 varlen/packed。单轴 KV 的 SDPA 路径支持连续分片下的
   packed 文档掩码，packed 与负载均衡组合仍明确拒绝；单轴及双轴
@@ -28,8 +29,8 @@ loud-raise（组合裁决集中在 `parallel/compatibility.py`），绝不静默
 - **EP**：HF MoE 块置换为原生栈（权重搬运逐位精确）；AllToAll dispatcher（可选
   TorchAO padded-permute 后端）；aux-loss-free bias 与 quantile 负载均衡；
   EP 感知的 checkpoint（存全量专家张量，resume 不受 EP 度数约束）。
-- **组合**：DP×一切、TP×FSDP、CP×TP、EP×FSDP、TP×EP、TP×EP×CP、PP×EP、PP×CP、
-  PP×AC、PP×validation 等均已接线；不支持的组合由组合矩阵逐项拒绝并写明解锁条件。
+- **组合**：TP×FSDP、CP×TP、EP×FSDP、TP×EP、TP×EP×CP 等；
+  不支持的组合由组合矩阵逐项拒绝并写明解锁条件。
 - **训练侧**：分组 `LLMTunerConfig`（CLI 扁平旗标 + YAML/JSON）、在线 EMA、
   validation 循环、chunked/vocab-parallel loss、确定性模式、metrics/profiler、
   DCP 与 torch_checkpointing 双 checkpoint 后端。
@@ -80,7 +81,8 @@ DeepSeek-V3 例子里 `n_routed_experts` / `q_lora_rank` 这类字段走
 | 位置 | 职责 |
 |---|---|
 | `llmtuner/config/` | 分组配置（Model/Parallel/Optimizer/Checkpoint/Data/Training + `LLMTunerConfig` 聚合根），每组自校验 |
-| `llmtuner/parallel/` | 并行五族（`tensor_parallel` / `expert_parallel` / `context_parallel` / `pipeline_parallel` / `fully_shard_parallel`）+ `stages.py`（装配顺序）、`compatibility.py`（组合裁决）、`model_compile.py`、`topology.py` |
+| `llmtuner/parallel/` | 生产并行四族（`tensor_parallel` / `expert_parallel` / `context_parallel` / `fully_shard_parallel`）+ `stages.py`（装配顺序）、`compatibility.py`（组合裁决）、`model_compile.py`、`topology.py` |
+| `experiments/pipeline_parallel/` | 独立实验 PP 实现与入口，不随生产 Python 包发布 |
 | `llmtuner/memory/` | activation checkpoint 与其他内存优化 |
 | `llmtuner/models/` | `architecture.py`（自定义架构注册）+ `hf/`（构造、五部件 wrapper、输入切分、mask、state-dict 适配）+ `common/`（通用模型构件） |
 | `llmtuner/components/` | loss / optimizer+EMA / lr_scheduler / checkpointer / metrics / profiler / tokenizer |
@@ -112,8 +114,8 @@ state-dict FQN），全部 non-vacuous。
 - 多进程训练需要 CUDA/NCCL 或 NPU/HCCL；CPU+gloo 只能跑单进程与声明层测试。
 - TP 融合算子走 symmetric memory（CUDA）；CPU 上只验证声明层与权重切分。
 - DeepEP/HybridEP dispatcher 是登记的缺口（CUDA-only，配置期 loud-raise）。
-- 部分组合仍未支持（chunked loss×PP、PP×tied embeddings 等），
-  全部 loud-raise 且文案带解锁条件——完整矩阵见 `docs/torchllmtuner_design.md`。
+- PP 已移至实验目录，生产配置拒绝 PP>1。其他组合限制见
+  `docs/torchllmtuner_design.md`。
 - EP 的 HF 初始加载按模型布局校验：Qwen3MoE 须启用
   `checkpoint.sharded_expert_parallel`，TP>1 时还须启用
   `checkpoint.sharded_tensor_parallel`；Kimi Linear 使用独立布局适配。

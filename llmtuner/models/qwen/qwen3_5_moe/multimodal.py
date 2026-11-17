@@ -58,17 +58,18 @@ from ..context_parallel import (
     ulysses_context_parallel_attention,
 )
 from ..ops import (
+    apply_rotary_pos_emb_vision,
     causal_conv1d,
-    causal_conv1d_update,
     chunk_gdn,
     flash_attention_forward,
-    fused_recurrent_gdn,
+    gated_attention_inputs,
+    gated_delta_forward,
     grouped_matmul,
     permute,
     rms_norm,
-    rotary_mul,
     swiglu,
     unpermute,
+    vision_attention_forward,
 )
 
 
@@ -100,7 +101,6 @@ class Qwen3_5MoeRMSNorm(hf.Qwen3_5MoeRMSNorm):
             hidden_states,
             weight,
             self.eps,
-            use_eager=use_eager,
         ).to(hidden_states.dtype)
 
 
@@ -161,128 +161,12 @@ class Qwen3_5MoeGatedDeltaNet(hf.Qwen3_5MoeGatedDeltaNet):
                 **kwargs,
             )
         hidden_states = hf.apply_mask_to_padding_states(hidden_states, attention_mask)
-        batch_size, sequence_length, _ = hidden_states.shape
-        has_state = cache_params is not None and cache_params.has_previous_state(
-            self.layer_idx, state_idx=0
+        return gated_delta_forward(
+            self,
+            hidden_states,
+            cache_params=cache_params,
+            cu_seqlens=kwargs.get("cu_seqlens"),
         )
-        decode = (
-            has_state
-            and sequence_length == 1
-            and not cache_params.layers[self.layer_idx].record_past
-        )
-        recurrent_state = (
-            cache_params.layers[self.layer_idx].recurrent_states[0]
-            if has_state
-            else None
-        )
-        mixed_qkv = self.in_proj_qkv(hidden_states)
-        gate = self.in_proj_z(hidden_states).reshape(
-            batch_size, sequence_length, -1, self.head_v_dim
-        )
-        beta = self.in_proj_b(hidden_states).sigmoid()
-        decay = -self.A_log.float().exp() * F.softplus(
-            self.in_proj_a(hidden_states).float() + self.dt_bias
-        )
-        cu_seqlens = kwargs.get("cu_seqlens")
-        if cu_seqlens is not None:
-            cu_seqlens = cu_seqlens.to(torch.int64)
-        if decode:
-            mixed_qkv, _ = causal_conv1d_update(
-                mixed_qkv,
-                cache_params.layers[self.layer_idx].conv_states[0],
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
-                activation=self.activation,
-                implementation=self.causal_conv1d_implementation,
-            )
-        else:
-            if cache_params is not None:
-                mixed_qkv = cache_params.update_conv_state(
-                    mixed_qkv.transpose(1, 2),
-                    self.layer_idx,
-                    conv_kernel_size=self.conv_kernel_size,
-                ).transpose(1, 2)
-            mixed_qkv, _ = causal_conv1d(
-                mixed_qkv,
-                self.conv1d.weight.squeeze(1).transpose(0, 1),
-                self.conv1d.bias,
-                activation=self.activation,
-                cu_seqlens=cu_seqlens,
-                head_num=2 * self.num_k_heads + self.num_v_heads,
-                implementation=self.causal_conv1d_implementation,
-            )
-            mixed_qkv = mixed_qkv[:, -sequence_length:]
-        query, key, value = torch.split(
-            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
-        )
-        query = query.reshape(
-            batch_size, sequence_length, self.num_k_heads, self.head_k_dim
-        )
-        key = key.reshape(
-            batch_size, sequence_length, self.num_k_heads, self.head_k_dim
-        )
-        value = value.reshape(
-            batch_size, sequence_length, self.num_v_heads, self.head_v_dim
-        )
-        if self.num_v_heads != self.num_k_heads:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-        if decode:
-            output, state = fused_recurrent_gdn(
-                query,
-                key,
-                value,
-                decay,
-                beta,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                implementation="eager",
-            )
-        else:
-            output, state = chunk_gdn(
-                query,
-                key,
-                value,
-                decay,
-                beta,
-                initial_state=recurrent_state,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-                implementation=self.gdn_implementation,
-            )
-        if cache_params is not None:
-            cache_params.update_recurrent_state(state, self.layer_idx)
-        output = self.norm(
-            output.reshape(-1, self.head_v_dim), gate.reshape(-1, self.head_v_dim)
-        )
-        return self.out_proj(output.reshape(batch_size, sequence_length, -1))
-
-
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate the configured prefix of Q/K and preserve non-rotary channels."""
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    # Keep half or full tensor for later concatenation
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-    q_embed = rotary_mul(q_rot, cos, sin)
-    k_embed = rotary_mul(k_rot, cos, sin)
-
-    # Concatenate back to full shape
-    q_embed = torch.cat([q_embed, q_pass], dim=-1)
-    k_embed = torch.cat([k_embed, k_pass], dim=-1)
-    return q_embed, k_embed
 
 
 class Qwen3_5MoeAttention(hf.Qwen3_5MoeAttention):
@@ -307,30 +191,9 @@ class Qwen3_5MoeAttention(hf.Qwen3_5MoeAttention):
         if kwargs.get("position_ids") is not None and kwargs["position_ids"].ndim == 3:
             kwargs["position_ids"] = kwargs["position_ids"][0]
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
-            2,
-            dim=-1,
+        query_states, key_states, value_states, gate = gated_attention_inputs(
+            self, hidden_states, position_embeddings, past_key_values
         )
-        gate = gate.reshape(*input_shape, -1)
-
-        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(
-            self.k_proj(hidden_states).view(hidden_shape)
-        ).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
-        )
-
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx
-            )
 
         attention_interface = _attention_interface(self.config._attn_implementation)
         total_seq_len = query_states.shape[2]
@@ -392,24 +255,17 @@ class Qwen3_5MoeExperts(hf.Qwen3_5MoeExperts):
         """Route tokens with HF weights in [expert, output, input] layout."""
         if not self.use_grouped_expert_matmul:
             return super().forward(hidden_states, top_k_index, top_k_weights)
-        use_eager = hidden_states.device.type != "npu"
-        permuted, row_ids = permute(
-            hidden_states, top_k_index.to(torch.int32), use_eager=use_eager
-        )
-        if use_eager:
+        permuted, row_ids = permute(hidden_states, top_k_index.to(torch.int32))
+        if hidden_states.device.type != "npu":
             counts = torch.bincount(top_k_index.reshape(-1), minlength=self.num_experts)
         else:
             counts = torch.histc(
                 top_k_index, bins=self.num_experts, min=0, max=self.num_experts
             )
-        projected = grouped_matmul(
-            permuted, counts, self.gate_up_proj, use_eager=use_eager
-        )
-        activated = swiglu(projected, fused=not use_eager)
-        projected = grouped_matmul(
-            activated, counts, self.down_proj, use_eager=use_eager
-        )
-        return unpermute(projected, row_ids, probs=top_k_weights, use_eager=use_eager)
+        projected = grouped_matmul(permuted, counts, self.gate_up_proj)
+        activated = swiglu(projected)
+        projected = grouped_matmul(activated, counts, self.down_proj)
+        return unpermute(projected, row_ids, probs=top_k_weights)
 
 
 class Qwen3_5MoeSparseMoeBlock(hf.Qwen3_5MoeSparseMoeBlock):
@@ -432,21 +288,6 @@ class Qwen3_5MoeSparseMoeBlock(hf.Qwen3_5MoeSparseMoeBlock):
         return (expert_output + shared_output).reshape(
             batch_size, sequence_length, hidden_size
         )
-
-
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute vision RoPE in FP32 before restoring Q/K dtypes."""
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = rotary_mul(q, cos, sin)
-    k_embed = rotary_mul(k, cos, sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-    return q_embed, k_embed
 
 
 class Qwen3_5MoeVisionAttention(hf.Qwen3_5MoeVisionAttention):
@@ -554,75 +395,14 @@ class Qwen3_5MoeVisionAttention(hf.Qwen3_5MoeVisionAttention):
             return self._forward_cp(
                 hidden_states, cu_seqlens, rotary_pos_emb, position_embeddings, **kwargs
             )
-        seq_length = hidden_states.shape[0]
-        query_states, key_states, value_states = (
-            self.qkv(hidden_states)
-            .reshape(seq_length, 3, self.num_heads, -1)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
+        return vision_attention_forward(
+            self,
+            _attention_interface,
+            hidden_states,
+            cu_seqlens,
+            position_embeddings,
+            **kwargs,
         )
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(
-            query_states, key_states, cos, sin
-        )
-
-        attention_interface = _attention_interface(self.config._attn_implementation)
-
-        if self.config._attn_implementation == "flash_attention_2":
-            query_states = query_states.unsqueeze(0)
-            key_states = key_states.unsqueeze(0)
-            value_states = value_states.unsqueeze(0)
-
-            # Flash Attention 2: Use cu_seqlens for variable length attention
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            attn_output, _ = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                is_causal=False,
-                total_seq_len=seq_length,
-                input_layout="1TND",
-                **kwargs,
-            )
-        else:
-            query_states = query_states.transpose(0, 1).unsqueeze(0)
-            key_states = key_states.transpose(0, 1).unsqueeze(0)
-            value_states = value_states.transpose(0, 1).unsqueeze(0)
-
-            # Other implementations: Process each chunk separately
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2)
-                for tensor in (query_states, key_states, value_states)
-            ]
-
-            attn_outputs = [
-                attention_interface(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
-                    **kwargs,
-                )[0]
-                for q, k, v in zip(*splits, strict=True)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
-
-        attn_output = attn_output.reshape(seq_length, -1).contiguous()
-        attn_output = self.proj(attn_output)
-        return attn_output
 
 
 class Qwen3_5MoeVisionPatchMerger(hf.Qwen3_5MoeVisionPatchMerger):

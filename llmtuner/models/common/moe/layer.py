@@ -269,39 +269,23 @@ class MoE(nn.Module):
         tokens = x.reshape(-1, x.shape[-1]) if restore_shape else x
         if restore_shape and padding_mask is not None:
             padding_mask = padding_mask.reshape(-1)
-        out = self._forward_tokens(tokens, padding_mask_T=padding_mask)
-        if restore_shape:
-            out = out.reshape(*x.shape[:-1], out.shape[-1])
-        # Reproduce the replaced HF block's return arity. The second element is
-        # ``None``: llmtuner's router consumes its scores internally, and the
-        # swap refuses a config that would make HF read them (see
-        # ``model_replacement``).
-        return (out, None) if self.returns_router_logits else out
-
-    def _forward_tokens(
-        self,
-        x_TD: torch.Tensor,
-        *,
-        padding_mask_T: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """The MoE computation over a flat ``(T, D)`` token stream."""
         # (T, K) scores and ids; (T, E) map of which experts each token picked.
         (
             topk_scores_TK,
             topk_expert_ids_TK,
             routing_map_TE,
-        ) = self.router(x_TD, self.expert_bias_E, padding_mask_T=padding_mask_T)
+        ) = self.router(tokens, self.expert_bias_E, padding_mask_T=padding_mask)
         num_local_tokens_per_expert_E = routing_map_TE.sum(dim=0)
 
         out_TD = self.routed_experts(
-            x_TD,
+            tokens,
             topk_scores_TK,
             topk_expert_ids_TK,
             num_local_tokens_per_expert_E,
         )
 
         if self.shared_experts is not None:
-            out_TD = out_TD + self.shared_experts(x_TD)
+            out_TD = out_TD + self.shared_experts(tokens)
         # Commit this block's observations only after both expert paths succeed.
         # Earlier accumulated microbatches remain owned by the optimizer step.
         if self.training:
@@ -313,12 +297,16 @@ class MoE(nn.Module):
                 # must not steer the bias.
                 valid_counts_E = (
                     num_local_tokens_per_expert_E
-                    if padding_mask_T is None
-                    else (routing_map_TE & ~padding_mask_T.unsqueeze(-1)).sum(dim=0)
+                    if padding_mask is None
+                    else (routing_map_TE & ~padding_mask.unsqueeze(-1)).sum(dim=0)
                 )
                 accumulate_forward_metric(self.tokens_per_expert_E, valid_counts_E)
 
-        return out_TD
+        if restore_shape:
+            out_TD = out_TD.reshape(*x.shape[:-1], out_TD.shape[-1])
+        # Preserve the replaced block's return arity. Router scores are consumed
+        # internally; conversion rejects models that require them in the output.
+        return (out_TD, None) if self.returns_router_logits else out_TD
 
 
 def collect_moe_layers(model_part: nn.Module) -> list[MoE]:

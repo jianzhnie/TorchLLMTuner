@@ -7,21 +7,18 @@ The caller validates all targets before publishing any replacement.
 
 from __future__ import annotations
 
-import torch
 from torch import nn
 
 from ...errors import UnsupportedCombinationError
 from ...models.common.moe.layer import MoE
-from .model_conversion import uses_model_expert_conversion
 
 
 def bind_shared_projection(
     owner: nn.Module,
     names: tuple[str, ...],
-    sources: tuple[torch.Tensor, ...],
+    source: nn.Parameter,
     *,
     converted_parameters: dict[int, tuple[nn.Parameter, ...]],
-    stacked_projection_sources: dict[int, tuple[int, ...]],
     external_parameters: dict[int, list[str]],
 ) -> None:
     """Bind one new projection while preserving source ownership and row order.
@@ -29,66 +26,36 @@ def bind_shared_projection(
     Only replacement modules and local planning indexes are changed here;
     installation into the live model remains the caller's final phase.
     """
-    previous = [converted_parameters.get(id(s)) for s in sources]
-    if all(entry is None for entry in previous):
+    shared = converted_parameters.get(id(source))
+    if shared is None:
         targets = tuple(getattr(owner, name) for name in names)
         # Unchanged layouts can keep the original Parameter, also
         # preserving consumers outside the converted MoE subtree.
-        # Split gate/up, stacked per-expert and EP-sharded
-        # projections have new layouts.
+        # Split gate/up and EP-sharded projections have new layouts.
         if (
-            len(sources) == 1
-            and len(targets) == 1
-            and isinstance(sources[0], nn.Parameter)
-            and type(sources[0]) is type(targets[0])
-            and sources[0].shape == targets[0].shape
-            and sources[0].dtype == targets[0].dtype
-            and sources[0].device == targets[0].device
+            len(targets) == 1
+            and type(source) is type(targets[0])
+            and source.shape == targets[0].shape
+            and source.dtype == targets[0].dtype
+            and source.device == targets[0].device
         ):
-            setattr(owner, names[0], sources[0])
-            targets = (sources[0],)
-        for source in sources:
-            external = external_parameters.get(id(source), [])
-            if external and not (len(targets) == 1 and targets[0] is source):
-                raise UnsupportedCombinationError(
-                    "MoE conversion changes the layout of a "
-                    "parameter also registered outside converted "
-                    f"blocks at {external}; split, stacked or "
-                    "EP-sharded expert aliases require an adapted "
-                    "external consumer. Register aliases to the "
-                    "converted expert parameters after EP conversion."
-                )
-            converted_parameters[id(source)] = targets
-        if len(sources) > 1:
-            stacked_projection_sources[id(targets[0])] = tuple(
-                id(source) for source in sources
+            setattr(owner, names[0], source)
+            targets = (source,)
+        external = external_parameters.get(id(source), [])
+        if external and not (len(targets) == 1 and targets[0] is source):
+            raise UnsupportedCombinationError(
+                "MoE conversion changes the layout of a "
+                "parameter also registered outside converted "
+                f"blocks at {external}; split or EP-sharded expert aliases "
+                "require an adapted external consumer. Register aliases to "
+                "the converted expert parameters after EP conversion."
             )
+        converted_parameters[id(source)] = targets
         return
-    shared = previous[0]
-    consistent = (
-        shared is not None
-        and len(shared) == len(names)
-        and all(
-            entry is not None
-            and len(entry) == len(shared)
-            and all(a is b for a, b in zip(entry, shared, strict=True))
-            for entry in previous
-        )
-    )
-    if not consistent:
+    if len(shared) != len(names):
         raise UnsupportedCombinationError(
-            "MoE conversion cannot preserve a partially shared expert "
-            "projection: stacking binds the whole projection to one "
-            "grouped parameter, so a shared projection must be shared "
-            "whole, with the same owner, by every converted block."
-        )
-    if len(sources) > 1 and stacked_projection_sources.get(id(shared[0])) != tuple(
-        id(source) for source in sources
-    ):
-        raise UnsupportedCombinationError(
-            "MoE conversion cannot preserve a shared projection with "
-            "different expert order; stacked rows must refer to the "
-            "same source parameters in the same order."
+            "MoE conversion requires shared projections to have the same "
+            "number of target parameters in every converted block."
         )
     for name, parameter in zip(names, shared, strict=True):
         setattr(owner, name, parameter)
@@ -96,9 +63,11 @@ def bind_shared_projection(
 
 def plan_tp_checkpoint_layouts(
     module_paths: list[tuple[str, nn.Module]],
-    candidates: list[tuple[nn.Module, str, nn.Module, bool]],
+    expert_replacements: dict[nn.Module, nn.Module],
     converted_blocks: dict[int, MoE],
     replaced_roots: list[str],
+    *,
+    router_replacements: dict[nn.Module, nn.Module],
 ) -> list[tuple[nn.Module, dict]]:
     """Plan TP registration renames without modifying any live owner."""
     # TP registers physical HF slices before this swap. Gate/up becomes two
@@ -114,25 +83,37 @@ def plan_tp_checkpoint_layouts(
         for root in replaced_roots
         for name, targets in projection_names.items()
     }
-    shared_prefixes = tuple(f"{root}.shared_expert." for root in replaced_roots)
-    converted_expert_owners_by_module: dict[int, nn.Module] = {}
-    seen_blocks: set[int] = set()
-    for _, _, block, _ in candidates:
-        identity = id(block)
-        if identity in seen_blocks:
+    child_renames = []
+    for path, block in module_paths:
+        if id(block) not in converted_blocks:
             continue
-        seen_blocks.add(identity)
-        if identity in converted_blocks and not uses_model_expert_conversion(block):
-            converted_expert_owners_by_module.setdefault(
-                id(block.experts),
-                converted_blocks[identity].routed_experts.inner_experts,
+        if block._modules.get("experts") not in expert_replacements:
+            continue  # Model-owned conversions own their internal paths.
+        contract = block.moe_contract
+        prefix = f"{path}." if path else ""
+        child_renames.append(
+            (path, f"{prefix}{contract.router}.", f"{prefix}router.gate.")
+        )
+        if contract.shared_expert is not None:
+            child_renames.append(
+                (
+                    path,
+                    f"{prefix}{contract.shared_expert}.",
+                    f"{prefix}shared_experts.",
+                )
             )
     converted_layouts = []
     for owner_path, owner in module_paths:
         layouts = owner.__dict__.get("_tp_checkpoint_layouts")
         if layouts is None:
             continue
-        expert_owner = converted_expert_owners_by_module.get(id(owner))
+        router_owner = router_replacements.get(owner)
+        if router_owner is not None:
+            # Router projections keep their local parameter names and axes;
+            # only their owning module changes during EP conversion.
+            converted_layouts.append((router_owner, dict(layouts)))
+            continue
+        expert_owner = expert_replacements.get(owner)
         if expert_owner is not None:
             updated = {}
             for name, layout in layouts.items():
@@ -146,15 +127,23 @@ def plan_tp_checkpoint_layouts(
             converted_layouts.append((expert_owner, updated))
             continue
         updated = {}
+        # Ancestor ownership is constant for all registrations on this module.
+        renames = [
+            (source, target)
+            for root, source, target in child_renames
+            if not owner_path or owner_path == root or root.startswith(owner_path + ".")
+        ]
         for name, layout in layouts.items():
             full_name = f"{owner_path}.{name}" if owner_path else name
             replacement = projection_replacements.get(full_name)
             if replacement is None:
-                if full_name.startswith(shared_prefixes) and "shared_expert." in name:
-                    # The reused shared module keeps its own relative
-                    # registrations. Only an ancestor's path needs renaming.
-                    parent, suffix = name.rsplit("shared_expert.", 1)
-                    name = f"{parent}shared_experts.{suffix}"
+                for source, target in renames:
+                    # Only ancestor registrations need path changes. A reused
+                    # child's own local names remain relative to that child.
+                    if full_name.startswith(source):
+                        renamed = target + full_name[len(source) :]
+                        name = renamed[len(owner_path) + 1 :] if owner_path else renamed
+                        break
                 updated[name] = layout
                 continue
             prefix = name.rsplit("experts.", 1)[0]

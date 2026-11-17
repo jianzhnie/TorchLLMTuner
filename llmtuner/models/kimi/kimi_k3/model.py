@@ -61,10 +61,10 @@ from transformers.modeling_outputs import (
 )
 
 from ....errors import UnsupportedCombinationError
-from ...common.linear import build_lm_head
-from ...common.input_preparation import prepare_text_inputs, restore_text_batch_rows
-from ...common.moe.layer import MoE
 from ...common.attention import temporary_attention_mask
+from ...common.input_preparation import prepare_text_inputs, restore_text_batch_rows
+from ...common.linear import build_lm_head
+from ...common.moe.layer import MoE
 from ...configuration import (
     validate_attention_backend,
     validate_native_execution_policy,
@@ -73,7 +73,7 @@ from ...contracts import DecoderStructure
 from ...execution import ModelExecutionCapabilities
 from .attention_residual import attention_residual
 from .configuration import KimiLinearConfig
-from .delta_attention import KimiDeltaAttention
+from .delta_attention import KimiDeltaAttention, validate_kimi_kda_runtime
 from .latent_attention import KimiLatentAttention
 from .mlp import KimiMLP as KimiMLP
 from .moe import KimiMoEGate, KimiRoutedExperts, KimiSparseMoE
@@ -373,6 +373,8 @@ class KimiLinearForCausalLM(PreTrainedModel):
     _supports_sdpa = True
     _supports_attention_backend = True
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+    validate_runtime = staticmethod(validate_kimi_kda_runtime)
 
     def __init__(self, config: KimiLinearConfig) -> None:
         validate_native_execution_policy(config, model_name="Kimi")

@@ -217,7 +217,8 @@ class FSDPPatternReferences:
                     )
                     if path is None:
                         raise ValueError(
-                            f"FSDP pattern {pattern!r}: hook_module lost its registered "
+                            f"FSDP pattern {pattern!r}: hook_module lost its "
+                            "registered "
                             "paths during model transformation; configure the "
                             "override on the converted model"
                         )

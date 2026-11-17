@@ -16,18 +16,16 @@ from ...models.common.moe.experts import (
     RoutedExperts,
 )
 from ...models.common.moe.layer import MoE
-from ...models.common.moe.layout import (
-    MoERoutingBinding,
-    PackedExpertBinding,
-    resolve_moe_routing,
-    resolve_packed_experts,
-)
 from ...models.common.moe.routing import (
     QuantileBalancedTopKRouter,
     TokenChoiceTopKRouter,
 )
 from .. import compatibility
 from ..tensor_parallel.sequence_boundary import FeatureParallelSequenceBoundary
+from .bindings import (
+    MoERoutingBinding,
+    PackedExpertBinding,
+)
 from .checkpointing import mark_experts_ep_sharded
 from .domino_dispatch import DominoRoutedExperts
 from .mc2_dispatch import MC2GroupedExperts, MC2RoutedExperts
@@ -125,6 +123,8 @@ def validate_moe_conversion(
 def convert_block(
     block: nn.Module,
     *,
+    routing: MoERoutingBinding,
+    packed_experts: PackedExpertBinding,
     ep_group: dist.ProcessGroup | None,
     aux_loss_coeff: float | None,
     load_balance_coeff: float | None,
@@ -132,14 +132,15 @@ def convert_block(
     token_dispatcher: str,
     torchao_pad_multiple: int,
     tp_enabled: bool = False,
-    routing: MoERoutingBinding | None = None,
-    packed_experts: PackedExpertBinding | None = None,
 ) -> MoE:
-    """Build the llmtuner MoE for one HF block and move its weights over."""
+    """Build one MoE from resolved bindings and copy its expert slice.
+
+    Callers resolve all targets before allocation. Execution validates these
+    bindings against the live block instead of discovering a replacement plan.
+    """
     ep_size = 1 if ep_group is None else get_world_size(ep_group)
     ep_rank = 0 if ep_group is None else get_rank(ep_group)
 
-    routing = routing if routing is not None else resolve_moe_routing(block)
     validate_moe_conversion(
         block,
         routing,
@@ -150,8 +151,6 @@ def convert_block(
     router_gate = routing.router
     shared = routing.shared
     feature_parallel = isinstance(block, FeatureParallelSequenceBoundary)
-    if packed_experts is None:
-        packed_experts = resolve_packed_experts(block, degree=ep_size)
     experts = packed_experts.projections(block)
 
     num_experts = experts.num_experts

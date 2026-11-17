@@ -81,7 +81,7 @@ def build_step_metrics(
         all_reduce(ntokens_seen_tensor, group=loss_mesh.get_group())
         global_ntokens_seen = float(ntokens_seen_tensor)
     else:
-        local_max = loss_sum.clone()
+        local_max = loss_sum
         global_ntokens_seen = float(ntokens_seen)
     metrics = {
         "loss": float(loss_sum),
@@ -106,7 +106,8 @@ def collect_update_metrics(
     Every reporting rank participates in the same reductions.
     Non-reporting steps do not call this function.
     """
+    if parallel_dims is None:
+        return result
     metrics = dict(result.auxiliary_metrics)
-    if parallel_dims is not None:
-        metrics.update(collect_aux_loss_metrics(parallel_dims, model_parts=model_parts))
+    metrics.update(collect_aux_loss_metrics(parallel_dims, model_parts=model_parts))
     return replace(result, auxiliary_metrics=metrics)

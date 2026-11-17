@@ -15,8 +15,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from llmtuner.accelerator.collectives import all_reduce
-
+from ....accelerator.collectives import all_reduce
 from .layer import MoE, collect_moe_layers
 from .routing import QuantileBalancedTopKRouter
 
@@ -56,23 +55,30 @@ def _reduce_token_statistics(
     statistics: Sequence[torch.Tensor], parallel_dims: ParallelTopology | None
 ) -> tuple[torch.Tensor, ...]:
     """Sum token-partial counts over DP, CP, and TP when EP uses its tokens."""
+    if not statistics:
+        return ()
+    groups = []
+    if parallel_dims is not None:
+        axes = ("dp", "cp", "tp") if parallel_dims.ep_enabled else ("dp", "cp")
+        for axis in axes:
+            mesh = parallel_dims.get_optional_mesh(axis)
+            if mesh is not None:
+                groups.append(mesh.get_group())
     # Shared counters have identical ownership on every rank. Reduce each
     # object once, then restore the caller's layer order without copying.
     unique = list({id(tensor): tensor for tensor in statistics}.values())
-    flattened = torch.cat([tensor.reshape(-1) for tensor in unique])
-    axes = ["dp", "cp"] + (["tp"] if parallel_dims and parallel_dims.ep_enabled else [])
-    for axis in axes:
-        mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh(axis)
-        if mesh is None:
-            continue
-        all_reduce(flattened, group=mesh.get_group())
+    if groups:
+        flattened = torch.cat([tensor.reshape(-1) for tensor in unique])
+        for group in groups:
+            all_reduce(flattened, group=group)
+        snapshots = flattened.split([tensor.numel() for tensor in unique])
+    else:
+        # Updates drain the source buffers. Snapshot each shared buffer once so
+        # later bias owners still read the complete accumulation window.
+        snapshots = [tensor.clone() for tensor in unique]
     reduced_by_id = {
         id(tensor): reduced.reshape(tensor.shape)
-        for reduced, tensor in zip(
-            flattened.split([tensor.numel() for tensor in unique]),
-            unique,
-            strict=True,
-        )
+        for tensor, reduced in zip(unique, snapshots, strict=True)
     }
     return tuple(reduced_by_id[id(tensor)] for tensor in statistics)
 
@@ -117,9 +123,7 @@ def collect_routing_load_metrics(
             totals[0] += active
             totals[1] += active * (values == 0).float().mean()
             totals[2] += active * floating_values.std(unbiased=False) / denominator
-            totals[3] = torch.maximum(
-                totals[3], active * values.max() / denominator
-            )
+            totals[3] = torch.maximum(totals[3], active * values.max() / denominator)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.all_reduce(totals[:3])
         torch.distributed.all_reduce(totals[3:], op=torch.distributed.ReduceOp.MAX)
@@ -257,11 +261,11 @@ def register_moe_balancing_hook(
     layers = _runtime_moe_layers(model_parts)
     if not layers:
         return
-    quantile_layers = [
-        moe for moe in layers if isinstance(moe.router, QuantileBalancedTopKRouter)
-    ]
-    if quantile_layers:
-        if len(quantile_layers) != len(layers) or any(
+    quantile_count = sum(
+        isinstance(moe.router, QuantileBalancedTopKRouter) for moe in layers
+    )
+    if quantile_count:
+        if quantile_count != len(layers) or any(
             moe.load_balance_coeff is not None for moe in layers
         ):
             raise ValueError(

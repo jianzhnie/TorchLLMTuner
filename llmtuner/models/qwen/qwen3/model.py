@@ -77,17 +77,18 @@ from ...common.attention import (
     build_dense_attention_mask,
     temporary_attention_mask,
 )
-from ...common.linear import build_lm_head
 from ...common.gradient_norm import (
     ReferenceNormGroup,
     packed_expert_reference_norm_group,
     qkv_reference_norm_group,
 )
 from ...common.input_preparation import prepare_text_inputs
+from ...common.linear import build_lm_head
 from ...common.moe.layer import collect_moe_layers
 from ...configuration import configure_reference_experts, validate_attention_backend
 from ...contracts import DecoderStructure, MoEBlockContract
 from ...execution import ModelExecutionCapabilities
+from ..ops import eager_experts_forward
 from ..routing import Qwen3MoeFP32TopKRouter, validate_router_compute_dtype
 from .normalization import build_rms_norm, validate_norm_backend
 from .rotary import (
@@ -335,20 +336,7 @@ class Qwen3MoeExperts(HFQwen3MoeExperts):
     def forward(
         self, hidden_states: Tensor, top_k_index: Tensor, top_k_weights: Tensor
     ) -> Tensor:
-        output = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-            active_experts = (mask.sum(dim=(-1, -2)) > 0).nonzero()
-        for expert in active_experts:
-            expert_idx = expert[0]
-            top_k_pos, token_idx = torch.where(mask[expert_idx])
-            gate, up = F.linear(
-                hidden_states[token_idx], self.gate_up_proj[expert_idx]
-            ).chunk(2, dim=-1)
-            values = F.linear(self.act_fn(gate) * up, self.down_proj[expert_idx])
-            values = values * top_k_weights[token_idx, top_k_pos, None]
-            output.index_add_(0, token_idx, values.to(output.dtype))
-        return output
+        return eager_experts_forward(self, hidden_states, top_k_index, top_k_weights)
 
 
 class Qwen3MoeTopKRouter(HFQwen3MoeTopKRouter):

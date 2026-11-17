@@ -264,21 +264,21 @@ def validate(
         if staging_failure is not None:
             raise staging_failure
 
-    training_modes = {
-        module: module.training
-        for part in engine.model_parts
-        for module in part.modules()
-    }
-    parameter_gradients = {
-        parameter: parameter.grad
-        for part in engine.model_parts
-        for parameter in part.parameters()
-    }
     model_contexts = ExitStack()
     with ExitStack() as resources:
-        # RNG capture is local and may fail before mode setup. Peers must not
-        # begin validation forward until every rank owns its restoration context.
+        # State capture is local and may fail before mode setup. Peers must not
+        # begin validation forward until every rank owns its restoration state.
         with synchronize_local_errors("Validation RNG setup", group=engine.error_group):
+            training_modes = {
+                module: module.training
+                for part in engine.model_parts
+                for module in part.modules()
+            }
+            parameter_gradients = {
+                parameter: parameter.grad
+                for part in engine.model_parts
+                for parameter in part.parameters()
+            }
             resources.enter_context(preserve_rng_state(engine.device))
         try:
             with synchronize_local_errors(
@@ -318,13 +318,15 @@ def validate(
                 step=step,
             )
         finally:
-            for parameter, gradient in parameter_gradients.items():
-                parameter.grad = gradient
             try:
-                model_contexts.close()
+                for parameter, gradient in parameter_gradients.items():
+                    parameter.grad = gradient
             finally:
-                for module, training in training_modes.items():
-                    module.training = training
+                try:
+                    model_contexts.close()
+                finally:
+                    for module, training in training_modes.items():
+                        module.training = training
         # Only a successful pass reaches this boundary. On pass failure the
         # stack unwinds normally, preserving the original error without new
         # communication that peers may no longer reach.

@@ -9,10 +9,9 @@ from transformers.cache_utils import Cache
 from transformers.models.deepseek_v4 import modeling_deepseek_v4 as reference
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
-from .compression_math import compress_overlap_context_parallel
+from .compression_math import compress_overlap, compress_overlap_context_parallel
 from .indexer import DeepseekV4Indexer
 from .normalization import DeepseekV4RMSNorm
-from .overlap import assemble_overlap_windows
 from .rotary import DeepseekV4RotaryEmbedding, apply_rotary_pos_emb
 
 
@@ -55,48 +54,9 @@ class DeepseekV4CSACompressor(reference.DeepseekV4CSACompressor):
         cache = (
             past_key_values.layers[layer_idx] if past_key_values is not None else None
         )
-        kv = self.kv_proj(hidden_states)
-        gate = self.gate_proj(hidden_states)
-        ratio = self.compress_rate
-        if cache is None:
-            usable = (kv.shape[1] // ratio) * ratio
-            chunk_kv, chunk_gate, first_position = kv[:, :usable], gate[:, :usable], 0
-        else:
-            chunk_kv, chunk_gate, first_position = cache.store_compression_weights(
-                "compressor", kv, gate
-            )
-        if chunk_kv.shape[1] > 0:
-            windows = chunk_kv.shape[1] // ratio
-            chunk_kv = chunk_kv.view(batch, windows, ratio, -1)
-            chunk_gate = chunk_gate.view(batch, windows, ratio, -1) + self.position_bias
-            combined_kv, combined_gate = assemble_overlap_windows(
-                chunk_kv, chunk_gate, self.head_dim
-            )
-            if cache is not None:
-                prior_kv, prior_gate = cache.update_overlap_state(
-                    "compressor", chunk_kv, chunk_gate, self.head_dim
-                )
-                if prior_kv is not None:
-                    combined_kv[:, 0, :ratio] = prior_kv.to(combined_kv.dtype)
-                    combined_gate[:, 0, :ratio] = prior_gate.to(combined_gate.dtype)
-            weights = combined_gate.softmax(dim=2, dtype=torch.float32).to(
-                combined_kv.dtype
-            )
-            compressed = self.kv_norm((combined_kv * weights).sum(dim=2))
-            positions = torch.arange(windows, device=compressed.device)
-            positions = (
-                (positions * ratio + first_position).unsqueeze(0).expand(batch, -1)
-            )
-            cosine, sine = self.rotary_emb(
-                compressed, position_ids=positions, layer_type=self.rope_layer_type
-            )
-            compressed = apply_rotary_pos_emb(
-                compressed.unsqueeze(1), cosine, sine
-            ).squeeze(1)
-        else:
-            compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
-        if cache is not None:
-            compressed = cache.update_compressor_states("compressor", compressed)
+        compressed = compress_overlap(
+            self, hidden_states, cache=cache, cache_key="compressor"
+        )
         compressed_kv = compressed.unsqueeze(1)
         selected = self.indexer(
             hidden_states, q_residual, position_ids, past_key_values, layer_idx

@@ -296,7 +296,5 @@ class TrainingObserver:
             "steady/step_p50_seconds": _sorted_percentile(durations, 0.5),
             "steady/step_p90_seconds": _sorted_percentile(durations, 0.9),
         }
-        result.update(
-            self._throughput_metrics("steady", tps=steady_tps, world=world)
-        )
+        result.update(self._throughput_metrics("steady", tps=steady_tps, world=world))
         return result

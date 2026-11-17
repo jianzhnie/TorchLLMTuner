@@ -33,6 +33,7 @@ __all__ = [
     "AuxLoss",
     "collect_aux_loss_metrics",
     "register_aux_loss_metrics_hook",
+    "snapshot_aux_loss_metrics",
 ]
 
 # Non-reentrant activation checkpointing replays the forward during backward.
@@ -142,9 +143,13 @@ class AuxLoss(nn.Module):
         AuxLoss._group_counts[(self.reduce_mesh, self.metric_name)] += 1
 
     @classmethod
-    def has_pending_counts(cls) -> bool:
-        """Whether any aux-loss group is registered (any MoE model built)."""
-        return bool(cls._group_counts)
+    def has_pending_counts(
+        cls, *, model_parts: Sequence[nn.Module] | None = None
+    ) -> bool:
+        """Check current runtime losses, or the standalone construction registry."""
+        if model_parts is None:
+            return bool(cls._group_counts)
+        return next(_iter_aux_losses(model_parts), None) is not None
 
     @property
     def metric_name(self) -> str:
@@ -258,6 +263,25 @@ def rollup_aux_loss_metrics(model_parts: Sequence[nn.Module]) -> None:
         module.instance_acc.zero_()
 
 
+def snapshot_aux_loss_metrics(
+    model_parts: Sequence[nn.Module],
+) -> tuple[Counter[tuple[str, str]], dict[tuple[str, str], torch.Tensor]]:
+    """Count runtime-owned losses and copy their completed step snapshots."""
+    runtime_totals: dict[tuple[str, str], torch.Tensor] = {}
+    counts = Counter()
+    for module in _iter_aux_losses(model_parts):
+        key = (module.reduce_mesh, module.metric_name)
+        counts[key] += 1
+        value = module._step_metric
+        if value is None:
+            continue
+        if key not in runtime_totals:
+            runtime_totals[key] = value.clone()
+        else:
+            runtime_totals[key].add_(value)
+    return counts, runtime_totals
+
+
 def collect_aux_loss_metrics(
     parallel_dims: ParallelTopology,
     *,
@@ -270,29 +294,16 @@ def collect_aux_loss_metrics(
     supplied, use only their snapshots. Standalone calls without parts retain
     the constructor registry; the trainer always supplies its current parts.
     """
-    runtime_totals: dict[tuple[str, str], torch.Tensor] = {}
     if model_parts is None:
         counts = dict(AuxLoss._group_counts)
+        runtime_totals = {}
     else:
-        counts = Counter()
-        for module in _iter_aux_losses(model_parts):
-            key = (module.reduce_mesh, module.metric_name)
-            counts[key] += 1
-            value = module._step_metric
-            if value is None:
-                continue
-            if key not in runtime_totals:
-                runtime_totals[key] = value.clone()
-            else:
-                runtime_totals[key].add_(value)
+        counts, runtime_totals = snapshot_aux_loss_metrics(model_parts)
+    totals = AuxLoss.group_acc if model_parts is None else runtime_totals
     metrics = {}
     for key, count in sorted(counts.items()):
         mesh_name, tag = key
-        total = (
-            runtime_totals.get(key)
-            if model_parts is not None
-            else AuxLoss.group_acc.get(key)
-        )
+        total = totals.get(key)
         if total is None:
             # Missing snapshots contribute zero to the reduction.
             total = torch.zeros((), dtype=torch.float32, device=device_type)
@@ -314,6 +325,8 @@ def register_aux_loss_metrics_hook(
     ``collect_aux_loss_metrics``.
     """
     tracked_parts = tuple(model_parts)
+    if not AuxLoss.has_pending_counts(model_parts=tracked_parts):
+        return
     optimizer.register_step_pre_hook(
         lambda *args, **kwargs: rollup_aux_loss_metrics(tracked_parts)
     )

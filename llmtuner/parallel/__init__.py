@@ -10,7 +10,7 @@ Each entry decides whether it is needed from the configuration and topology.
 FSDP may still be required with a singleton DP shard axis when CP, replication,
 or expert sharding is active; callers must not skip it based only on DP degree.
 
-Pipeline parallelism has moved to ``experiment/pipeline_parallel``. Production
+Pipeline parallelism has moved to ``experiments/pipeline_parallel``. Production
 assembly returns a transformed module with its final local layout.
 """
 

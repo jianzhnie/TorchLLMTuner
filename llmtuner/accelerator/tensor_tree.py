@@ -1,4 +1,4 @@
-"""Inspect and move tensor trees while preserving their container structure.
+"""Copy local tensor storage and inspect or move tensor trees.
 
 Leaves must be tensors. Containers may be mappings, lists, tuples (including
 namedtuples), or sets. One-shot iterators and scalar metadata are unsupported.
@@ -12,6 +12,29 @@ from typing import Any
 
 import torch
 from torch import Tensor
+from torch.distributed.tensor import DTensor
+
+
+def clone_local_tensor(tensor: Tensor, *, detach: bool = False) -> Tensor:
+    """Copy local storage without redistributing DTensor placements.
+
+    Rebuild distributed metadata explicitly: ordinary DTensor clone dispatch
+    may reduce Partial placements, while state owners need a local snapshot.
+    Shape and stride preserve uneven-shard metadata without collective checks.
+    ``detach`` controls gradient ownership independently of the storage copy.
+    """
+    local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+    cloned = (local.detach() if detach else local).clone()
+    if not isinstance(tensor, DTensor):
+        return cloned
+    return DTensor.from_local(
+        cloned,
+        device_mesh=tensor.device_mesh,
+        placements=tensor.placements,
+        run_check=False,
+        shape=tensor.shape,
+        stride=tensor.stride(),
+    )
 
 
 def _children(data: Any) -> list[Any]:
@@ -80,15 +103,14 @@ def _move(data: Any, device: torch.device, out: Any = None) -> Any:
         for child, output in zip(children, outputs, strict=True)
     ]
     if isinstance(data, Mapping):
-        items = dict(zip(data, moved, strict=True))
         if isinstance(data, MutableMapping):
             result = copy(data)
             # Keep existing keys and use the mapping's assignment protocol.
             # ModelOutput forbids update() and synchronizes attributes here.
-            for key, value in items.items():
+            for key, value in zip(data, moved, strict=True):
                 result[key] = value
             return result
-        return type(data)(items)
+        return type(data)(dict(zip(data, moved, strict=True)))
     if isinstance(data, tuple) and hasattr(data, "_fields"):
         return type(data)(*moved)
     return type(data)(moved)

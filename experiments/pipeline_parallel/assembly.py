@@ -21,7 +21,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 
 from experiments.pipeline_parallel import compatibility
-from experiments.pipeline_parallel.aux_loss import register_aux_loss_metrics_hook
 from experiments.pipeline_parallel.builders import (
     PipelineScheduleFactory,
     TrainingBuilders,
@@ -64,9 +63,9 @@ from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
 from llmtuner.components.optimizer.state_residency import (
     validate_checkpoint_configuration,
 )
-from llmtuner.components.profiler import Profiler
 from llmtuner.errors import UnsupportedCombinationError
 from llmtuner.memory.materialization import materialize_meta_model
+from llmtuner.models.common.aux_loss import register_aux_loss_metrics_hook
 from llmtuner.models.common.moe.bias_update import register_moe_balancing_hook
 from llmtuner.models.configuration import (
     build_model_config_for,
@@ -84,15 +83,11 @@ if TYPE_CHECKING:
     from torch.distributed.checkpoint.stateful import Stateful
     from transformers import PretrainedConfig
 
-    from experiments.pipeline_parallel.builders import (
-        ProfilerOwner,
-    )
     from experiments.pipeline_parallel.config import (
         LLMTunerConfig,
     )
     from experiments.pipeline_parallel.environment import RuntimeEnvironment
     from experiments.pipeline_parallel.topology import ParallelTopology
-    from llmtuner.config.observability_config import ProfilerConfig
     from llmtuner.datasets.contracts import BaseDataLoader
 
 
@@ -100,27 +95,6 @@ def _resolve_factory(
     factory: Callable[..., Any] | None, default: Callable[..., Any]
 ) -> Callable[..., Any]:
     return default if factory is None else factory
-
-
-def build_profiler(
-    config: ProfilerConfig,
-    *,
-    global_step: int,
-    base_folder: str,
-    builders: TrainingBuilders | None = None,
-) -> ProfilerOwner:
-    """Construct an unentered tracing owner for Trainer's loop lifecycle.
-
-    The factory owns partial construction. Trainer retains the returned owner
-    before entering it, so close retries remain available on failure.
-    """
-    factory = _resolve_factory(
-        None if builders is None else builders.profiler, Profiler
-    )
-    owner = factory(config, global_step=global_step, base_folder=base_folder)
-    if not callable(getattr(owner, "close", None)):
-        raise TypeError("Profiler factory must return an owner with close()")
-    return owner
 
 
 @dataclass(frozen=True, slots=True)

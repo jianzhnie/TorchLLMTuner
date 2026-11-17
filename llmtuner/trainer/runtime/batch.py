@@ -261,11 +261,11 @@ def prepare_model_inputs(
     Collator token counts are not model inputs. Unread accumulation groups stay
     on the host until this function consumes them.
     """
-    if isinstance(batch, dict):
-        batch = {
-            key: value for key, value in batch.items() if key != "num_valid_tokens"
-        }
     with synchronize_local_errors("Training batch preprocessing", group=error_group):
+        if isinstance(batch, dict):
+            batch = {
+                key: value for key, value in batch.items() if key != "num_valid_tokens"
+            }
         prepare_inputs = getattr(model, "prepare_inputs", None)
         if not callable(prepare_inputs):
             raise TypeError(

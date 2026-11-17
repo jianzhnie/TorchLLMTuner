@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.distributed import ProcessGroup
@@ -75,15 +75,8 @@ if TYPE_CHECKING:
     from ...config.observability_config import ProfilerConfig
     from ...datasets.contracts import BaseDataLoader
     from ...parallel.topology import ParallelTopology
-    from .builders import ProfilerOwner
+    from .builders import ProfilerFactory, ProfilerOwner
     from .environment import RuntimeEnvironment
-
-
-_Factory = TypeVar("_Factory", bound=Callable[..., Any])
-
-
-def _resolve_factory(factory: _Factory | None, default: _Factory) -> _Factory:
-    return default if factory is None else factory
 
 
 def build_profiler(
@@ -91,16 +84,14 @@ def build_profiler(
     *,
     global_step: int,
     base_folder: str,
-    builders: TrainingBuilders | None = None,
+    factory: ProfilerFactory | None = None,
 ) -> ProfilerOwner:
     """Construct an unentered tracing owner for Trainer's loop lifecycle.
 
     The factory owns partial construction. Trainer retains the returned owner
     before entering it, so close retries remain available on failure.
     """
-    factory = _resolve_factory(
-        None if builders is None else builders.profiler, Profiler
-    )
+    factory = Profiler if factory is None else factory
     owner = factory(config, global_step=global_step, base_folder=base_folder)
     if not callable(getattr(owner, "close", None)):
         raise TypeError("Profiler factory must return an owner with close()")
@@ -225,6 +216,9 @@ def build_model(
             "TP/EP/CP paths need an ownership-aware initializer."
         )
     model_class = resolve_model_class(text_config)
+    validate_runtime = getattr(model_class, "validate_runtime", None)
+    if callable(validate_runtime):
+        validate_runtime(text_config, device)
     if initialize_from_meta:
         for method in ("initialize_parameters", "materialization_buffers"):
             if not callable(getattr(model_class, method, None)):
@@ -490,9 +484,9 @@ def build_optimizer_stack(
         if layouts:
             validate_model_part_layouts(model_parts, layouts)
     factories = builders or TrainingBuilders()
-    optimizer_factory = _resolve_factory(factories.optimizer, OptimizersContainer)
-    scheduler_factory = _resolve_factory(factories.scheduler, build_lr_scheduler)
-    ema_factory = _resolve_factory(factories.ema, EMA)
+    optimizer_factory = (
+        OptimizersContainer if factories.optimizer is None else factories.optimizer
+    )
     optimizer = optimizer_factory(
         cfg.optimizer,
         sharded_expert_parallel=cfg.checkpoint.sharded_expert_parallel,
@@ -512,6 +506,9 @@ def build_optimizer_stack(
         # service here. The built-in container transfers before construction.
         on_service_acquired("optimizer", optimizer)
     with synchronize_local_errors("Optimizer services construction", group=error_group):
+        scheduler_factory = (
+            build_lr_scheduler if factories.scheduler is None else factories.scheduler
+        )
         lr_scheduler = scheduler_factory(
             cfg.lr_scheduler_config,
             optimizers=list(optimizer),
@@ -521,6 +518,7 @@ def build_optimizer_stack(
         ema_config = cfg.training.ema
         ema = None
         if ema_config is not None:
+            ema_factory = EMA if factories.ema is None else factories.ema
             ema = ema_factory(
                 model_parts=model_parts,
                 runtime_layouts=layouts,
@@ -597,7 +595,9 @@ def build_checkpointer(
         else DistributedCheckpointManager
     )
     factories = builders or TrainingBuilders()
-    manager_factory = _resolve_factory(factories.checkpoint, manager_cls)
+    manager_factory = (
+        manager_cls if factories.checkpoint is None else factories.checkpoint
+    )
     return manager_factory(
         cfg.checkpoint,
         model_parts=model_assembly.model_parts,
@@ -630,7 +630,9 @@ def build_metrics_processor(
     The callback must retain the service without raising or performing device work.
     """
     factories = builders or TrainingBuilders()
-    metrics_factory = _resolve_factory(factories.metrics, MetricsProcessor)
+    metrics_factory = (
+        MetricsProcessor if factories.metrics is None else factories.metrics
+    )
     with synchronize_local_errors("Metrics construction", group=error_group):
         if not callable(on_service_acquired):
             raise TypeError("Metrics construction requires a callable resource owner")
