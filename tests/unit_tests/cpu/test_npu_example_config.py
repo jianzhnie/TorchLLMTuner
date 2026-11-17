@@ -2,6 +2,22 @@ import pytest
 
 from examples.train_qwen3_8b_npu import qwen3_8b_npu_config
 from examples.train_qwen3_30b_npu import qwen3_30b_npu_config
+from llmtuner.errors import ConfigError
+
+
+def test_dense_example_rejects_missing_registration_before_device_setup(monkeypatch):
+    from importlib import import_module
+
+    recipe = import_module("examples.qwen3-dense.train_qwen3_8b_npu")
+    monkeypatch.setattr(recipe, "get_model_spec", lambda name: None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Unregistered recipe changed dtype or constructed Trainer")
+
+    monkeypatch.setattr(recipe.torch, "set_default_dtype", forbidden)
+    monkeypatch.setattr(recipe, "Trainer", forbidden)
+    with pytest.raises(ConfigError, match="Qwen3 dense has no registered"):
+        recipe.main()
 
 
 @pytest.fixture(autouse=True)

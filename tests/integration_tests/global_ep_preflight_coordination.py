@@ -1,4 +1,4 @@
-"""Reject rank-local EP geometry errors before production TP/PP transforms.
+"""Reject rank-local EP geometry errors before production TP/EP transforms.
 
 Run with four ranks for TP2/EP2. This validates failure coordination and plan
 purity on small explicit models, not numerical or performance equivalence.
@@ -43,10 +43,26 @@ def main() -> None:
                 num_experts_per_tok=2,
             )
             model = Qwen3MoeForCausalLM(config).to(device)
-            parameters = tuple(model.parameters())
+            bindings = {
+                "parameter": tuple(model.named_parameters(remove_duplicate=False)),
+                "buffer": tuple(model.named_buffers(remove_duplicate=False)),
+            }
+            storage = {
+                (kind, name): value.untyped_storage().data_ptr()
+                for kind, entries in bindings.items()
+                for name, value in entries
+            }
             state = {key: value.clone() for key, value in model.state_dict().items()}
             forwards = tuple(module.forward for module in model.modules())
             rng = torch.get_rng_state().clone()
+            device_backend = (
+                torch.get_device_module(device) if device.type != "cpu" else None
+            )
+            device_rng = (
+                device_backend.get_rng_state(device).clone()
+                if device_backend is not None
+                else None
+            )
             try:
                 parallelize_model(model, cfg=cfg, mesh=mesh, parallel_dims=topology)
             except (ValueError, RuntimeError) as error:
@@ -58,11 +74,19 @@ def main() -> None:
                 assert expected in str(error), error
             else:
                 raise AssertionError("Invalid EP ownership reached parallel execution")
-            assert all(
-                a is b for a, b in zip(parameters, model.parameters(), strict=True)
-            )
+            for kind, current in (
+                ("parameter", model.named_parameters(remove_duplicate=False)),
+                ("buffer", model.named_buffers(remove_duplicate=False)),
+            ):
+                for (name, value), (original_name, original) in zip(
+                    current, bindings[kind], strict=True
+                ):
+                    assert name == original_name and value is original
+                    assert value.untyped_storage().data_ptr() == storage[kind, name]
             assert forwards == tuple(module.forward for module in model.modules())
             assert torch.equal(rng, torch.get_rng_state())
+            if device_backend is not None:
+                assert torch.equal(device_rng, device_backend.get_rng_state(device))
             for key, value in model.state_dict().items():
                 torch.testing.assert_close(value, state[key], rtol=0, atol=0)
             dist.barrier()

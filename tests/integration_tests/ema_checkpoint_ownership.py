@@ -1,8 +1,8 @@
-"""Two CPU ranks: manager restore and cold start with an empty EMA owner.
+"""Two device-selected ranks: restore and cold start with an empty EMA owner.
 
 Run with PYTHONPATH=. torchrun --nproc_per_node=2. Models are replicated and
 updated identically; EMA deliberately owns no model parts on one rank. This
-exercises manager lifecycle, not a pipeline schedule or target-device kernels.
+exercises manager lifecycle on CPU/Gloo or NPU/HCCL, not sharded ownership.
 """
 
 from copy import deepcopy
@@ -23,11 +23,12 @@ from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
 from llmtuner.config.optimizer_config import OptimizerConfig
 from tests.integration_tests.cli_checkpoint_equivalence import assert_state_equal
+from tests.integration_tests.harness import init_distributed, moved
 
 
 def runtime(seed, empty_rank):
     torch.manual_seed(seed)
-    model = torch.nn.Linear(2, 2)
+    model = moved(torch.nn.Linear(2, 2))
     optimizer = OptimizersContainer(
         OptimizerConfig(learning_rate=0.01, implementation="for-loop"),
         model_parts=[model],
@@ -42,7 +43,7 @@ def runtime(seed, empty_rank):
 def update(current):
     model, optimizer, scheduler, ema = current
     optimizer.zero_grad()
-    model(torch.tensor([[0.2, -0.4], [0.6, 0.8]])).square().sum().backward()
+    model(moved(torch.tensor([[0.2, -0.4], [0.6, 0.8]]))).square().sum().backward()
     optimizer.step()
     scheduler.step()
     ema.step(scheduler.state_dict()["last_epoch"])
@@ -128,7 +129,7 @@ def check_case(empty_rank, mode, exclude_ema):
 
 
 def main():
-    dist.init_process_group("gloo", timeout=timedelta(seconds=45))
+    init_distributed(timeout=timedelta(seconds=45))
     try:
         assert dist.get_world_size() == 2
         for empty_rank in (0, 1):

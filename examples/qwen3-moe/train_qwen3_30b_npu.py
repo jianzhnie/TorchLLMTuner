@@ -70,7 +70,7 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
     tensor_parallel_size = int(os.environ.get("LLMTUNER_TENSOR_PARALLEL_SIZE", "1"))
     expert_parallel_size = int(os.environ.get("LLMTUNER_EXPERT_PARALLEL_SIZE", "1"))
     # CP splits the sequence across ranks; the kv_allgather strategy is the one
-    # the sdpa kernel implements (see parallel/context_parallel/sdpa_attention).
+    # the sdpa kernel implements (see parallel/context_parallel/attention.py).
     context_parallel_size = int(os.environ.get("LLMTUNER_CONTEXT_PARALLEL_SIZE", "1"))
     # Deterministic kernels cost throughput; the default matches the shape of
     # this example (a training run, not a bit-reproducibility harness). Turn it
@@ -185,9 +185,9 @@ def qwen3_30b_npu_config() -> LLMTunerConfig:
                 # 1 = one document per sequence (plain causal attention, no mask
                 # materialized). A larger value packs several documents into a
                 # sequence, which needs the block-causal document mask; that is
-                # built densely on this backend (see
-                # HFTransformerModel._apply_attention) instead of via flex,
-                # which Ascend does not have.
+                # represented by the batch attention mask. Keep one document
+                # per sample unless the selected model/backend supports the
+                # packed-document mask contract.
                 max_num_documents=int(
                     os.environ.get("LLMTUNER_MAX_NUM_DOCUMENTS", "1")
                 ),

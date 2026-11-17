@@ -10,14 +10,20 @@ require --checkpoint-root on a shared filesystem. Keep TMPDIR local: PROCESS
 workers use it for host-local multiprocessing sockets. Accelerator staging
 requires an accelerator run; requesting pinned memory does not prove the
 installed PyTorch stager actually supports accelerator-pinned memory.
+Add --interrupt-close in ordinary async mode to hold real file writes pending,
+inject a KeyboardInterrupt at the upload Future wait, and retry close before
+checking the same restore and next-step equivalence.
 """
 
 import argparse
 from contextlib import nullcontext
 from tempfile import TemporaryDirectory
+from threading import Event
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from torch.distributed.checkpoint import FileSystemWriter
 
 from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
@@ -58,9 +64,48 @@ def assert_group_released(group):
     raise AssertionError("Checkpoint manager left its Gloo group registered")
 
 
+def save_with_interrupted_close(manager):
+    """Keep a real upload pending while injecting an interrupted Future wait."""
+    entered, release = Event(), Event()
+    write_data = FileSystemWriter.write_data
+
+    def blocked_write(writer, *args, **kwargs):
+        entered.set()
+        if not release.wait(60):
+            raise TimeoutError("Checkpoint write was not released")
+        return write_data(writer, *args, **kwargs)
+
+    group = manager.pg
+    try:
+        with patch.object(FileSystemWriter, "write_data", blocked_write):
+            assert manager.save(1)
+            assert entered.wait(30), "Async worker did not reach real file writing"
+            future = manager.save_future
+            assert future is not None and not future.done()
+            failure = KeyboardInterrupt("injected pending checkpoint wait interruption")
+            with patch.object(future, "result", side_effect=failure):
+                try:
+                    manager.close()
+                except KeyboardInterrupt as error:
+                    assert error is failure
+                else:
+                    raise AssertionError("Interrupted close was swallowed")
+            assert manager._initialized and manager.pg is group
+            assert manager.save_future is future and not future.done()
+            release.set()
+            manager.close()
+            manager.close()
+            assert manager.save_future is None and not manager._initialized
+            assert_group_released(group)
+    finally:
+        release.set()
+        manager.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fsdp", action="store_true")
+    parser.add_argument("--interrupt-close", action="store_true")
     parser.add_argument(
         "--async-mode", choices=("async", "async_with_pinned_mem"), default="async"
     )
@@ -69,6 +114,10 @@ def main():
         help="Shared parent for checkpoint artifacts; TMPDIR stays local",
     )
     args = parser.parse_args()
+    if args.interrupt_close and args.async_mode != "async":
+        parser.error(
+            "--interrupt-close requires thread uploads with --async-mode async"
+        )
     device = init_distributed()
     active = []
     try:
@@ -118,7 +167,13 @@ def main():
                 active.append(manager)
                 group = manager.pg
                 assert group is not None
-                assert manager.save(1)
+                if args.interrupt_close:
+                    save_with_interrupted_close(manager)
+                    manager = manager_for(model, optimizer, scheduler, folder)
+                    active.append(manager)
+                    group = manager.pg
+                else:
+                    assert manager.save(1)
                 # Training may resume once the snapshot is staged, without
                 # waiting for upload/close. Mutate parameters, moments and the
                 # decaying schedule before loading the older checkpoint.
@@ -175,6 +230,7 @@ def main():
                 if rank == 0:
                     print(
                         f"cycle {cycle}: {args.async_mode} fsdp={args.fsdp} "
+                        f"interrupt_close={args.interrupt_close} "
                         "resume and group teardown match"
                     )
             dist.barrier()

@@ -98,6 +98,13 @@ def test_recipe_rejects_invalid_layer_reduction(tmp_path, layers):
         build_config(recipe_args(tmp_path, layers=layers))
 
 
+def test_recipe_rejects_unregistered_dense_text_model(tmp_path):
+    args = recipe_args(tmp_path)
+    AutoConfig.for_model("qwen3_5").save_pretrained(args.model)
+    with pytest.raises(ConfigError, match="No local text model.*qwen3_5_text"):
+        build_config(args)
+
+
 def test_meta_materialization_initializes_delta_state_and_backward():
     architecture = AutoConfig.for_model(
         "qwen3_5_moe_text",

@@ -37,6 +37,8 @@ from llmtuner.config import (
     ParallelConfig,
     TrainingConfig,
 )
+from llmtuner.errors import ConfigError
+from llmtuner.models.registry import get_model_spec
 
 MODEL_PATH = "/home/jianzhnie/llmtuner/hfhub/models/Qwen/Qwen3-8B"
 DATASET_PATH = (
@@ -50,7 +52,7 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
     save_checkpoint = os.environ.get("LLMTUNER_SAVE_CHECKPOINT", "1") == "1"
     tensor_parallel_size = int(os.environ.get("LLMTUNER_TENSOR_PARALLEL_SIZE", "1"))
     # CP splits the sequence across ranks; the kv_allgather strategy is the one
-    # the sdpa kernel implements (see parallel/context_parallel/sdpa_attention).
+    # the sdpa kernel implements (see parallel/context_parallel/attention.py).
     context_parallel_size = int(os.environ.get("LLMTUNER_CONTEXT_PARALLEL_SIZE", "1"))
     # Deterministic kernels cost throughput; the default matches the shape of
     # this example (a training run, not a bit-reproducibility harness). Turn it
@@ -111,9 +113,9 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
                 # 1 = one document per sequence (plain causal attention, no mask
                 # materialized). A larger value packs several documents into a
                 # sequence, which needs the block-causal document mask; that is
-                # built densely on this backend (see
-                # HFTransformerModel._apply_attention) instead of via flex,
-                # which Ascend does not have.
+                # represented by the batch attention mask. Keep one document
+                # per sample unless the selected model/backend supports the
+                # packed-document mask contract.
                 max_num_documents=int(
                     os.environ.get("LLMTUNER_MAX_NUM_DOCUMENTS", "1")
                 ),
@@ -132,6 +134,11 @@ def qwen3_8b_npu_config() -> LLMTunerConfig:
 
 
 def main() -> None:
+    if get_model_spec("qwen3") is None:
+        raise ConfigError(
+            "Qwen3 dense has no registered local implementation; this legacy "
+            "recipe cannot train. Use a registered model such as qwen3_moe."
+        )
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         raise RuntimeError(
             "This example requires torch-npu and a visible Ascend NPU. "

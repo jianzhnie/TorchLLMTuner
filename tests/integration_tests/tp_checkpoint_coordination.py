@@ -61,10 +61,9 @@ try:
                     "differ across ranks" in message for _, message in outcomes
                 ), outcomes
             else:
-                expected = (
-                    "KeyError" if failure == "missing_parameter" else "ValueError"
-                )
-                assert outcomes[0][0] == expected, outcomes
+                assert outcomes[0][0] == "ValueError", outcomes
+                if failure == "missing_parameter":
+                    assert "no live parameter" in outcomes[0][1], outcomes
                 assert outcomes[1][0] == "RuntimeError", outcomes
                 assert "preparation failed on another rank" in outcomes[1][1], outcomes
             dist.barrier()

@@ -178,32 +178,25 @@ class ModelCheckpointState(Stateful):
             strict=True,
         ):
             bound.validate(layout, consumer="Checkpoint")
-        for index, (current, bound) in enumerate(
-            zip(
-                (dict(named_persistent_buffers(part)) for part in self.model),
-                self._bound_buffers,
-                strict=True,
-            )
+        for description, discover, snapshots in (
+            ("buffer bindings", named_persistent_buffers, self._bound_buffers),
+            (
+                "extra-state ownership",
+                named_extra_state_owners,
+                self._bound_extra_state_owners,
+            ),
         ):
-            if current.keys() != bound.keys() or any(
-                current[name] is not buffer for name, buffer in bound.items()
+            for index, (part, bound) in enumerate(
+                zip(self.model, snapshots, strict=True)
             ):
-                raise RuntimeError(
-                    f"Model checkpoint buffer bindings changed at part {index}; "
-                    "construct a new ModelCheckpointState"
-                )
-
-        for index, (part, bound) in enumerate(
-            zip(self.model, self._bound_extra_state_owners, strict=True)
-        ):
-            current = dict(named_extra_state_owners(part))
-            if current.keys() != bound.keys() or any(
-                current[name] is not owner for name, owner in bound.items()
-            ):
-                raise RuntimeError(
-                    f"Model checkpoint extra-state ownership changed at part {index}; "
-                    "construct a new ModelCheckpointState"
-                )
+                current = dict(discover(part))
+                if current.keys() != bound.keys() or any(
+                    current[name] is not value for name, value in bound.items()
+                ):
+                    raise RuntimeError(
+                        f"Model checkpoint {description} changed at part {index}; "
+                        "construct a new ModelCheckpointState"
+                    )
 
     def remember_metadata(self) -> None:
         # Keep validation independent of exported storage: full TP/EP exports

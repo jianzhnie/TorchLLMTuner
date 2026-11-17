@@ -19,6 +19,7 @@ from llmtuner.config import (
 )
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.errors import ConfigError
+from llmtuner.models.registry import get_model_spec
 
 
 def build_config(args: argparse.Namespace) -> LLMTunerConfig:
@@ -35,6 +36,8 @@ def build_config(args: argparse.Namespace) -> LLMTunerConfig:
     text = getattr(architecture, "text_config", architecture)
     if text.model_type not in ("qwen3_5_text", "qwen3_5_moe_text"):
         raise ConfigError(f"Expected Qwen3.5 text architecture, got {text.model_type}")
+    if get_model_spec(text.model_type) is None:
+        raise ConfigError(f"No local text model registered for {text.model_type!r}")
     # Preserve every published dimension. Layer reduction is an explicit OOM
     # fallback, never the default, and must also truncate the HF layer schedule.
     overrides = text.to_dict()

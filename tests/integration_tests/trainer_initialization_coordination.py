@@ -3,9 +3,10 @@
 PYTHONPATH=. torchrun --standalone --nproc_per_node=2 \
     tests/integration_tests/trainer_initialization_coordination.py
 
-CPU/Gloo only. After each failed constructor, a barrier checks that peers have
-not entered unmatched model collectives; each rank also checks host RNG and
-execution-policy rollback. A fresh Trainer then performs an update.
+CPU/Gloo or accelerator backend. After each failed constructor, a barrier checks
+that peers have not entered unmatched model collectives; each rank also checks
+host RNG and execution-policy rollback. Device RNG rollback is outside the
+production constructor contract. A fresh Trainer performs an update.
 """
 
 import os
@@ -27,6 +28,7 @@ from llmtuner.config.training_config import TrainingConfig
 from llmtuner.trainer.runtime import assembly
 from llmtuner.trainer.runtime import batch as batch_runtime
 from llmtuner.trainer.trainer import Trainer
+from tests.integration_tests.harness import init_distributed
 
 
 def config():
@@ -106,7 +108,7 @@ def failed_constructor(cfg):
 
 
 def main():
-    dist.init_process_group("gloo", timeout=timedelta(seconds=30))
+    selected_device = init_distributed(timeout=timedelta(seconds=60))
     try:
         assert dist.get_world_size() == 2
         rank = dist.get_rank()
@@ -195,7 +197,7 @@ def main():
                         CheckpointConfig(
                             enable=True, async_mode="async", last_save_in_hf=True
                         ),
-                        model_parts=[torch.nn.Linear(2, 2)],
+                        model_parts=[torch.nn.Linear(2, 2, device=selected_device)],
                         optimizer=None,
                         lr_scheduler=None,
                         states={},
@@ -247,7 +249,7 @@ def main():
                         CheckpointConfig(
                             enable=True, async_mode="async", keep_latest_k=2
                         ),
-                        model_parts=[torch.nn.Linear(2, 2)],
+                        model_parts=[torch.nn.Linear(2, 2, device=selected_device)],
                         optimizer=None,
                         lr_scheduler=None,
                         states={},
@@ -280,13 +282,17 @@ def main():
         )
 
         expert = torch.nn.Module()
-        expert.register_parameter("first", torch.nn.Parameter(torch.zeros(1, 2)))
-        expert.register_parameter("second", torch.nn.Parameter(torch.zeros(1, 2)))
+        expert.register_parameter(
+            "first", torch.nn.Parameter(torch.zeros(1, 2, device=selected_device))
+        )
+        expert.register_parameter(
+            "second", torch.nn.Parameter(torch.zeros(1, 2, device=selected_device))
+        )
         mark_experts_ep_sharded(expert, dist.group.WORLD)
         # Same shapes make a swapped collective silently produce wrong values.
         items = [
-            ("first", torch.full((1, 2), 10.0 + rank)),
-            ("second", torch.full((1, 2), 20.0 + rank)),
+            ("first", torch.full((1, 2), 10.0 + rank, device=selected_device)),
+            ("second", torch.full((1, 2), 20.0 + rank, device=selected_device)),
         ]
         if rank == 1:
             items.reverse()
@@ -296,7 +302,9 @@ def main():
         for name, base in (("first", 10.0), ("second", 20.0)):
             torch.testing.assert_close(
                 gathered[name],
-                torch.tensor([[base, base], [base + 1, base + 1]]),
+                torch.tensor(
+                    [[base, base], [base + 1, base + 1]], device=selected_device
+                ),
                 rtol=0,
                 atol=0,
             )
@@ -309,7 +317,7 @@ def main():
             "hook_overlapping_keys",
         ):
             for failing_rank in (0, 1):
-                part = torch.nn.Linear(2, 2)
+                part = torch.nn.Linear(2, 2, device=selected_device)
                 mark_experts_ep_sharded(part, dist.group.WORLD)
                 model_parts = [part]
                 if rank == failing_rank:
@@ -318,7 +326,10 @@ def main():
                     elif case == "hook_overlapping_keys":
                         duplicate = torch.nn.Module()
                         duplicate.register_parameter(
-                            "other", torch.nn.Parameter(torch.zeros(2, 2))
+                            "other",
+                            torch.nn.Parameter(
+                                torch.zeros(2, 2, device=selected_device)
+                            ),
                         )
 
                         def export_logical_name(module, state, prefix, metadata):
@@ -327,7 +338,7 @@ def main():
                         duplicate.register_state_dict_post_hook(export_logical_name)
                         model_parts.append(duplicate)
                     elif case == "overlapping_keys":
-                        duplicate = torch.nn.Linear(2, 2)
+                        duplicate = torch.nn.Linear(2, 2, device=selected_device)
                         mark_experts_ep_sharded(duplicate, dist.group.WORLD)
                         model_parts.append(duplicate)
                     else:

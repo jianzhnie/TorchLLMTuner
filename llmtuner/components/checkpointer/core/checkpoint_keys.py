@@ -6,7 +6,7 @@ Both ``components/checkpointer`` (which writes states under these keys) and
 submodule directly -- it is dependency-free, so that import never pulls the
 checkpointer backends (``base``/``dcp`` and their torch.distributed surface)
 into ``llmtuner.config``; the package ``__init__`` re-exports those lazily for
-the same reason. ``models/runtime/state_dict_adapter.py`` reads the same way for the
+the same reason. ``components/checkpointer/model_state.py`` reads the same way for the
 index name: it writes that file, the DCP checkpointer probes for it, and one
 spelling means the two cannot drift apart.
 """
