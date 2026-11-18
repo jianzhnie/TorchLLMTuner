@@ -18,14 +18,12 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import FSDPModule
 
 from experiments.pipeline_parallel import compatibility
 from experiments.pipeline_parallel.builders import (
     PipelineScheduleFactory,
     TrainingBuilders,
 )
-from experiments.pipeline_parallel.collectives import synchronize_local_errors
 from experiments.pipeline_parallel.engine import (
     ParamContext,
     TrainingEngine,
@@ -43,6 +41,7 @@ from experiments.pipeline_parallel.pipeline_parallel import (
     PipelineParallelSetup,
 )
 from experiments.pipeline_parallel.random_state import RNGCheckpointState
+from llmtuner.accelerator.collectives import synchronize_local_errors
 from llmtuner.components.checkpointer.backends.distributed_checkpoint import (
     DistributedCheckpointManager,
 )
@@ -56,7 +55,6 @@ from llmtuner.components.checkpointer.core.checkpoint_keys import (
     TRAIN_STATE,
 )
 from llmtuner.components.checkpointer.model_state import ModelStateDictAdapter
-from llmtuner.components.loss import chunked_lm_head_cross_entropy, cross_entropy_loss
 from llmtuner.components.loss_contract import LossFunctions
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
@@ -64,7 +62,10 @@ from llmtuner.components.optimizer.state_residency import (
     validate_checkpoint_configuration,
 )
 from llmtuner.errors import UnsupportedCombinationError
-from llmtuner.memory.materialization import materialize_meta_model
+from llmtuner.memory.materialization import (
+    materialize_meta_model,
+    model_materialization_buffers,
+)
 from llmtuner.models.common.aux_loss import register_aux_loss_metrics_hook
 from llmtuner.models.common.moe.bias_update import register_moe_balancing_hook
 from llmtuner.models.configuration import (
@@ -77,6 +78,10 @@ from llmtuner.models.configuration import (
 from llmtuner.models.flops import flops_estimation_note, flops_per_token
 from llmtuner.models.registry import resolve_state_format
 from llmtuner.parallel.assembly import ModelPartLayout, validate_model_part_layouts
+from llmtuner.parallel.fully_shard_parallel.policies import fsdp_managed_parameters
+from llmtuner.trainer.runtime.assembly import (
+    build_loss_functions as build_loss_functions,
+)
 from llmtuner.utils import logging as logging_utils
 
 if TYPE_CHECKING:
@@ -252,35 +257,6 @@ def build_model(
     return model, model_config, load_initial_weights
 
 
-def _fsdp_managed_parameters(model: torch.nn.Module) -> set[torch.nn.Parameter]:
-    return {
-        fsdp_param.sharded_param
-        for module in model.modules()
-        if isinstance(module, FSDPModule)
-        for group in module._get_fsdp_state()._fsdp_param_groups
-        for fsdp_param in group.fsdp_params
-    }
-
-
-def _model_materialization_buffers(
-    model: torch.nn.Module, device: torch.device
-) -> dict[tuple[torch.nn.Module, str], torch.Tensor]:
-    """Ask the explicit model to rebuild non-checkpoint buffers.
-
-    Buffer reconstruction is a model contract. Keeping this adapter here makes
-    older explicit models fail at materialization with a useful error instead
-    of allowing uninitialized runtime state into training.
-    """
-    builder = getattr(model, "materialization_buffers", None)
-    if builder is None:
-        return {}
-    if not callable(builder):
-        raise TypeError(
-            f"{type(model).__name__}.materialization_buffers must be callable"
-        )
-    return builder(device)
-
-
 def _apply_parallelism(
     model: torch.nn.Module,
     *,
@@ -347,9 +323,9 @@ def _apply_parallelism(
                     device,
                     parameter_device=torch.device("cpu") if cpu_offload else None,
                     offloaded_parameters=(
-                        _fsdp_managed_parameters(model_part) if cpu_offload else None
+                        fsdp_managed_parameters(model_part) if cpu_offload else None
                     ),
-                    runtime_buffers=_model_materialization_buffers(model_part, device),
+                    runtime_buffers=model_materialization_buffers(model_part, device),
                 )
         except BaseException as error:
             materialization_error = error
@@ -431,29 +407,6 @@ def prepare_parallel_model(
         num_parameters=num_parameters,
         num_trainable_parameters=num_trainable_parameters,
     )
-
-
-def build_loss_functions(
-    cfg: LLMTunerConfig,
-    *,
-    factory: Callable[[LLMTunerConfig], LossFunctions] | None = None,
-    error_group: ProcessGroup | None = None,
-) -> LossFunctions:
-    """Select and validate one loss service for both PP and ordinary execution."""
-    with synchronize_local_errors("Loss services construction", group=error_group):
-        loss_functions = (
-            factory(cfg)
-            if factory is not None
-            else LossFunctions(cross_entropy_loss, chunked_lm_head_cross_entropy)
-        )
-        if not isinstance(loss_functions, LossFunctions):
-            raise TypeError("Loss factory must return LossFunctions")
-        if (
-            cfg.training.chunked_loss_num_chunks > 1
-            and loss_functions.chunked_backward is None
-        ):
-            raise ValueError("Injected loss must explicitly support chunked backward")
-    return loss_functions
 
 
 def create_training_engine(

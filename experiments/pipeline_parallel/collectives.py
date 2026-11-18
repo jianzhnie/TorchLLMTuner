@@ -1,290 +1,27 @@
-"""Collective operations, and gradient-norm clipping that respects the meshes.
+"""Pipeline gradient clipping over disjoint stage parameters.
 
-The reductions and ``clip_grad_norm_`` are vendored from torchtitan
-``distributed/utils.py``. What changed:
-
-* The ``extra_pg`` argument is gone. torchtitan threads an extra process group
-  through every reduction to reach ranks a mesh does not model (its odd-sized TP
-  cases); llmtuner's meshes cover every rank, so the mesh argument is the whole
-  addressing story.
-* EP-aware clipping is adapted to llmtuner's physical expert partition: callers
-  pass the exact local expert parameters plus the EP mesh. Dense parameters are
-  counted once, while the p-th powers of local expert norms are reduced across
-  EP ranks. This avoids upstream's requirement that every parameter be a
-  DTensor carrying an explicit ``"ep"`` mesh axis.
-* ``dist_sum`` / ``dist_max`` / ``dist_mean`` / ``dist_sum_tensor`` are not
-  re-created. Upstream they are one-line ``funcol.all_reduce`` wrappers naming
-  a reduction and its mesh; llmtuner's counterpart is this module's
-  ``all_reduce`` (cast to the comm device + in-place c10d collective, vendored
-  from mmengine's ``dist.all_reduce``), called at the site.
-  ``trainer/trainer.py`` and ``trainer/runtime/validation.py`` reduce loss/token
-  denominators over ``dp_mesh`` / ``loss_mesh`` with it, and
-  ``components/metrics.py`` reduces nothing at all (see its docstring), so
-  there is no caller that would read better with a named helper. This also
-  covers upstream's ``all_gather_entries`` and friends, which exist for
-  bucketed per-module metrics llmtuner does not report.
-
-The single non-obvious line kept from upstream is the ``DTensor`` branch in
-``clip_grad_norm_``; it carries a comment explaining why it exists.
+Shared collectives and local norm helpers live in llmtuner.accelerator.collectives.
+This module retains the PP norm reduction before scaling local gradients.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
-from datetime import timedelta
+from collections.abc import Iterable
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor
 
-from llmtuner.accelerator.device import device_module
-from llmtuner.accelerator.distributed import (
-    get_comm_device,
-    get_default_group,
-    get_world_size,
+from llmtuner.accelerator.collectives import (
+    _clip_offloaded_gradients,
+    _offloaded_gradient_norm,
+    _parameter_precision_norm,
+    build_packed_gradient_groups,
 )
-from llmtuner.accelerator.tensor_tree import get_tensor_tree_device, move_tensor_tree
-from llmtuner.utils.logging import get_logger
+from llmtuner.accelerator.distributed import get_comm_device
 
-logger = get_logger(__name__)
-
-__all__ = [
-    "PartialToInvariantAllReduce",
-    "all_reduce",
-    "clip_grad_norm_",
-    "set_pg_timeouts",
-]
-
-
-def set_pg_timeouts(
-    timeout: timedelta,
-    parallel_dims,
-    *,
-    device: torch.device | None = None,
-) -> None:
-    """Lower every process group's timeout, once startup is behind the run.
-
-    Called after the first completed train step. The groups are created with a
-    long timeout because startup -- model build, the first collective, compile --
-    is what genuinely takes minutes; left there, a later hang looks the same as a
-    slow start and the job waits out the startup value. By this point that work
-    is done, so the timeout can become the one a stall should be measured
-    against.
-
-    ``device`` is the rank's device, used only for the barrier's ``device_ids``
-    and the device-side sync (NCCL needs both; gloo rejects ``device_ids``, so
-    ``None`` -- the default -- omits them).
-
-    The barrier before the change is the point of the whole function: a slow rank
-    may still be inside an operation permitted by the OLD timeout while a fast
-    rank moves on and issues a collective under the new, shorter one, and
-    times out waiting for it. Synchronizing first means every rank crosses the
-    reduction together.
-    """
-    if device is not None and device.type != "cpu":
-        # NCCL accepts device_ids; HCCL selects the current NPU and rejects the
-        # CUDA-specific argument on some torch-npu releases.
-        if device.type == "cuda":
-            dist.barrier(device_ids=[device.index])
-        else:
-            dist.barrier()
-        # Derive the sync call from the passed device rather than the
-        # import-time global.
-        getattr(torch, device.type, device_module).synchronize(device)
-    else:
-        dist.barrier()
-
-    # torch-npu 2.10 exposes the c10d compatibility API, but HCCL does not
-    # implement the operation (it emits one warning per group and changes
-    # nothing). The synchronization above is still useful; retain the startup
-    # timeout and make this limitation explicit once per rank.
-    if device is not None and device.type == "npu":
-        logger.warning(
-            "HCCL cannot change process-group timeouts at runtime; continuing "
-            "with the startup timeout"
-        )
-        return
-
-    # ``None`` names the default (world) group, which is not part of any mesh.
-    groups = [
-        mesh.get_group()
-        for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
-    ]
-    logger.info(
-        "Adjusting the timeout of %d process group(s) plus the default to %s",
-        len(groups),
-        timeout,
-    )
-    set_timeout = getattr(dist, "set_timeout", None)
-    if set_timeout is None:
-        # PyTorch 2.10 exposes this operation only from distributed_c10d.
-        # Keep the compatibility detail here rather than forcing the trainer to
-        # know which torch release it is running on.
-        set_timeout = getattr(dist.distributed_c10d, "_set_pg_timeout", None)
-    if set_timeout is None:
-        logger.warning(
-            "This PyTorch build cannot change process-group timeouts at runtime; "
-            "continuing with the startup timeout"
-        )
-        return
-
-    for group in groups:
-        set_timeout(timeout, group)
-    set_timeout(timeout)
-
-
-def _offloaded_gradient_norm(grad: DTensor, norm_type: float) -> torch.Tensor:
-    """Reduce scalar norms without moving CPU gradient storage to the device."""
-    if not (norm_type > 0):
-        raise ValueError("CPU-offloaded gradient norms require a positive norm_type")
-    if any(not isinstance(p, Replicate | Shard) for p in grad.placements):
-        raise ValueError(
-            "CPU-offloaded gradient norms require Replicate/Shard placements; "
-            f"got {grad.placements}"
-        )
-    local = grad.to_local()
-    dtype = torch.float32 if local.dtype in (torch.float16, torch.bfloat16) else None
-    if local.numel() == 0:
-        norm = torch.zeros((), dtype=dtype or local.dtype, device=local.device)
-    else:
-        norm = torch.linalg.vector_norm(local, norm_type, dtype=dtype)
-    power = norm if math.isinf(norm_type) else norm.pow(norm_type)
-    for axis, placement in enumerate(grad.placements):
-        if isinstance(placement, Shard):
-            group = grad.device_mesh.get_group(axis)
-            power = power.to(get_comm_device(group))
-            dist.all_reduce(
-                power,
-                op=dist.ReduceOp.MAX if math.isinf(norm_type) else dist.ReduceOp.SUM,
-                group=group,
-            )
-    return power if math.isinf(norm_type) else power.pow(1.0 / norm_type)
-
-
-def _clip_offloaded_gradients(
-    gradients: Iterable[DTensor], *, max_norm: float, total_norm: torch.Tensor
-) -> set[int]:
-    """Scale CPU-offloaded gradients using one host copy of the global factor."""
-    gradients = tuple(gradients)
-    if not gradients:
-        return set()
-
-    coefficient = (max_norm / (total_norm + 1e-6)).clamp(max=1).cpu()
-    with torch.no_grad():
-        for gradient in gradients:
-            gradient.to_local().mul_(coefficient)
-    return {id(gradient) for gradient in gradients}
-
-
-def _parameter_precision_norm(
-    grads: list[torch.Tensor],
-    norm_type: float,
-    packed_gradients: dict[int, tuple[torch.Tensor, ...]] | None = None,
-) -> torch.Tensor:
-    """Preserve native norm and coefficient rounding, including DTensor reduction."""
-    groups = {}
-    for grad in grads:
-        packed = (packed_gradients or {}).get(id(grad))
-        if packed is not None:
-            if not packed:
-                continue
-            grad = torch.cat(packed, dim=1)
-        # Match upstream mesh equality: equivalent mesh objects must share the
-        # same norm aggregation, avoiding an extra low-precision rounding step.
-        key = grad.device_mesh if isinstance(grad, DTensor) else None
-        groups.setdefault(key, []).append(grad)
-    norms = []
-    for group in groups.values():
-        offloaded = any(
-            isinstance(grad, DTensor)
-            and grad.device.type == "cpu"
-            and grad.device_mesh.device_type != "cpu"
-            for grad in group
-        )
-        if offloaded:
-            device = get_comm_device(group[0].device_mesh.get_group(0))
-            norm = torch.nn.utils.get_total_norm(
-                [
-                    _offloaded_gradient_norm(grad, norm_type).to(device)
-                    for grad in group
-                ],
-                norm_type,
-                foreach=False,
-            )
-        else:
-            # Let DTensor retain its norm-partial placement until the complete
-            # norm is assembled, just as get_total_norm/full_tensor upstream.
-            # FP32 scalar power accumulation changes BF16 clipping coefficients.
-            norm = torch.nn.utils.get_total_norm(group, norm_type, foreach=False)
-            if isinstance(norm, DTensor):
-                norm = norm.full_tensor()
-        norms.append(norm)
-    if len(norms) == 1:
-        return norms[0]
-    if norms:
-        device = next(
-            (norm.device for norm in norms if norm.device.type != "cpu"),
-            norms[0].device,
-        )
-        norms = [norm.to(device) for norm in norms]
-        # Upstream combines mesh norms with scalar powers, retaining their
-        # native dtype rounding rather than applying another vector norm.
-        return sum(norm**norm_type for norm in norms) ** (1.0 / norm_type)
-    return torch.nn.utils.get_total_norm(norms, norm_type, foreach=False)
-
-
-def build_packed_gradient_groups(
-    parameters: list[torch.Tensor],
-    packed_parameters: Iterable[tuple[torch.Tensor, torch.Tensor]] | None,
-    *,
-    expert_ids: set[int],
-    tp_ids: set[int],
-) -> dict[int, tuple[torch.Tensor, ...]]:
-    """Validate packed norm groups before any norm collective or scaling.
-
-    The first gradient owns the pair; an empty entry skips the second gradient
-    during norm calculation. Both gradients must therefore have distinct
-    identities, compatible layouts and the same reduction ownership.
-    """
-    packed_gradients: dict[int, tuple[torch.Tensor, ...]] = {}
-    parameter_ids = {id(p) for p in parameters}
-    for first, second in packed_parameters or ():
-        if id(first) not in parameter_ids or id(second) not in parameter_ids:
-            raise ValueError("Packed norm parameters must belong to the clipped set")
-        if first.grad is None or second.grad is None:
-            raise ValueError("Packed norm parameters require both gradients")
-        if (
-            first.grad is second.grad
-            or id(first.grad) in packed_gradients
-            or id(second.grad) in packed_gradients
-        ):
-            raise ValueError("Packed norm parameter groups must be disjoint")
-        if first.grad.shape != second.grad.shape or first.grad.ndim != 3:
-            raise ValueError(
-                "Packed gate/up norm requires equal three-dimensional shapes"
-            )
-        if (
-            first.grad.dtype != second.grad.dtype
-            or first.grad.device != second.grad.device
-        ):
-            raise ValueError("Packed norm gradients must share dtype and device")
-        if isinstance(first.grad, DTensor) != isinstance(second.grad, DTensor):
-            raise ValueError("Packed norm gradients must share tensor layout")
-        if isinstance(first.grad, DTensor) and (
-            first.grad.device_mesh != second.grad.device_mesh
-            or first.grad.placements != second.grad.placements
-        ):
-            raise ValueError("Packed norm gradients must share mesh and placements")
-        if (id(first) in expert_ids, id(first) in tp_ids) != (
-            id(second) in expert_ids,
-            id(second) in tp_ids,
-        ):
-            raise ValueError("Packed norm parameters must share reduction ownership")
-        packed_gradients[id(first.grad)] = (first.grad, second.grad)
-        packed_gradients[id(second.grad)] = ()
-    return packed_gradients
+__all__ = ["clip_grad_norm_"]
 
 
 def clip_grad_norm_(
@@ -317,7 +54,8 @@ def clip_grad_norm_(
         error_if_nonfinite: throw if the total norm is nan/inf.
         foreach: use the faster foreach implementation (``None`` lets torch pick).
         pp_mesh: pipeline-parallel mesh; when present the norm is reduced across
-            stages before clipping.
+            stages before clipping. Stage norms use a common FP32 accumulator,
+            promoted to FP64 when any stage supplies an FP64 norm.
         ep_mesh: expert-parallel mesh. When present, only the norm contribution
             from ``expert_parameters`` is reduced over this mesh.
         expert_parameters: parameters physically partitioned across EP ranks.
@@ -520,7 +258,18 @@ def clip_grad_norm_(
         )
         if device.type == "cpu":
             device = get_comm_device(pp_mesh.get_group())
-        total_norm = total_norm.to(device)
+        # Empty stages return FP32, while native local norms may be BF16/FP16
+        # or FP64. Agree before reducing: c10d requires identical wire dtypes.
+        # Promote low precision before powers and retain FP64 if any stage uses it.
+        group = pp_mesh.get_group()
+        needs_double = torch.tensor(
+            int(total_norm.dtype == torch.float64), device=device, dtype=torch.int32
+        )
+        dist.all_reduce(needs_double, op=dist.ReduceOp.MAX, group=group)
+        total_norm = total_norm.to(
+            device=device,
+            dtype=torch.float64 if needs_double.item() else torch.float32,
+        )
         if math.isinf(norm_type):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
         else:
@@ -580,108 +329,3 @@ def clip_grad_norm_(
                 False if len(clip_groups) > 1 else foreach,
             )
     return total_norm
-
-
-_REDUCE_OPS = {
-    "sum": dist.ReduceOp.SUM,
-    "product": dist.ReduceOp.PRODUCT,
-    "min": dist.ReduceOp.MIN,
-    "max": dist.ReduceOp.MAX,
-    "band": dist.ReduceOp.BAND,
-    "bor": dist.ReduceOp.BOR,
-    "bxor": dist.ReduceOp.BXOR,
-}
-
-
-def all_reduce(
-    data: torch.Tensor, *, op: str = "sum", group: dist.ProcessGroup | None = None
-) -> None:
-    """In-place all-reduce; a no-op outside a distributed environment.
-
-    Vendored from mmengine's ``dist.all_reduce``. Unlike the raw c10d call it
-    casts the tensor to the group's comm device first and copies the result
-    back, so a CPU tensor reduces correctly over an NCCL/HCCL group (the
-    trainer's loss/token denominators are CPU scalars). ``op="mean"`` is
-    emulated as sum + divide and requires floating or complex data so copying
-    back cannot silently truncate a fractional result. Arguments are validated
-    even when no process group is initialized.
-    """
-    op = op.lower()
-    if op not in _REDUCE_OPS and op != "mean":
-        raise ValueError(
-            f"reduce op should be one of {list(_REDUCE_OPS)} or 'mean', but got {op}"
-        )
-    if op == "mean" and not (data.is_floating_point() or data.is_complex()):
-        raise TypeError("in-place mean reduction requires a floating or complex tensor")
-    world_size = get_world_size(group)
-    if world_size <= 1:
-        return
-    if group is None:
-        group = get_default_group()
-
-    input_device = get_tensor_tree_device(data)
-    backend_device = get_comm_device(group)
-    # c10d backends may treat strided views as contiguous storage. Keep the
-    # communication buffer contiguous, then copy back using the original stride.
-    data_on_device = move_tensor_tree(data, backend_device).contiguous()
-
-    if op == "mean":
-        dist.all_reduce(data_on_device, op=_REDUCE_OPS["sum"], group=group)
-        data_on_device.div_(world_size)
-    else:
-        dist.all_reduce(data_on_device, op=_REDUCE_OPS[op], group=group)
-
-    move_tensor_tree(data_on_device, input_device, out=data)
-
-
-@contextmanager
-def synchronize_local_errors(
-    phase: str, *, group: dist.ProcessGroup | None = None
-) -> Iterator[None]:
-    """Coordinate a rank-local phase before peers enter subsequent collectives.
-
-    Every group member must enter in the same order. The body must not contain
-    collectives: this boundary cannot recover blocked/killed peers or a failure
-    inside communication. Local exceptions retain their identity and traceback;
-    successful peers receive a RuntimeError naming the failed phase. Local
-    interrupts and exits also participate before being re-raised; killed peers
-    and interrupts inside the coordination collective cannot be recovered.
-    """
-    error: BaseException | None = None
-    try:
-        yield
-    except BaseException as caught:
-        error = caught
-    ready = error is None
-    if get_world_size(group) > 1:
-        status = torch.tensor(
-            int(ready), device=get_comm_device(group), dtype=torch.int32
-        )
-        all_reduce(status, op="min", group=group)
-        ready = bool(status.item())
-    if not ready:
-        if error is not None:
-            raise error
-        raise RuntimeError(f"{phase} failed on another rank")
-
-
-class PartialToInvariantAllReduce(torch.autograd.Function):
-    """Sum partial values in forward and pass gradients through unchanged.
-
-    Use when every rank computes the same loss from the reduced sum. Its
-    derivative with respect to each local summand equals the derivative with
-    respect to the sum. A second all-reduce in backward would multiply that
-    gradient by the group size. Forward clones the input before reducing it.
-
-    Adapted from torchtitan's MoE auxiliary-loss placement conversion.
-    """
-
-    @staticmethod
-    def forward(ctx, partial, group):  # pyrefly: ignore[bad-override]
-        reduced = partial.clone()
-        all_reduce(reduced, group=group)
-        return reduced
-
-    @staticmethod
-    def backward(ctx, grad_output):  # pyrefly: ignore[bad-override]
-        return grad_output, None

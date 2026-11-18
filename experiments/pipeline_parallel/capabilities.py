@@ -23,14 +23,19 @@ flex_attention) have nothing to probe.
 
 from __future__ import annotations
 
-import importlib
 import inspect
-from collections.abc import Callable
 from functools import cache
 
 import torch
 
-from llmtuner.accelerator.device import get_current_device
+from llmtuner.accelerator.capabilities import (
+    Capability,
+    _fsdp_unshard_is_a_context_manager,
+    dynamo_lru_cache_knob,
+    grouped_mm_runs,
+    importable,
+    npu_ascendc_codegen,
+)
 from llmtuner.errors import EnvironmentUnsupportedError
 
 try:
@@ -38,56 +43,7 @@ try:
 except ImportError:
     pipeline_schedules = None
 
-try:
-    import torch.distributed.fsdp._fully_shard._fully_shard as fully_shard_module
-except ImportError:
-    fully_shard_module = None
-
 __all__ = ["CAPABILITIES", "has", "is_compiling", "require"]
-
-
-def importable(module: str, attr: str | None = None) -> Callable[[], bool]:
-    """Probe factory: the module imports (and optionally exposes ``attr``)."""
-
-    def probe() -> bool:
-        try:
-            mod = importlib.import_module(module)
-        except ImportError:
-            return False
-        return attr is None or getattr(mod, attr, None) is not None
-
-    return probe
-
-
-def npu_ascendc_codegen() -> bool:
-    """AscendC imports may initialize the device while detecting its SoC.
-
-    A missing/inaccessible device makes this optional backend unavailable,
-    even when torch-npu itself is installed. Other probe failures keep their
-    normal diagnostics; do not make every import probe swallow runtime errors.
-    """
-    try:
-        return importable("torch_npu._inductor.ascendc")()
-    except RuntimeError:
-        return False
-
-
-def dynamo_lru_cache_knob() -> bool:
-    """Whether dynamo exposes ``eval_frame._set_lru_cache``.
-
-    The knob is private, so it is looked up on the import's own attribute
-    chain (``import torch._dynamo``, then ``torch._C._dynamo.eval_frame``)
-    rather than by importing the submodule by name -- which is how upstream
-    reaches it, and the only spelling that can succeed. ``torch._C._dynamo``
-    and ``eval_frame`` both exist in torch 2.2.2; the *function* on it does
-    not, which is exactly the distinction this probe has to make.
-    """
-    try:
-        importlib.import_module("torch._dynamo")
-    except ImportError:
-        return False
-    eval_frame = getattr(getattr(torch._C, "_dynamo", None), "eval_frame", None)
-    return getattr(eval_frame, "_set_lru_cache", None) is not None
 
 
 def _pipelining_has_eval() -> bool:
@@ -111,67 +67,6 @@ def _pipelining_has_eval() -> bool:
     if step is None:
         return False
     return "return_outputs" in inspect.signature(step).parameters
-
-
-def _fsdp_unshard_is_a_context_manager() -> bool:
-    """Whether an FSDP unshard can be held open across several backwards.
-
-    Probe API shape, not numerical correctness. A context manager alone does
-    not validate shared head ownership, repeated-backward gradient reduction,
-    or checkpoint restoration. torch 2.9's handle only has ``wait()``; inspect
-    the handle class rather than guessing from the torch version.
-    """
-    handle = getattr(fully_shard_module, "_UnshardHandleImpl", None)
-    return hasattr(handle, "__enter__") and hasattr(handle, "__exit__")
-
-
-def grouped_mm_runs() -> bool:
-    """Whether ``torch._grouped_mm`` can run here.
-
-    Probed by doing it, rather than by checking the device or the torch
-    version: the op is reachable on CPU as well as CUDA, and it imposes shape
-    constraints of its own (strides must be 16-byte multiples, so the
-    innermost dim has to be at least 8 bf16 elements). A version or device
-    test would be wrong on both counts and would go stale silently.
-
-    The probe is necessarily approximate -- a shape that satisfies the op
-    need not be one a real layer uses. It uses the selected training device and
-    transposed expert weights. It is deliberately shaped like the
-    real call (``(T, K) @ (E, K, N)``, bf16, int32 offsets) so that it fails
-    for the same reasons a real call would.
-    """
-    grouped_mm = getattr(torch, "_grouped_mm", None)
-    if grouped_mm is None:
-        return False
-    try:
-        device = get_current_device()
-        grouped_mm(
-            torch.zeros(8, 8, dtype=torch.bfloat16, device=device),
-            torch.zeros(2, 8, 8, dtype=torch.bfloat16, device=device).transpose(-2, -1),
-            offs=torch.tensor([4, 8], dtype=torch.int32, device=device),
-        )
-    except Exception:
-        return False
-    return True
-
-
-class Capability:
-    """One registry entry: probe, provenance, unlock hint, consumers."""
-
-    def __init__(
-        self,
-        probe: Callable[[], bool],
-        *,
-        what: str,
-        since: str,
-        hint: str,
-        consumers: str,
-    ) -> None:
-        self.probe = probe
-        self.what = what
-        self.since = since
-        self.hint = hint
-        self.consumers = consumers
 
 
 CAPABILITIES: dict[str, Capability] = {

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Protocol
+
+from llmtuner.trainer.runtime.builders import EMAFactory, SchedulerFactory
 
 if TYPE_CHECKING:
     from torch import nn
@@ -12,7 +14,6 @@ if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.pipelining import PipelineStage
     from torch.distributed.pipelining.schedules import _PipelineSchedule
-    from torch.optim import Optimizer
 
     from experiments.pipeline_parallel.config import (
         LLMTunerConfig,
@@ -31,7 +32,6 @@ if TYPE_CHECKING:
     from llmtuner.components.optimizer.ema import EMA
     from llmtuner.components.optimizer.lr_scheduler import LRSchedulersContainer
     from llmtuner.config.checkpoint_config import CheckpointConfig
-    from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
     from llmtuner.config.observability_config import MetricsConfig
     from llmtuner.config.optimizer_config import OptimizerConfig
     from llmtuner.parallel.assembly import ModelPartLayout
@@ -60,25 +60,6 @@ class PipelineScheduleFactory(Protocol):
         global_vocab_size: int | None = None,
         logits_width: int | None = None,
     ) -> _PipelineSchedule: ...
-
-
-class EMAFactory(Protocol):
-    """Build model-state averaging over final local parameter ownership."""
-
-    def __call__(
-        self,
-        *,
-        model_parts: list[nn.Module],
-        decay: float | None,
-        half_life_fraction: float,
-        start_step: int,
-        step_bias: int,
-        update_every_n_steps: int,
-        buffer_patterns: Sequence[str],
-        sharded_expert_parallel: bool,
-        sharded_tensor_parallel: bool,
-        runtime_layouts: tuple[ModelPartLayout, ...],
-    ) -> EMA: ...
 
 
 class MetricsFactory(Protocol):
@@ -113,19 +94,6 @@ class OptimizerFactory(Protocol):
         sharded_expert_parallel: bool,
         runtime_layouts: tuple[ModelPartLayout, ...],
     ) -> OptimizersContainer: ...
-
-
-class SchedulerFactory(Protocol):
-    """Build schedules over the actual inner optimizers, without Trainer."""
-
-    def __call__(
-        self,
-        config: LRSchedulerConfig,
-        /,
-        *,
-        optimizers: list[Optimizer],
-        training_steps: int,
-    ) -> LRSchedulersContainer: ...
 
 
 class CheckpointFactory(Protocol):

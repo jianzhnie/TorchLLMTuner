@@ -24,16 +24,12 @@ import torch.nn as nn
 from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
 
-from experiments.pipeline_parallel.collectives import synchronize_local_errors
 from experiments.pipeline_parallel.execution import (
     ExecutionLayout,
     resolve_execution_layout,
     validate_execution_chain,
 )
-from experiments.pipeline_parallel.fsdp_backend import (
-    apply_fsdp,
-    validate_fsdp_environment,
-)
+from experiments.pipeline_parallel.fsdp_backend import apply_fsdp
 from experiments.pipeline_parallel.fsdp_plan import (
     resolve_pipeline_fsdp_configs,
 )
@@ -60,6 +56,7 @@ from experiments.pipeline_parallel.topology import (
     ParallelTopology,
     ParallelTopologySnapshot,
 )
+from llmtuner.accelerator.collectives import synchronize_local_errors
 from llmtuner.components.loss_contract import LossSum
 from llmtuner.config.activation_checkpoint_config import (
     MemoryBudgetACConfig,
@@ -78,6 +75,9 @@ from llmtuner.parallel.context_parallel.plan import resolve_cp_plan
 from llmtuner.parallel.expert_parallel.expert_parallel import apply_ep
 from llmtuner.parallel.expert_parallel.mc2_ops import validate_mc2_world_size
 from llmtuner.parallel.expert_parallel.plan import resolve_ep_plan
+from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
+    validate_fsdp_environment,
+)
 from llmtuner.parallel.fully_shard_parallel.ownership import FSDPPatternReferences
 from llmtuner.parallel.model_compile import apply_compile, validate_compile_environment
 from llmtuner.parallel.plan import (

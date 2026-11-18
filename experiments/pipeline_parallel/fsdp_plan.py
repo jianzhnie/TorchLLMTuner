@@ -4,10 +4,6 @@ from dataclasses import replace
 
 from torch import nn
 
-from experiments.pipeline_parallel.fsdp_backend_plan import (
-    _resolve_pattern_units,
-    validate_fsdp_ignored_parameters,
-)
 from experiments.pipeline_parallel.ownership import (
     PipelineOwnership,
     snapshot_pipeline_ownership,
@@ -15,6 +11,10 @@ from experiments.pipeline_parallel.ownership import (
 from experiments.pipeline_parallel.parallel_config import ParallelConfig
 from llmtuner.parallel.fully_shard_parallel.fine_grained.fine_grained import (
     validate_fsdp_hook_target,
+)
+from llmtuner.parallel.fully_shard_parallel.plan import (
+    _resolve_pattern_units,
+    validate_fsdp_ignored_parameters,
 )
 from llmtuner.parallel.module_patterns import resolve_module_patterns
 from llmtuner.parallel.plan import model_bindings_from_plan

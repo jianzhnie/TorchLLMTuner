@@ -2,44 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 
 from experiments.pipeline_parallel.aux_loss import collect_aux_loss_metrics
-from experiments.pipeline_parallel.collectives import all_reduce
 from experiments.pipeline_parallel.reductions import TrainingReductionMeshes
+from llmtuner.accelerator.collectives import all_reduce
+from llmtuner.trainer.runtime.metrics import (
+    collect_resource_metrics as collect_resource_metrics,
+)
 from llmtuner.trainer.runtime.results import AccumulationResult, UpdateResult
 
 if TYPE_CHECKING:
     from experiments.pipeline_parallel.topology import ParallelTopology
-    from llmtuner.trainer.runtime.training_observer import DispatchTimer
-
-
-def collect_resource_metrics(
-    *,
-    activation_swap: Any,
-    optimizer: Any,
-    checkpointer: Any,
-    dispatch_timers: Iterable[DispatchTimer] = (),
-) -> dict[str, float]:
-    """Rank-local resource counters, explicitly labelled rather than summed.
-
-    Activation events are measured only when activation swap is configured.
-    Byte counters are cumulative; device transfer seconds consume the log window.
-    """
-    result = {}
-    result.update(getattr(activation_swap, "observation_metrics", {}).copy())
-    result.update(getattr(optimizer, "observation_metrics", {}).copy())
-    result.update(getattr(checkpointer, "observation_metrics", {}).copy())
-    timers = tuple(dispatch_timers)
-    if timers:
-        result["moe/local_forward_dispatch_seconds_window"] = sum(
-            timer.consume_seconds() for timer in timers
-        )
-    return result
 
 
 def build_step_metrics(

@@ -6,9 +6,8 @@ then construct the loader. Synthetic data bypasses tokenizer and packing setup.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 import grain.python as grain
 
@@ -17,9 +16,7 @@ from llmtuner.components.tokenizer.huggingface import HuggingFaceTokenizer
 from llmtuner.components.tokenizer.kimi import KimiK3Tokenizer
 from llmtuner.components.tokenizer.multimodal import MultimodalTokenizer
 from llmtuner.datasets.collators import (
-    CollatorFactory,
     ContextRowsCollator,
-    TextCollator,
 )
 from llmtuner.datasets.contracts import (
     BaseDataLoader,
@@ -33,127 +30,22 @@ from llmtuner.datasets.corpus_identity import (
     corpus_data_identity as corpus_data_identity,
 )
 from llmtuner.datasets.dataloader import GrainDataLoader
-from llmtuner.datasets.packing.build import (
-    build_concat_then_split_packing,
-    build_first_fit_packing,
+from llmtuner.datasets.loader_builder import (
+    _resolve_multimodal_recipe,
+    _resolve_text_recipe,
 )
 from llmtuner.datasets.packing.global_rows import GlobalRowsIterDataset
 from llmtuner.datasets.synthetic import RandomTokenDataLoader
 from llmtuner.datasets.text.recipes import (
     DATASETS,
-    build_local_jsonl,
-    build_local_jsonl_sft,
-    build_local_jsonl_sft_multiturn,
 )
-from llmtuner.datasets.text.renderer import build_chat_renderer
-
-# Media dependencies remain optional for text and synthetic recipes.
-MULTIMODAL_IMPORT_ERROR = None
-try:
-    from llmtuner.datasets.multimodal.collator import MultimodalCollator
-    from llmtuner.datasets.multimodal.packing import build_multimodal_packing
-    from llmtuner.datasets.multimodal.recipes import MULTIMODAL_DATASETS
-except ImportError as error:
-    MULTIMODAL_IMPORT_ERROR = error
 
 if TYPE_CHECKING:
     from experiments.pipeline_parallel.config import (
         LLMTunerConfig,
     )
-    from llmtuner.components.tokenizer.base import BaseTokenizer
-    from llmtuner.config.data_config import DataloaderConfig
-    from llmtuner.datasets.composition import DatasetRecipe
 
 __all__ = ["build_dataloader"]
-
-
-class _PackingBuilder(Protocol):
-    """Build a packing graph after recipe-specific options have been bound."""
-
-    def __call__(
-        self,
-        recipe: DatasetRecipe,
-        *,
-        context: DatasetBuildContext,
-        iteration_policy: DatasetIterationPolicy,
-    ) -> grain.IterDataset: ...
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class _ResolvedRecipe:
-    """Recipe-specific graph and collation choices for shared loader assembly."""
-
-    recipe: DatasetRecipe
-    build_packing: _PackingBuilder
-    collator: CollatorFactory
-
-
-def _resolve_multimodal_recipe(
-    dataset_name: str, *, num_packing_bins: int
-) -> _ResolvedRecipe:
-    """Resolve media packing and diagnose unavailable optional dependencies."""
-    if MULTIMODAL_IMPORT_ERROR is not None:
-        raise ImportError(
-            f"dataset {dataset_name!r} is not one of the text "
-            f"recipes {sorted(DATASETS)}, so it was looked up in the "
-            "multimodal registry -- which failed to import. Multimodal "
-            "recipes need the optional dependencies torchvision and Pillow "
-            "(and av for video): install them with `pip install torchvision "
-            "pillow av`, or name a text recipe instead."
-        ) from MULTIMODAL_IMPORT_ERROR
-    if dataset_name not in MULTIMODAL_DATASETS:
-        raise ValueError(
-            f"unknown dataset {dataset_name!r}. Expected 'random', "
-            f"'local_jsonl', a text recipe {sorted(DATASETS)}, or a "
-            f"multimodal recipe {sorted(MULTIMODAL_DATASETS)}"
-        )
-    return _ResolvedRecipe(
-        recipe=MULTIMODAL_DATASETS[dataset_name],
-        build_packing=partial(
-            build_multimodal_packing, num_packing_bins=num_packing_bins
-        ),
-        collator=MultimodalCollator,
-    )
-
-
-def _resolve_text_recipe(
-    dataloader_config: DataloaderConfig,
-    *,
-    dataset_name: str,
-    tokenizer: BaseTokenizer,
-) -> _ResolvedRecipe:
-    """Resolve a text recipe with its configured packing and collation policy."""
-    if dataset_name == "local_jsonl":
-        recipe = build_local_jsonl(path=dataloader_config.dataset_path)
-    elif dataset_name == "local_jsonl_sft":
-        if dataloader_config.chat_renderer is not None:
-            recipe = build_local_jsonl_sft_multiturn(
-                path=dataloader_config.dataset_path,
-                messages_field=dataloader_config.messages_field,
-                renderer=build_chat_renderer(
-                    tokenizer=tokenizer,
-                    renderer_name=dataloader_config.chat_renderer,
-                ),
-            )
-        else:
-            recipe = build_local_jsonl_sft(
-                path=dataloader_config.dataset_path,
-                prompt_field=dataloader_config.prompt_field,
-                response_field=dataloader_config.response_field,
-                chat_template_kwargs=dataloader_config.chat_template_kwargs,
-            )
-    else:
-        recipe = DATASETS[dataset_name]
-    build_packing: _PackingBuilder = build_concat_then_split_packing
-    if dataloader_config.packing == "first_fit":
-        # Bind recipe-specific options before the shared graph-building step.
-        build_packing = partial(
-            build_first_fit_packing,
-            num_packing_bins=dataloader_config.num_packing_bins,
-        )
-    return _ResolvedRecipe(
-        recipe=recipe, build_packing=build_packing, collator=TextCollator
-    )
 
 
 def resolve_packing_geometry(

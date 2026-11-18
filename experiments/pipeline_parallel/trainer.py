@@ -31,11 +31,6 @@ from experiments.pipeline_parallel import step_metrics as metrics_runtime
 from experiments.pipeline_parallel.builders import (
     TrainingBuilders,
 )
-from experiments.pipeline_parallel.collectives import (
-    all_reduce,
-    set_pg_timeouts,
-    synchronize_local_errors,
-)
 from experiments.pipeline_parallel.config import LLMTunerConfig
 from experiments.pipeline_parallel.environment import build_runtime_environment
 from experiments.pipeline_parallel.metrics import MetricsProcessor
@@ -44,6 +39,11 @@ from experiments.pipeline_parallel.reductions import (
     resolve_training_reduction_meshes,
 )
 from experiments.pipeline_parallel.topology import ParallelTopology
+from llmtuner.accelerator.collectives import (
+    all_reduce,
+    set_pg_timeouts,
+    synchronize_local_errors,
+)
 from llmtuner.components.checkpointer.core.base import BaseCheckpointManager
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.lr_scheduler import LRSchedulersContainer

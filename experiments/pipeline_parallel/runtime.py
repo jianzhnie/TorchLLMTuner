@@ -15,11 +15,11 @@ from torch.distributed import ProcessGroup
 from torch.utils._pytree import tree_leaves, tree_map_only
 
 from experiments.pipeline_parallel import compatibility
-from experiments.pipeline_parallel.collectives import synchronize_local_errors
 from experiments.pipeline_parallel.microbatch_drivers import (
     run_eval_microbatches,
     run_microbatches,
 )
+from llmtuner.accelerator.collectives import synchronize_local_errors
 from llmtuner.accelerator.distributed import get_world_size
 from llmtuner.accelerator.spmd import spmd_context
 from llmtuner.components.loss import IGNORE_INDEX

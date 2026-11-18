@@ -8,7 +8,6 @@ per-module wrap policy (MoE blocks get the sparse treatment by their
 ``moe_enabled`` flag).
 """
 
-from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from typing import Any
 
@@ -18,19 +17,13 @@ from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import Shard
-from torch.nn import ModuleDict
 
-from experiments.pipeline_parallel.collectives import synchronize_local_errors
 from experiments.pipeline_parallel.fsdp_policies import (
-    build_fsdp_placement_fn,
-    disable_fsdp_gradient_division,
-    enable_fsdp_symm_mem,
-    fsdp_shard_size,
     get_fsdp_reshard_after_forward_policy,
-    iter_fsdp_modules,
 )
 from experiments.pipeline_parallel.topology import ParallelTopology
 from llmtuner.accelerator.capabilities import has as capability
+from llmtuner.accelerator.collectives import synchronize_local_errors
 from llmtuner.accelerator.distributed import get_backend, is_distributed
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import UnsupportedCombinationError
@@ -38,11 +31,24 @@ from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.compatibility import chunked_loss_fsdp
 from llmtuner.parallel.fully_shard_parallel.fine_grained.fine_grained import (
     get_fsdp_strategy,
-    load_custom_fsdp_engine,
+)
+from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import (
+    force_sum_grad_reduction,
+    iter_transformer_layers,
+    resolve_fsdp_mesh,
+    resolve_sparse_fsdp_mesh,
+    shard_experts_on_their_own_mesh,
 )
 from llmtuner.parallel.fully_shard_parallel.pattern import (
     apply_fsdp_by_pattern,
     set_fsdp_prefetch_windows,
+)
+from llmtuner.parallel.fully_shard_parallel.policies import (
+    build_fsdp_placement_fn,
+    disable_fsdp_gradient_division,
+    enable_fsdp_symm_mem,
+    fsdp_shard_size,
+    iter_fsdp_modules,
 )
 from llmtuner.utils.logging import get_logger
 
@@ -60,143 +66,6 @@ __all__ = [
     "resolve_fsdp_mesh",
     "resolve_sparse_fsdp_mesh",
 ]
-
-
-def iter_transformer_layers(layers: nn.Module) -> Iterator[tuple[Any, nn.Module]]:
-    """Yield ``(index, block)`` for the transformer block container.
-
-    torchtitan's ``Decoder.layers`` is a ``ModuleDict`` keyed by index, so it
-    iterates with ``.items()``; HF's ``PreTrainedModel`` stores a ``ModuleList``,
-    which iterates by position. Both yield the same pairs.
-    """
-    if isinstance(layers, ModuleDict):
-        return iter(layers.items())
-    return iter(enumerate(layers))
-
-
-def resolve_fsdp_mesh(parallel_dims: ParallelTopology) -> DeviceMesh:
-    """Build the dense FSDP-only submesh.
-
-    llmtuner's HF models hold plain tensors, so ``fully_shard`` cannot take an
-    explicit ``DataParallelMeshDims``: torch requires every parameter to be a
-    DTensor on the full SPMD mesh in that mode ("When dp_mesh_dims is
-    provided, all parameters must be DTensors ... via distribute_module").
-    Without mesh dims, torch reads the mesh by shape alone: 1-D means plain
-    FSDP, 2-D means HSDP (dim 0 replicates, dim 1 shards), and anything
-    higher-dimensional raises. Handing FSDP the raw multi-axis storage mesh
-    therefore mis-assigns the axes whenever that mesh also carries ``tp`` or
-    more than two active axes.
-
-    Instead, rebuild a dedicated submesh over exactly the axes torchtitan
-    declares in its ``DataParallelMeshDims``:
-
-    * shard: ``dp_shard`` (force-kept-alive in the dense storage mesh even at
-      size 1, so pure DDP gets a well-defined HSDP shard axis) plus ``cp``
-      when CP is enabled, flattened into a single axis when both are active
-      (torchtitan's flattened shard semantics);
-    * replicate: ``dp_replicate`` when replication is enabled.
-
-    The result is at most 2-D with the replicate axis first, so torch's
-    default reading coincides with the intended one. A size-1 result means no
-    DP/CP axis is active and FSDP is a no-op; the caller checks for that.
-    """
-    shard_axes = ["dp_shard"]
-    if parallel_dims.cp_enabled:
-        shard_axes.append("cp")
-    replicate_axis = "dp_replicate" if parallel_dims.dp_replicate_enabled else None
-
-    axes = ([replicate_axis] if replicate_axis else []) + shard_axes
-    submesh = parallel_dims.get_optional_mesh(axes)
-    assert submesh is not None  # dp_shard is always kept alive
-
-    if replicate_axis is None and len(shard_axes) == 1:
-        # 1-D: plain FSDP over the shard axis.
-        return submesh
-    if replicate_axis is None:
-        # 2-D (dp_shard, cp): flatten into torchtitan's single shard axis.
-        return submesh._flatten("dp_shard_cp")
-    if len(shard_axes) == 1:
-        # 2-D (dp_replicate, dp_shard): HSDP as torch reads it by default.
-        return submesh
-    flat_ranks = submesh.mesh.reshape(submesh.mesh.size(0), -1)
-    shard_mesh = submesh[tuple(shard_axes)]._flatten("dp_shard_cp")
-    return DeviceMesh.from_group(
-        [submesh[replicate_axis].get_group(), shard_mesh.get_group()],
-        submesh.device_type,
-        mesh=flat_ranks,
-        mesh_dim_names=(replicate_axis, "dp_shard_cp"),
-    )
-
-
-def resolve_sparse_fsdp_mesh(parallel_dims: ParallelTopology) -> DeviceMesh | None:
-    """Sparse counterpart of ``resolve_fsdp_mesh`` for routed experts.
-
-    Returns ``None`` when EP is disabled. Otherwise rebuilds the FSDP-only
-    submesh over ``efsdp`` (shard) and, when enabled, ``dp_replicate``
-    (replicate) -- the axes torchtitan declares as
-    ``DataParallelMeshDims(shard="efsdp", replicate="dp_replicate")``. The
-    raw sparse storage mesh also carries the ``ep`` axis, which torch's
-    default 2-D reading would mistake for the shard axis, so it is excluded
-    here the same way ``tp`` is excluded from the dense mesh.
-    """
-    if not parallel_dims.ep_enabled:
-        return None
-    axes = (["dp_replicate"] if parallel_dims.dp_replicate_enabled else []) + ["efsdp"]
-    submesh = parallel_dims.get_optional_mesh(axes)
-    assert submesh is not None  # efsdp is kept alive whenever ep > 1
-    return submesh
-
-
-def validate_fsdp_environment(
-    cfg: ParallelConfig,
-    parallel_dims: ParallelTopology | None,
-    *,
-    error_group: torch.distributed.ProcessGroup | None = None,
-) -> None:
-    """Reject an unavailable custom engine before parallel assembly mutates weights.
-
-    A single-rank FSDP no-op must not acquire optional engine dependencies.
-    """
-    if cfg.fsdp_config.fsdp_implementation != "custom" or parallel_dims is None:
-        return
-    dense_mesh = resolve_fsdp_mesh(parallel_dims)
-    sparse_mesh = resolve_sparse_fsdp_mesh(parallel_dims)
-    if dense_mesh.size() > 1 or (sparse_mesh is not None and sparse_mesh.size() > 1):
-        # Mesh resolution may create process groups, so only the local import
-        # belongs inside this error boundary. All assembly ranks must stop
-        # before transformations if one host lacks the optional private APIs.
-        with synchronize_local_errors(
-            "Custom FSDP environment validation", group=error_group
-        ):
-            load_custom_fsdp_engine()
-
-
-def shard_experts_on_their_own_mesh(
-    shard_fn: Callable[..., Any],
-    experts: nn.Module,
-    *,
-    edp_mesh: DeviceMesh,
-    fsdp_config: dict[str, Any],
-    reshard_after_forward: bool | int,
-) -> set[nn.Parameter]:
-    """Shard a MoE experts child on the sparse mesh as its own FSDP unit.
-
-    The nested form of what ``build_fsdp_placement_fn`` expresses on torch >=
-    2.12, where one ``fully_shard`` takes a placement function that returns both
-    a ``Shard`` and a mesh, so a single unit can own parameters on two meshes.
-    torch 2.9's ``shard_placement_fn`` returns only the ``Shard`` and has no
-    mesh slot, so the same split is expressed structurally instead: the experts
-    child becomes its own FSDP unit on the sparse mesh, and the caller keeps
-    the enclosing unit off those parameters via ``ignored_params``.
-
-    Returns the child's parameters read *after* sharding: FSDP2 replaces the
-    parameter objects it converts (they come back as DTensors), and
-    ``ignored_params`` matches by identity, so the pre-shard objects would not
-    match anything.
-    """
-    experts_config = dict(fsdp_config, mesh=edp_mesh)
-    shard_fn(experts, **experts_config, reshard_after_forward=reshard_after_forward)
-    return set(experts.parameters())
 
 
 def apply_fsdp_to_decoder(
@@ -608,18 +477,6 @@ def apply_fsdp_to_decoder(
             forward_count=forward_window,
             backward_count=backward_window,
         )
-
-
-def force_sum_grad_reduction(model: torch.nn.Module) -> None:
-    """Use plain SUM for FSDP's gradient reduce comms.
-
-    FSDP defaults to ``ReduceOp.PREMUL_SUM``, which pre-scales the local
-    gradient so the collective needs no separate scaling kernel -- but only NCCL
-    implements it, so every other backend raises. Forcing plain SUM gives up
-    that optimization, which is why the caller only turns it on off-NCCL.
-    """
-    for module in iter_fsdp_modules(model):
-        module.set_force_sum_reduction_for_comms(True)
 
 
 def apply_fsdp(

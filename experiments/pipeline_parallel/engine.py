@@ -7,7 +7,7 @@ iteration, reporting cadence and checkpointing remain Trainer responsibilities.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from functools import partial
@@ -15,20 +15,16 @@ from typing import Any
 
 import torch
 from torch.distributed import ProcessGroup
-from torch.distributed.tensor import DTensor
 
 from experiments.pipeline_parallel import gradients
 from experiments.pipeline_parallel import runtime as pipeline
-from experiments.pipeline_parallel.collectives import (
-    all_reduce,
-    synchronize_local_errors,
-)
 from experiments.pipeline_parallel.execution import (
     ExecutionLayout,
     validate_local_pipeline_layouts,
 )
 from experiments.pipeline_parallel.reductions import TrainingReductionMeshes
 from experiments.pipeline_parallel.topology import ParallelTopology
+from llmtuner.accelerator.collectives import synchronize_local_errors
 from llmtuner.accelerator.spmd import spmd_context
 from llmtuner.components.loss import chunked_lm_head_cross_entropy, cross_entropy_loss
 from llmtuner.components.loss_contract import (
@@ -38,17 +34,12 @@ from llmtuner.components.loss_contract import (
     validate_normalization_tokens,
 )
 from llmtuner.datasets.contracts import Batch, TrainerBatch
-from llmtuner.models.common.aux_loss import AuxLoss
-from llmtuner.models.common.moe.bias_update import (
-    collect_routing_load_metrics,
-    reset_routing_statistics,
-)
+from llmtuner.models.common.moe.bias_update import collect_routing_load_metrics
 from llmtuner.models.contracts import DecoderStructure
-from llmtuner.models.execution import (
-    ModelExecutionCapabilities,
-    validate_training_output,
-)
+from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.trainer.runtime.batch import prepare_model_inputs
+from llmtuner.trainer.runtime.engine import _TrainingStepOperations
+from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 from llmtuner.trainer.runtime.results import (
     AccumulationResult,
     StepResult,
@@ -73,7 +64,7 @@ def loss_vocab_kwargs(
 
 
 @dataclass(slots=True)
-class TrainingEngine:
+class TrainingEngine(_TrainingStepOperations):
     """Execute forward/backward with fixed model and parallel dependencies."""
 
     model_parts: list[torch.nn.Module]
@@ -219,36 +210,6 @@ class TrainingEngine:
             else self._backward_logits
         )
 
-    @property
-    def model(self) -> torch.nn.Module:
-        if len(self.model_parts) != 1:
-            raise RuntimeError("Dense execution requires exactly one model part")
-        return self.model_parts[0]
-
-    def begin_step(self) -> None:
-        """Reset gradient and routing accumulation before reading the step's batches."""
-        if self.optimizer is None:
-            raise RuntimeError(
-                "Optimizer services are not bound to the training engine"
-            )
-        self.optimizer.zero_grad(set_to_none=True)
-        reset_routing_statistics(self.model_parts)
-
-    def prepare_auxiliary_loss(
-        self, local_routing_tokens: int, *, dp_group: ProcessGroup | None
-    ) -> None:
-        """Normalize router loss over non-padding inputs, including masked prompts."""
-        if not AuxLoss.has_pending_counts(model_parts=self.model_parts):
-            return
-        global_routing_tokens = torch.tensor(
-            local_routing_tokens, dtype=torch.int64, device=self.device
-        )
-        if dp_group is not None:
-            all_reduce(global_routing_tokens, group=dp_group)
-        AuxLoss.set_step_denominator(
-            global_routing_tokens, model_parts=self.model_parts
-        )
-
     def prepare_accumulation_group(self, *, is_last: bool) -> None:
         """HSDP reduces accumulated gradients only on the final backward group."""
         if self.parallel_dims is not None and self.parallel_dims.dp_replicate_enabled:
@@ -260,38 +221,9 @@ class TrainingEngine:
         gradients.allreduce_fsdp_excluded_grads(
             self.model_parts, parallel_dims=self.parallel_dims
         )
-        gradients.allreduce_replicated_tp_grads(
+        allreduce_replicated_tp_grads(
             self.model_parts, parallel_dims=self.parallel_dims
         )
-
-    def accumulate_results(
-        self, results: Iterable[StepResult], *, retain_loss: bool
-    ) -> AccumulationResult:
-        """Consume executed groups without retaining a list of detached losses.
-
-        The iterable can execute each backward lazily, preserving caller-owned
-        diagnostics around individual groups. Inspect DTensor shards locally;
-        gradient validation coordinates the verdict after all groups finish.
-        """
-        loss_sum = None
-        group_count = 0
-        loss_is_finite = torch.ones((), dtype=torch.int32, device=self.device)
-        for result in results:
-            group_count += 1
-            value = result.loss_sum
-            local = value.to_local() if isinstance(value, DTensor) else value
-            loss_is_finite.logical_and_(torch.isfinite(local).all())
-            if retain_loss:
-                if loss_sum is None:
-                    loss_sum = value.clone()
-                else:
-                    loss_sum.add_(value)
-        with synchronize_local_errors(
-            "Training accumulation result validation", group=self.error_group
-        ):
-            if not group_count:
-                raise ValueError("Training accumulation requires at least one group")
-            return AccumulationResult(loss_sum, loss_is_finite)
 
     def routing_metrics(self) -> dict[str, float]:
         """Collect model routing observations only when the caller requests a log."""
@@ -386,126 +318,6 @@ class TrainingEngine:
                 extra_kwargs=extra_kwargs,
                 global_valid_tokens=global_valid_tokens,
             )
-
-    def _training_output(
-        self,
-        output: Any,
-        labels: torch.Tensor,
-        *,
-        hidden_states: bool = False,
-    ) -> torch.Tensor:
-        """Validate original token geometry, then expose flat rows to loss services.
-
-        Forward may communicate and must finish outside this local boundary.
-        Width comes from model-declared hidden geometry or the assembled
-        replicated vocabulary; vocabulary shards retain their own contracts.
-        """
-        with synchronize_local_errors(
-            "Model training output validation", group=self.error_group
-        ):
-            tensor = self._output_capabilities.output_tensor(
-                output, hidden_states=hidden_states
-            )
-            width = self._output_capabilities.hidden_size if hidden_states else None
-            if not hidden_states and self.execution_layouts:
-                layout = self.execution_layouts[0]
-                if not layout.vocabulary_sharded:
-                    width = layout.vocabulary_size
-            validate_training_output(tensor, labels, output_width=width)
-        # Reshaping a DTensor can communicate. Keep tensor operations outside
-        # the local-only validation boundary and preserve the original autograd.
-        return tensor if tensor.ndim == 2 else tensor.reshape(-1, tensor.shape[-1])
-
-    def _backward_chunked(
-        self,
-        inputs: torch.Tensor,
-        labels: torch.Tensor,
-        *,
-        extra_kwargs: dict[str, Any],
-        global_valid_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        model = self.model
-        projection = self._chunked_projection
-        if projection is None:
-            raise RuntimeError("Chunked output projection is not bound")
-        hidden_states = self._training_output(
-            model(inputs, **extra_kwargs, skip_lm_head=True),
-            labels,
-            hidden_states=True,
-        )
-        if self.chunked_loss_backward is None:
-            raise RuntimeError("Chunked loss backward is not bound")
-        loss = self.chunked_loss_backward(
-            projection,
-            hidden_states,
-            labels.reshape(-1),
-            num_chunks=self.chunked_loss_num_chunks,
-            grad_scale=1.0 / global_valid_tokens,
-            **self._loss_kwargs,
-        )
-        with synchronize_local_errors(
-            "Chunked loss result validation", group=self.error_group
-        ):
-            validate_loss_sum(loss, device=labels.device, requires_grad=False)
-        return loss
-
-    def _backward_logits(
-        self,
-        inputs: torch.Tensor,
-        labels: torch.Tensor,
-        *,
-        extra_kwargs: dict[str, Any],
-        global_valid_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        model = self.model
-        logits = self._training_output(model(inputs, **extra_kwargs), labels)
-        loss_sum = self.loss_sum(logits, labels.reshape(-1), **self._loss_kwargs)
-        del logits
-        with synchronize_local_errors(
-            "Training loss result validation", group=self.error_group
-        ):
-            validate_loss_sum(loss_sum, device=labels.device, requires_grad=True)
-        (loss_sum / global_valid_tokens).backward()
-        return loss_sum.detach()
-
-    def optimizer_step(
-        self,
-        step: int,
-        *,
-        grad_norm: torch.Tensor | None = None,
-        auxiliary_metrics: Mapping[str, float] | None = None,
-    ) -> UpdateResult:
-        """Commit an update, then advance scheduler and EMA in the fixed order."""
-        with synchronize_local_errors(
-            "Training update preflight", group=self.error_group
-        ):
-            if self.optimizer is None or self.lr_scheduler is None:
-                raise RuntimeError(
-                    "Optimizer services are not bound to the training engine"
-                )
-            # Validate and snapshot reporting inputs before any parameter write.
-            # Publish this result only after every update operation succeeds.
-            result = UpdateResult(
-                step=step,
-                grad_norm=grad_norm,
-                updated=True,
-                scheduler_advanced=True,
-                ema_advanced=self.ema is not None,
-                auxiliary_metrics={}
-                if auxiliary_metrics is None
-                else auxiliary_metrics,
-            )
-        self.optimizer.step()
-        # The optimizer update is committed if scheduler coordination fails.
-        with synchronize_local_errors(
-            "Training scheduler update", group=self.error_group
-        ):
-            self.lr_scheduler.step()
-        with synchronize_local_errors("Training EMA update", group=self.error_group):
-            if self.ema is not None:
-                # All ranks enter, including PP stages with no tracked tensors.
-                self.ema.step(step)
-        return result
 
     def finish_step(
         self,
