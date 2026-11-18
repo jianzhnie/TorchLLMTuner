@@ -85,6 +85,41 @@ class _FakeParallelTopology:
         self.non_data_parallel_size = non_data_parallel
 
 
+@pytest.mark.parametrize(
+    "rank,writer_rank,all_ranks,expected",
+    [
+        (0, 0, False, True),
+        (0, 3, False, False),
+        (3, 3, False, True),
+        (3, 0, False, False),
+        (3, 0, True, True),
+    ],
+)
+def test_metric_sink_uses_selected_writer_rank(
+    monkeypatch, tmp_path, rank, writer_rank, all_ranks, expected
+):
+    created = []
+
+    def build_sink(folder, tag):
+        created.append(folder)
+        return BaseLogger()
+
+    monkeypatch.setattr(metrics_module, "get_distributed_rank", lambda: rank)
+    monkeypatch.setattr(metrics_module.metric_loggers, "TensorBoardLogger", build_sink)
+    owner = MetricsProcessor.__new__(MetricsProcessor)
+    logger = owner._build_metric_logger(
+        config=Config(enable_tensorboard=True, save_for_all_ranks=all_ranks),
+        dump_folder=str(tmp_path),
+        metrics_rank=writer_rank,
+    )
+    try:
+        assert bool(created) is expected
+        if all_ranks:
+            assert created[0].endswith(f"rank_{rank}")
+    finally:
+        logger.close()
+
+
 def _processor(num_flops_per_token: int = 1000, **config_overrides) -> MetricsProcessor:
     return MetricsProcessor(
         Config(**config_overrides),
@@ -1031,3 +1066,39 @@ def test_optional_sink_dependency_failure_preserves_cause(
     with pytest.raises(ImportError, match=message) as failure:
         logger_type(str(tmp_path))
     assert failure.value.__cause__ is cause
+
+
+@pytest.mark.parametrize("report_error", [OSError, KeyboardInterrupt, SystemExit])
+def test_logger_cleanup_preserves_owners_when_error_reporting_fails(
+    monkeypatch, report_error
+):
+    from types import SimpleNamespace
+
+    from llmtuner.utils import metric_loggers
+
+    calls = []
+    failures = [OSError("first sink"), ValueError("second sink")]
+    retry = False
+
+    def close(index):
+        calls.append(index)
+        if not retry and index < 2:
+            raise failures[index]
+
+    def report(*args, **kwargs):
+        raise report_error("error sink failed")
+
+    monkeypatch.setattr(metric_loggers.logger, "exception", report)
+    container = LoggerContainer()
+    for index in range(3):
+        container.add_logger(SimpleNamespace(close=lambda index=index: close(index)))
+    with pytest.raises(OSError) as caught:
+        container.close()
+    assert caught.value is failures[0]
+    assert calls == [0, 1, 2]
+    assert container.number_of_loggers == 2
+    retry = True
+    container.close()
+    container.close()
+    assert calls == [0, 1, 2, 0, 1]
+    assert container.number_of_loggers == 0

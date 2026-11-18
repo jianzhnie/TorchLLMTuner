@@ -162,6 +162,14 @@ def check_failure(phase, failing_rank, error_type):
         assert len(saves) == expected_saves
         assert closes == ["checkpointer", "metrics"]
         assert not profiler._entered
+        if profiler.torch_profiler is not None:
+            # Export failed throughout train() cleanup. The owner must remain
+            # reachable until the injection is removed and close can retry.
+            assert phase == "step" and dist.get_rank() == failing_rank
+            assert trainer.profiler_resource is profiler
+            trainer.close()
+            assert trainer.profiler_resource is None
+            assert closes == ["checkpointer", "metrics"]
         assert profiler.torch_profiler is None
         assert profiler.memory_profiler is None
         assert gc.isenabled() == enabled

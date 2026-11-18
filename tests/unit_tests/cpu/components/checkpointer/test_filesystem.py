@@ -78,11 +78,11 @@ def test_local_queries_do_not_resolve_remote_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(filesystem, "resolve", unexpected_resolve)
     model = tmp_path / "model.bin"
     model.write_bytes(b"checkpoint")
-    assert filesystem.exists(model)
     assert filesystem.isfile(model)
     assert not filesystem.isdir(model)
     assert filesystem.isdir(tmp_path)
-    assert not filesystem.exists(tmp_path / "missing")
+    assert not filesystem.isfile(tmp_path / "missing")
+    assert not filesystem.isdir(tmp_path / "missing")
 
 
 def test_listdir_returns_names_not_paths(tmp_path):
@@ -112,7 +112,6 @@ def test_remote_pathlike_uses_filesystem_path_for_all_operations(tmp_path):
     try:
         assert filesystem.is_remote(directory)
         assert filesystem.join(directory, "model.bin") == model.path
-        assert filesystem.exists(directory)
         assert filesystem.isdir(directory)
         assert filesystem.isfile(model)
         assert filesystem.listdir(directory) == ["model.bin"]

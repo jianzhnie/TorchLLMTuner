@@ -50,7 +50,7 @@ def test_gather_metadata_preserves_variable_length_rank_payloads(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("initialized,device", [(False, "npu"), (True, "cpu")])
+@pytest.mark.parametrize("initialized,device", [(False, "npu"), (True, "cuda")])
 def test_metadata_adapter_leaves_other_environments_untouched(
     monkeypatch, initialized, device
 ):
@@ -58,10 +58,11 @@ def test_metadata_adapter_leaves_other_environments_untouched(
     monkeypatch.setattr(
         metadata, "get_comm_device", lambda: SimpleNamespace(type=device)
     )
-    assert not metadata.adapt_npu_metadata_gather(SimpleNamespace())
+    assert not metadata.adapt_metadata_gather(SimpleNamespace())
 
 
-def test_metadata_adapter_is_scoped_to_one_manager_instance(monkeypatch):
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+def test_metadata_adapter_is_scoped_to_one_manager_instance(monkeypatch, device):
     class DefaultMetadataManager:
         def _all_gather_pickled_data(self, data, process_group=None):
             return "original"
@@ -70,10 +71,10 @@ def test_metadata_adapter_is_scoped_to_one_manager_instance(monkeypatch):
     other = DefaultMetadataManager()
     monkeypatch.setattr(metadata.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(
-        metadata, "get_comm_device", lambda: SimpleNamespace(type="npu")
+        metadata, "get_comm_device", lambda: SimpleNamespace(type=device)
     )
     monkeypatch.setattr(metadata, "DefaultMetadataManager", DefaultMetadataManager)
-    assert metadata.adapt_npu_metadata_gather(SimpleNamespace(_metadata_manager=target))
+    assert metadata.adapt_metadata_gather(SimpleNamespace(_metadata_manager=target))
     assert target._all_gather_pickled_data.__func__ is metadata._gather_pickled_metadata
     assert other._all_gather_pickled_data(None) == "original"
 

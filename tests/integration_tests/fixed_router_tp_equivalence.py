@@ -9,18 +9,22 @@ target-device validation remains separate.
 """
 
 import argparse
+from contextlib import ExitStack
+from dataclasses import replace
 from itertools import product
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import DefaultDeviceType
 
 from llmtuner.accelerator.linear_collectives import resolve_autograd_collectives
+from llmtuner.accelerator.spmd import set_current_spmd_mesh
 from llmtuner.config.compile_config import CompileConfig
 from llmtuner.memory.activation_checkpoint import wrap_full
 from llmtuner.models.common.aux_loss import AuxLoss
-from llmtuner.models.contracts import GatedMLPStructure
+from llmtuner.models.contracts import DecoderStructure, GatedMLPStructure
 from llmtuner.parallel.expert_parallel.model_replacement import swap_moe_blocks
 from llmtuner.parallel.model_compile import apply_compile
 from llmtuner.parallel.tensor_parallel.checkpointing import (
@@ -55,6 +59,8 @@ class SharedExpert(nn.Module):
 
 
 class MoEDecoder(nn.Module):
+    moe_block_name = "mlp"
+
     def __init__(self, block):
         super().__init__()
         self.mlp = block
@@ -64,6 +70,10 @@ class MoEDecoder(nn.Module):
 
 
 class MoEModel(nn.Module):
+    decoder_structure = DecoderStructure(
+        decoder="", embedding="embedding", blocks="layers", norm="norm", head="head"
+    )
+
     def __init__(self, layer):
         super().__init__()
         self.layers = nn.ModuleList([layer])
@@ -83,7 +93,11 @@ def main():
     args = parser.parse_args()
     args.compile = args.compile or args.fullgraph
     dist.init_process_group("gloo")
+    previous_checkpoint_device = DefaultDeviceType.get_device_type()
+    DefaultDeviceType.set_device_type("cpu")
+    scope = ExitStack()
     try:
+        scope.enter_context(set_current_spmd_mesh(None))
         rank = dist.get_rank()
         assert dist.get_world_size() == 2
         # apply_tp resolves the version-dependent API before tracing.
@@ -125,6 +139,9 @@ def main():
             if shared_name is not None:
                 setattr(block, shared_name, SharedExpert())
                 setattr(reference, shared_name, SharedExpert())
+                block.moe_contract = replace(
+                    block.moe_contract, shared_expert=shared_name
+                )
             block_path = next(
                 name for name, module in target.named_modules() if module is block
             )
@@ -298,7 +315,9 @@ def main():
                     assert (
                         f"shared_experts.{name}.weight" in block.tp_sharded_param_names
                     )
-            torch.optim.SGD(block.parameters(), lr=0.01).step()
+            torch.optim.SGD(
+                block.parameters(), lr=0.01, foreach=False, fused=False
+            ).step()
             for name, wanted in zip(names, expected_updates, strict=True):
                 torch.testing.assert_close(
                     getattr(grouped, name), wanted, atol=1e-10, rtol=1e-10
@@ -350,6 +369,8 @@ def main():
                     flush=True,
                 )
     finally:
+        scope.close()
+        DefaultDeviceType.set_device_type(previous_checkpoint_device)
         dist.destroy_process_group()
 
 

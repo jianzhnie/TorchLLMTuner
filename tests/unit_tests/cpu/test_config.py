@@ -379,15 +379,42 @@ def test_a_whitespace_folder_is_not_a_folder() -> None:
         CheckpointConfig(folder="   ")
 
 
-def test_load_step_is_either_derive_or_non_negative() -> None:
-    assert CheckpointConfig(load_step=-1).load_step == -1
+@pytest.mark.parametrize("folder", [None, False, 1, [], {}])
+def test_checkpoint_folder_requires_a_string(folder) -> None:
+    with pytest.raises(ConfigError, match="checkpoint.folder must be a string"):
+        CheckpointConfig(folder=folder)
+
+
+@pytest.mark.parametrize("step", [-1, 0, 3])
+def test_load_step_is_either_derive_or_non_negative(step) -> None:
+    assert CheckpointConfig(load_step=step).load_step == step
+
+
+@pytest.mark.parametrize("step", [-2, True, False, 1.5, "latest", None])
+def test_load_step_rejects_invalid_counter(step) -> None:
     with pytest.raises(ValueError, match="load_step must be >= -1"):
-        CheckpointConfig(load_step=-2)
+        CheckpointConfig(load_step=step)
 
 
 def test_negative_retention_is_rejected() -> None:
     with pytest.raises(ValueError, match="keep_latest_k must be >= 0"):
         CheckpointConfig(keep_latest_k=-1)
+
+
+@pytest.mark.parametrize("predicate", [False, True, 0, "step > 2", {}])
+def test_retention_predicate_rejects_noncallable_configuration(predicate) -> None:
+    with pytest.raises(ValueError, match="purge_exempt must be callable or None"):
+        CheckpointConfig(purge_exempt=predicate)
+
+
+def test_retention_predicate_preserves_callable_owner() -> None:
+    class Predicate:
+        def __call__(self, step):
+            return step == 2
+
+    predicate = Predicate()
+    assert CheckpointConfig(purge_exempt=predicate).purge_exempt is predicate
+    assert CheckpointConfig(purge_exempt=None).purge_exempt is None
 
 
 @skip_without("dcp")
@@ -437,6 +464,17 @@ def test_hf_load_modes_imply_each_other() -> None:
         CheckpointConfig(last_save_in_hf=True, last_save_model_only=False)
     # The pairing the defaults describe is accepted without spelling it out.
     assert CheckpointConfig(initial_load_in_hf=True).initial_load_model_only is True
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32"])
+def test_checkpoint_export_dtype_accepts_supported_precision(dtype):
+    assert CheckpointConfig(export_dtype=dtype).export_dtype == dtype
+
+
+@pytest.mark.parametrize("dtype", ["float64", "FLOAT32", "", None, True, [], {}])
+def test_checkpoint_export_dtype_rejects_invalid_precision(dtype):
+    with pytest.raises(ConfigError, match="checkpoint.export_dtype must be"):
+        CheckpointConfig(export_dtype=dtype)
 
 
 def test_an_unknown_async_mode_is_rejected_and_the_valid_one_is_lowered() -> None:
@@ -1165,3 +1203,9 @@ def test_auto_fill_keeps_explicit_sizes_when_metadata_unavailable(monkeypatch):
     )
     cfg.auto_fill_model()
     assert cfg.model.vocab_size == 257
+
+
+@pytest.mark.parametrize("mode", [None, True, 1, [], {}])
+def test_checkpoint_async_mode_rejects_nonstring_values(mode):
+    with pytest.raises(ConfigError, match="checkpoint.async_mode must be one of"):
+        CheckpointConfig(async_mode=mode)

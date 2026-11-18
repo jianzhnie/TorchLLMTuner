@@ -1880,45 +1880,6 @@ def test_preprocess_filters_metadata_without_changing_source():
     assert seen[0]["labels"] is labels
 
 
-def test_fsdp_managed_parameters_is_empty_without_fsdp_modules():
-    from llmtuner.trainer.runtime.assembly import _fsdp_managed_parameters
-
-    assert _fsdp_managed_parameters(nn.Linear(3, 2)) == set()
-
-
-def test_fsdp_managed_parameters_reads_actual_shared_state():
-    from torch.distributed.fsdp import FSDPModule
-
-    from llmtuner.trainer.runtime.assembly import _fsdp_managed_parameters
-
-    class Unit(FSDPModule, nn.Linear):
-        def __new__(cls, state):
-            return object.__new__(cls)
-
-        def __init__(self, state):
-            nn.Linear.__init__(self, 3, 2)
-            self.state = state
-
-        def _get_fsdp_state(self):
-            return self.state
-
-    state = SimpleNamespace(_fsdp_param_groups=[])
-    first, second = Unit(state), Unit(state)
-    state._fsdp_param_groups = [
-        SimpleNamespace(
-            fsdp_params=[
-                SimpleNamespace(sharded_param=first.weight),
-                SimpleNamespace(sharded_param=first.weight),
-            ]
-        ),
-        SimpleNamespace(fsdp_params=[SimpleNamespace(sharded_param=second.bias)]),
-    ]
-    model = nn.ModuleList([first, second])
-    model.unmanaged = nn.Linear(3, 2)
-
-    assert _fsdp_managed_parameters(model) == {first.weight, second.bias}
-
-
 def test_assembly_uses_live_process_group_rank_and_size(monkeypatch):
     from llmtuner.trainer.runtime import environment
 
@@ -2524,6 +2485,47 @@ def test_finite_training_final_dcp_restores_consumed_cursor_and_completed_state(
         torch.testing.assert_close(next_batch.labels, reference.labels)
     finally:
         resumed.close()
+
+
+@pytest.mark.parametrize("failure_type", [OSError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("resource_name", ["checkpointer", "metrics", "optimizer"])
+def test_close_attribute_failure_retains_owner_and_drains_independent_resources(
+    failure_type, resource_name
+):
+    trainer = Trainer.__new__(Trainer)
+    calls = []
+    failure = failure_type("close attribute unavailable")
+
+    class Resource:
+        @property
+        def close(self):
+            calls.append("resolve")
+            if calls.count("resolve") == 1:
+                raise failure
+            return lambda: calls.append("close")
+
+    owner = Resource()
+    setattr(trainer, resource_name, owner)
+    loader = SimpleNamespace(close=lambda: calls.append("loader"))
+    trainer.dataloader = loader
+    trainer.gc_handler = SimpleNamespace(close=lambda: calls.append("gc"))
+    with pytest.raises(failure_type) as caught:
+        trainer.close()
+    assert caught.value is failure
+    assert getattr(trainer, resource_name) is owner
+    assert trainer.gc_handler is None
+    if resource_name == "checkpointer":
+        assert trainer.dataloader is loader
+        assert calls == ["resolve", "gc"]
+    else:
+        assert trainer.dataloader is None
+        assert calls.count("loader") == 1
+    trainer.close()
+    trainer.close()
+    assert getattr(trainer, resource_name) is None
+    assert trainer.dataloader is None
+    assert calls.count("resolve") == 2
+    assert calls.count("close") == calls.count("gc") == calls.count("loader") == 1
 
 
 def test_trainer_retries_failed_metrics_cleanup_without_reclosing_other_resources():

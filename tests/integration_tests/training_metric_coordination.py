@@ -7,7 +7,7 @@ Step computation and services are substituted; the real train loop must stop
 both ranks before checkpoint save after a rank-local sink failure.
 """
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +15,17 @@ from unittest.mock import patch
 import torch.distributed as dist
 
 from llmtuner.trainer.trainer import Trainer
+
+
+class IdleProfiler(AbstractContextManager):
+    def step(self):
+        pass
+
+    def close(self):
+        pass
+
+    def __exit__(self, *args):
+        return False
 
 
 def main():
@@ -59,7 +70,7 @@ def main():
                 with (
                     patch(
                         "llmtuner.trainer.runtime.assembly.Profiler",
-                        return_value=nullcontext(SimpleNamespace(step=lambda: None)),
+                        return_value=IdleProfiler(),
                     ),
                     patch(
                         "llmtuner.trainer.trainer.GarbageCollection",

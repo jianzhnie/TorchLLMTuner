@@ -32,6 +32,8 @@ Set CHUNKED_LOSS_EQ_ACCUMULATION=2 and CHUNKED_LOSS_EQ_MASKED=1 to test
 unequal sequence lengths and ignored-target counts across accumulation groups.
 Set CHUNKED_LOSS_EQ_PADDING=1 for right-padded rows with differing lengths;
 the reference removes padding and executes each row independently.
+Set CHUNKED_LOSS_EQ_UNPAD_REFERENCE=0 for models whose compression windows
+depend on padded positions; compare ordinary loss on the same padded layout.
 Add CHUNKED_LOSS_EQ_PADDING_SIDE=left to reset positions after a padded prefix.
 Add CHUNKED_LOSS_EQ_EMPTY_ROWS=1 to include rows containing only padding.
 Set CHUNKED_LOSS_EQ_REJECT_EMPTY=1 to enable EMA and verify that a fully
@@ -65,9 +67,10 @@ from llmtuner.config import (
 from llmtuner.datasets.contracts import Batch, TrainerBatch
 from llmtuner.datasets.synthetic import RandomTokenSource
 from llmtuner.models.configuration import build_model_config_for
-from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
+from llmtuner.models.registry import build_registered_model
 from llmtuner.parallel.tensor_parallel.checkpointing import gather_tensor_parallel_state
 from llmtuner.trainer.trainer import Trainer
+from llmtuner.utils.module_names import canonical_fqn
 from tests.integration_tests.cli_checkpoint_equivalence import assert_state_equal
 from tests.integration_tests.harness import (
     device as harness_device,
@@ -92,6 +95,9 @@ MICRO_BATCH = GLOBAL_BATCH if TP == 1 else 1
 ACCUMULATION = int(os.environ.get("CHUNKED_LOSS_EQ_ACCUMULATION", "1"))
 MASKED = os.environ.get("CHUNKED_LOSS_EQ_MASKED") == "1"
 PADDING = os.environ.get("CHUNKED_LOSS_EQ_PADDING") == "1"
+# Compression/recurrent models may assign meaning to physical padded positions.
+# Keep the stronger unpadding oracle by default for padding-invariant models.
+UNPAD_REFERENCE = os.environ.get("CHUNKED_LOSS_EQ_UNPAD_REFERENCE", "1") == "1"
 PADDING_SIDE = os.environ.get("CHUNKED_LOSS_EQ_PADDING_SIDE", "right")
 EMPTY_ROWS = os.environ.get("CHUNKED_LOSS_EQ_EMPTY_ROWS") == "1"
 REJECT_EMPTY = os.environ.get("CHUNKED_LOSS_EQ_REJECT_EMPTY") == "1"
@@ -189,7 +195,7 @@ def scenario_batches(source: Iterable[Batch]) -> Iterator[Batch | TrainerBatch]:
 
 def _reference_trajectory(
     cfg: LLMTunerConfig,
-) -> tuple[list[float], dict, list[dict[str, torch.Tensor]]]:
+) -> tuple[list[float], dict, list[dict[str, torch.Tensor | None]]]:
     """The same training, un-chunked and unparallelized: one process, full batch.
 
     Mirrors the trainer's non-PP step arithmetic exactly. As in
@@ -199,7 +205,10 @@ def _reference_trajectory(
     second group's rows different positions and a different causal boundary.
     """
     torch.manual_seed(cfg.seed)
-    model = moved(Qwen3MoeForCausalLM(build_model_config_for(cfg)))
+    model = moved(build_registered_model(build_model_config_for(cfg)))
+    initialize_buffers = getattr(model, "initialize_training_buffers", None)
+    if callable(initialize_buffers):
+        initialize_buffers()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
@@ -225,7 +234,7 @@ def _reference_trajectory(
         loss_sum = None
         for _microbatch in range(cfg.gradient_accumulation_steps):
             batch = next(batches)
-            if PADDING:
+            if PADDING and UNPAD_REFERENCE:
                 # Independent oracle: no padding mask or padded token reaches
                 # reference attention, unlike the flattened Trainer path.
                 num_valid += int((batch["labels"] != IGNORE_INDEX).sum())
@@ -240,7 +249,11 @@ def _reference_trajectory(
                     loss = cross_entropy_loss(logits, targets)
                     loss_sum = loss if loss_sum is None else loss_sum + loss
                 continue
-            batch = moved_batch(batch)
+            if PADDING:
+                empty_rows += int(batch["padding_mask"].all(dim=-1).sum())
+                batch = {name: moved(value) for name, value in batch.items()}
+            else:
+                batch = moved_batch(batch)
             num_valid += int(
                 (
                     model.prepare_inputs(batch, parallel_dims=None)[1] != IGNORE_INDEX
@@ -248,7 +261,13 @@ def _reference_trajectory(
             )
             for d in range(DP_SHARD):
                 rows = slice(d * rows_per_dp, (d + 1) * rows_per_dp)
-                sub = Batch(input_ids=batch.input_ids[rows], labels=batch.labels[rows])
+                sub = (
+                    {name: value[rows] for name, value in batch.items()}
+                    if PADDING
+                    else Batch(
+                        input_ids=batch.input_ids[rows], labels=batch.labels[rows]
+                    )
+                )
                 inputs, targets, kwargs = model.prepare_inputs(sub, parallel_dims=None)
                 logits = model(inputs, **kwargs).logits
                 loss = cross_entropy_loss(logits, targets)
@@ -258,7 +277,11 @@ def _reference_trajectory(
         clip_grad_norm_(model.parameters(), max_norm=cfg.max_norm, foreach=True)
         gradients.append(
             {
-                name: parameter.grad.detach().clone()
+                name: (
+                    parameter.grad.detach().clone()
+                    if parameter.grad is not None
+                    else None
+                )
                 for name, parameter in model.named_parameters()
             }
         )
@@ -279,9 +302,10 @@ def global_parameters(
     model: torch.nn.Module, *, gradients: bool = False
 ) -> dict[str, torch.Tensor | None]:
     state = {
-        name: parameter.grad if gradients else parameter.detach()
+        canonical_fqn(name): parameter.grad if gradients else parameter.detach()
         for name, parameter in model.named_parameters()
     }
+    assert len(state) == sum(1 for _ in model.parameters()), "Parameter name collision"
     # None gradients remain visible to the comparison, rather than being skipped.
     state = gather_tensor_parallel_state(state, model_parts=[model])
     return {
@@ -369,10 +393,17 @@ def main() -> None:
             actual_gradients = global_parameters(model, gradients=True)
             assert actual_gradients.keys() == ref_gradients[step].keys()
             for name, actual in actual_gradients.items():
+                expected = ref_gradients[step][name]
+                if actual is None and expected is None:
+                    continue
                 if actual is None:
                     failures.append(f"rank {rank}: step {step + 1} missing grad {name}")
                     continue
-                expected = ref_gradients[step][name]
+                if expected is None:
+                    failures.append(
+                        f"rank {rank}: step {step + 1} unexpected grad {name}"
+                    )
+                    continue
                 max_grad_diff = max(
                     max_grad_diff, (actual - expected).abs().max().item()
                 )
@@ -398,6 +429,7 @@ def main() -> None:
         assert actual_params.keys() == ref_params.keys()
         saw_shard = False
         for name, parameter in model.named_parameters():
+            name = canonical_fqn(name)
             local = (
                 parameter.to_local() if isinstance(parameter, DTensor) else parameter
             )
@@ -426,7 +458,8 @@ def main() -> None:
                 f"tp={TP} dp_shard={DP_SHARD} chunks={NUM_CHUNKS} steps={STEPS} "
                 f"microbatch={MICRO_BATCH} seq={SEQ} "
                 f"accumulation={cfg.gradient_accumulation_steps} masked={MASKED} "
-                f"padding={PADDING} padding_side={PADDING_SIDE} empty_rows={EMPTY_ROWS}"
+                f"padding={PADDING} padding_side={PADDING_SIDE} "
+                f"empty_rows={EMPTY_ROWS} unpad_reference={UNPAD_REFERENCE}"
             )
             print(f"reference losses = {[f'{x:.6f}' for x in reference]}")
             print(f"chunked losses   = {[f'{x:.6f}' for x in losses]}")

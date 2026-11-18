@@ -9,6 +9,7 @@ import pickle
 import random
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from itertools import product
 from tempfile import TemporaryDirectory
 
@@ -18,8 +19,10 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
+from torch.utils.checkpoint import DefaultDeviceType
 
 from llmtuner.accelerator.linear_collectives import resolve_autograd_collectives
+from llmtuner.accelerator.spmd import set_current_spmd_mesh
 from llmtuner.components.checkpointer.core.checkpoint_keys import RNG_STATE
 from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.lr_scheduler import build_lr_scheduler
@@ -51,6 +54,7 @@ def runtime(seed, recompute, compile_enabled, tp_group, dp_mesh=None, custom=Fal
     target = _model(seed).train()
     block = target.layers[0].mlp
     block.shared_expert = SharedExpert()
+    block.moe_contract = replace(block.moe_contract, shared_expert="shared_expert")
     path = next(name for name, module in target.named_modules() if module is block)
     realize_moe_blocks_tp(
         [(path, block)], tp_size=2, tp_rank=dist.get_rank(tp_group), group=tp_group
@@ -66,6 +70,7 @@ def runtime(seed, recompute, compile_enabled, tp_group, dp_mesh=None, custom=Fal
     swap_moe_blocks(
         target, fixed_router=True, tp_enabled=True, router_aux_loss_coef=0.03
     )
+    assert target.layers[0].mlp.shared_experts is block.shared_expert
     decoder = MoEDecoder(target.layers[0].mlp)
     if recompute:
         decoder = wrap_full(decoder)
@@ -183,12 +188,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fsdp", action="store_true", help="Use four ranks: DP2 x TP2")
     parser.add_argument(
+        "--ac-compile-only", action="store_true", help="Run the AC/compile pair only"
+    )
+    parser.add_argument(
         "--custom-fsdp", action="store_true", help="Use custom FSDP; requires --fsdp"
     )
     args = parser.parse_args()
     if args.custom_fsdp and not args.fsdp:
         parser.error("--custom-fsdp requires --fsdp")
     dist.init_process_group("gloo")
+    previous_checkpoint_device = DefaultDeviceType.get_device_type()
+    # torch-npu may set the process default even though this script is CPU-only.
+    DefaultDeviceType.set_device_type("cpu")
     try:
         assert dist.get_world_size() == (4 if args.fsdp else 2)
         dp_mesh = None
@@ -200,12 +211,16 @@ def main():
         resolve_autograd_collectives()
         rank = dist.get_rank()
         context = TemporaryDirectory() if rank == 0 else nullcontext(None)
-        with context as root:
+        # This lower-level runtime passes TP groups explicitly. Establish its
+        # empty ambient scope before tracing, as Trainer does for its mesh scope.
+        with context as root, set_current_spmd_mesh(None):
             paths = [root]
             dist.broadcast_object_list(paths, src=0)
             for recompute, compiled, mode in product(
                 (False, True), (False, True), ("disabled", "async")
             ):
+                if args.ac_compile_only and not (recompute and compiled):
+                    continue
                 original = runtime(
                     42, recompute, compiled, tp_group, dp_mesh, args.custom_fsdp
                 )
@@ -268,6 +283,7 @@ def main():
                         flush=True,
                     )
     finally:
+        DefaultDeviceType.set_device_type(previous_checkpoint_device)
         dist.destroy_process_group()
 
 

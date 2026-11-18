@@ -168,24 +168,18 @@ def _run(directory: str, residency: str, steps: int, expected_start=None):
                         )
     torch.npu.reset_peak_memory_stats()
     try:
-        trainer.train()
+        trainer.checkpointer.load(trainer.cfg.checkpoint.load_step)
+        source = trainer.data_iterator()
+        while trainer.step < steps:
+            trainer.step += 1
+            trainer.train_step(source)
+            trainer.checkpointer.save(trainer.step, last_step=trainer.step == steps)
+        trainer.checkpointer.maybe_wait_for_staging()
+        trainer.checkpointer.maybe_wait_for_saving()
         for optimizer, parameter, name, destination in virtual_destinations:
             assert optimizer.state[parameter][name] is destination, (
                 f"checkpoint restore replaced virtual optimizer state {name}"
             )
-        if expected_start is not None:
-            restored_model = {
-                name: value.detach().cpu().clone()
-                for name, value in trainer.training_engine.model.state_dict().items()
-            }
-            restored_optimizer = {
-                name: value.detach().cpu().clone()
-                if isinstance(value, torch.Tensor)
-                else value
-                for name, value in trainer.optimizer.state_dict().items()
-            }
-            _compare(restored_model, expected_start[0])
-            _compare(restored_optimizer, expected_start[1])
         model = {
             name: value.detach().cpu().clone()
             for name, value in trainer.training_engine.model.state_dict().items()
@@ -196,6 +190,9 @@ def _run(directory: str, residency: str, steps: int, expected_start=None):
             else value
             for name, value in trainer.optimizer.state_dict().items()
         }
+        if expected_start is not None:
+            _compare(model, expected_start[0])
+            _compare(optimizer, expected_start[1])
         return model, optimizer, torch.npu.max_memory_allocated()
     finally:
         trainer.close()

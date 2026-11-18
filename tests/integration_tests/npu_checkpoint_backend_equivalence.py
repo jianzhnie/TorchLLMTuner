@@ -43,7 +43,15 @@ def _assert_equal(actual, expected) -> None:
         assert actual == expected, (actual, expected)
 
 
-def _train(root: Path, steps: int, *, ema: str, ac: str) -> dict:
+def _train(
+    root: Path,
+    steps: int,
+    *,
+    ema: str,
+    ac: str,
+    keep_latest_k: int,
+    checkpoint_interval: int,
+) -> dict:
     config = qwen3_config()
     config.training.steps = steps
     config.training.global_batch_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -58,9 +66,9 @@ def _train(root: Path, steps: int, *, ema: str, ac: str) -> dict:
     config.training.checkpoint_config = CheckpointConfig(
         enable=True,
         backend="torch_checkpointing",
-        interval=2,
+        interval=checkpoint_interval,
         last_save_model_only=False,
-        keep_latest_k=0,
+        keep_latest_k=keep_latest_k,
     )
     trainer = Trainer(config)
     manager = trainer.checkpointer
@@ -117,6 +125,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ema", choices=("none", "fixed", "dynamic"), default="none")
     parser.add_argument("--ac", choices=("none", "full", "selective"), default="none")
+    parser.add_argument("--keep-latest-k", type=int, default=0)
+    parser.add_argument("--checkpoint-interval", type=int, default=2)
     args = parser.parse_args()
     require_env("dtensor")
     if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -126,10 +136,42 @@ def main() -> None:
         args.output.mkdir(parents=True, exist_ok=False)
     if dist.is_initialized():
         dist.barrier()
-    reference = _train(args.output / "continuous", 4, ema=args.ema, ac=args.ac)
-    interrupted = _train(args.output / "resumed", 2, ema=args.ema, ac=args.ac)
+    reference = _train(
+        args.output / "continuous",
+        4,
+        ema=args.ema,
+        ac=args.ac,
+        keep_latest_k=args.keep_latest_k,
+        checkpoint_interval=args.checkpoint_interval,
+    )
+    interrupted = _train(
+        args.output / "resumed",
+        2,
+        ema=args.ema,
+        ac=args.ac,
+        keep_latest_k=args.keep_latest_k,
+        checkpoint_interval=args.checkpoint_interval,
+    )
     assert interrupted, "No state captured after interrupted training"
-    resumed = _train(args.output / "resumed", 4, ema=args.ema, ac=args.ac)
+    resumed = _train(
+        args.output / "resumed",
+        4,
+        ema=args.ema,
+        ac=args.ac,
+        keep_latest_k=args.keep_latest_k,
+        checkpoint_interval=args.checkpoint_interval,
+    )
+    if rank == 0 and args.keep_latest_k > 0 and args.checkpoint_interval == 1:
+        for run in ("continuous", "resumed"):
+            steps = sorted((args.output / run / "checkpoint").glob("step-*"))
+            expected = [
+                f"step-{step}" for step in range(max(1, 5 - args.keep_latest_k), 5)
+            ]
+            assert [step.name for step in steps] == expected, steps
+        print(
+            "PASS retention keeps the configured number of published checkpoints",
+            flush=True,
+        )
     torch.save(reference, args.output / f"reference-rank{rank}.pt")
     torch.save(resumed, args.output / f"resumed-rank{rank}.pt")
     assert reference.keys() == resumed.keys()

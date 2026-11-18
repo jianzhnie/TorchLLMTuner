@@ -39,6 +39,7 @@ def check_cleanup(error_type, failing_rank):
                 use_pinned_memory=False,
                 use_shared_memory=False,
                 use_async_staging=True,
+                use_non_blocking_copy=False,
             )
         )
         manager.stager = stager
@@ -70,8 +71,9 @@ def check_cleanup(error_type, failing_rank):
             assert manager.stager is stager
             assert manager.pg is group
             assert any(thread.is_alive() for thread in executor._threads)
-            expected = ["metrics", "dataloader", "gc_handler"] if interrupted else []
+            expected = ["metrics", "gc_handler"] if interrupted else []
             assert released == expected
+            assert trainer.dataloader is not None
             # The retained owned group must remain usable, not just referenced.
             value = torch.tensor(dist.get_rank() + 1)
             dist.all_reduce(value, group=group)
@@ -89,7 +91,11 @@ def check_cleanup(error_type, failing_rank):
             else:
                 raise AssertionError("closed checkpoint group is still registered")
             trainer.close()
-            assert released == ["metrics", "dataloader", "gc_handler"]
+            assert released == (
+                ["metrics", "gc_handler", "dataloader"]
+                if interrupted
+                else ["metrics", "dataloader", "gc_handler"]
+            )
             dist.barrier()
         finally:
             stager.close()

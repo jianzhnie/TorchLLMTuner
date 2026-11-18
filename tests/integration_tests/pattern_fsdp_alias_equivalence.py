@@ -100,9 +100,11 @@ def main():
             assert model.left[0] is model.right[0]
             assert model.left._get_fsdp_state() is model.right._get_fsdp_state()
         force_sum_grad_reduction(model)
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.05, momentum=0.9, foreach=False, fused=False
+        )
         reference_optimizer = torch.optim.SGD(
-            reference.parameters(), lr=0.05, momentum=0.9
+            reference.parameters(), lr=0.05, momentum=0.9, foreach=False, fused=False
         )
         initial = next(reference.parameters()).detach().clone()
         for step in range(3):

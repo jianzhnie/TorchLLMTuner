@@ -2,6 +2,12 @@
 
 State capture and exact comparisons reuse the current fresh-process recovery
 oracle. Model recipes supply configuration; no pipeline schedule is involved.
+
+Run the default Qwen3 scenario in separate torchrun invocations:
+``torchrun --standalone --nproc_per_node=2 -m
+tests.integration_tests.checkpoint_scenarios full WORKDIR`` and then the same
+command with ``resume WORKDIR``. Uses the runtime-selected device.
+Set LLMTUNER_TEST_CHECKPOINT_BACKEND=torch_checkpointing for the optional backend.
 """
 
 import json
@@ -56,7 +62,10 @@ def build_config(workdir: str) -> LLMTunerConfig:
             dump_folder=workdir,
             ema_config=EMAConfig(half_life_fraction=0.5, step_bias=1),
             checkpoint_config=CheckpointConfig(
-                enable=True, interval=SPLIT_STEP, last_save_model_only=False
+                enable=True,
+                backend=os.environ.get("LLMTUNER_TEST_CHECKPOINT_BACKEND", "dcp"),
+                interval=SPLIT_STEP,
+                last_save_model_only=False,
             ),
         ),
     )
@@ -104,8 +113,9 @@ def run_phase(config_factory=build_config) -> None:
     phase, directory = sys.argv[1:]
     if phase not in {"full", "resume"}:
         raise ValueError("Expected full|resume WORKDIR")
-    root = Path(directory)
-    trainer = Trainer(config_factory(directory))
+    root = Path(directory).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    trainer = Trainer(config_factory(str(root)))
     rank = trainer.rank
     try:
         if phase == "full":
@@ -136,3 +146,7 @@ def run_phase(config_factory=build_config) -> None:
         finally:
             if dist.is_initialized():
                 dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    run_phase()

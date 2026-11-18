@@ -34,8 +34,12 @@ def test_training_module_and_repository_root_exist(launcher):
     ["npu_checkpoint_backend_equivalence", "npu_profiler_equivalence"],
 )
 def test_auxiliary_npu_scripts_import_without_deleted_examples(module):
+    from llmtuner.models.registry import get_model_spec
+
     script = import_module(f"tests.integration_tests.{module}")
     config = script.qwen3_config()
+    assert get_model_spec(config.model.model_name_or_path) is not None
+    assert config.model.arch_overrides["mlp_only_layers"] == [0, 1]
     assert config.model.hidden_size == 64
     assert config.model.num_hidden_layers == 2
     assert config.training.deterministic

@@ -1,4 +1,4 @@
-"""Four ranks: disjoint TP/EP state with empty DP ownership and cold restore.
+"""Four ranks: TP/EP model, Adam and EMA with empty DP ownership and cold restore.
 
 Run explicitly with torchrun --standalone --nproc-per-node=4.
 CHECKPOINT_TEST_ROOT may select a shared directory for multi-node execution.
@@ -20,6 +20,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
 from llmtuner.components.checkpointer.core.model_state import ModelCheckpointState
+from llmtuner.components.optimizer.ema import EMA
 from llmtuner.components.optimizer.optimizer import OptimizersContainer
 from llmtuner.config.optimizer_config import OptimizerConfig, ParamGroupConfig
 from llmtuner.parallel.expert_parallel.checkpointing import mark_experts_ep_sharded
@@ -86,7 +87,13 @@ def main() -> None:
                 sharded_tensor_parallel=True,
                 sharded_expert_parallel=True,
             )
-            return model, wrapper, optimizer
+            ema = EMA(
+                model_parts=[model],
+                decay=0.5,
+                sharded_tensor_parallel=True,
+                sharded_expert_parallel=True,
+            )
+            return model, wrapper, optimizer, ema
 
         reference = {key: nn.Parameter(value.clone()) for key, value in full.items()}
         native = torch.optim.AdamW(
@@ -99,9 +106,25 @@ def main() -> None:
         for key, parameter in reference.items():
             parameter.grad = (full[key] + 1) / 100
         native.step()
+        expected_ema = {
+            key: full[key].lerp(parameter.detach(), 0.5)
+            for key, parameter in reference.items()
+        }
+
+        def check_ema(ema):
+            for key, expected in expected_ema.items():
+                actual = ema.state_dict()[f"state.{key}.ema_params"]
+                assert (not actual.chunks) == (dp_rank == 1)
+                for offset, chunk in actual.chunks:
+                    slices = tuple(
+                        slice(start, start + size)
+                        for start, size in zip(offset, chunk.shape, strict=True)
+                    )
+                    torch.testing.assert_close(chunk, expected[slices], rtol=0, atol=0)
+
         paths = [args.checkpoint]
         if args.phase != "load":
-            model, wrapper, optimizer = build()
+            model, wrapper, optimizer, ema = build()
             for key, parameter in model.named_parameters():
                 axis = 0 if key == "dense" else 1
                 assert (parameter.to_local().numel() == 0) == (dp_rank == 1)
@@ -110,12 +133,14 @@ def main() -> None:
                 )
             optimizer.step()
             optimizer.zero_grad()
+            ema.step(1)
+            check_ema(ema)
             if args.checkpoint is None and dist.get_rank() == 0:
                 paths[0] = tempfile.mkdtemp(
                     prefix="joint-empty-", dir=os.environ.get("CHECKPOINT_TEST_ROOT")
                 )
             dist.broadcast_object_list(paths)
-            state = {"model": wrapper, "optimizer": optimizer}
+            state = {"model": wrapper, "optimizer": optimizer, "ema": ema}
             if args.async_save:
                 # Async DCP stages CPU tensors; HCCL alone is insufficient.
                 upload_group = dist.new_group(backend="gloo")
@@ -130,14 +155,16 @@ def main() -> None:
             if args.phase == "save":
                 print(f"PASS joint empty checkpoint saved rank={dist.get_rank()}")
                 return
-        cold, cold_wrapper, cold_optimizer = build()
+        cold, cold_wrapper, cold_optimizer, cold_ema = build()
         assert all(not inner.state for inner in cold_optimizer.optimizers)
         with torch.no_grad():
             for parameter in cold.parameters():
                 parameter.fill_(float("nan"))
         dcp.load(
-            {"model": cold_wrapper, "optimizer": cold_optimizer}, checkpoint_id=paths[0]
+            {"model": cold_wrapper, "optimizer": cold_optimizer, "ema": cold_ema},
+            checkpoint_id=paths[0],
         )
+        check_ema(cold_ema)
         for key, parameter in cold.named_parameters():
             axis = 0 if key == "dense" else 1
             parameter.grad = distribute_tensor(
@@ -146,6 +173,12 @@ def main() -> None:
             reference[key].grad = full[key].cos() + 2
         cold_optimizer.step()
         native.step()
+        cold_ema.step(2)
+        expected_ema = {
+            key: expected_ema[key].lerp(parameter.detach(), 0.5)
+            for key, parameter in reference.items()
+        }
+        check_ema(cold_ema)
         restored = cold_optimizer.state_dict()
         for key, parameter in cold.named_parameters():
             partition_dim = 1 if key == "dense" else 0
@@ -169,7 +202,7 @@ def main() -> None:
                     torch.testing.assert_close(chunk, value[slices], rtol=0, atol=0)
             assert dp_rank == 1 or not torch.equal(parameter.to_local(), local[key])
         print(
-            "PASS joint TP/EP empty ownership cold restore and next step "
+            "PASS joint TP/EP empty ownership model/Adam/EMA restore and next step "
             f"rank={dist.get_rank()}"
         )
     finally:

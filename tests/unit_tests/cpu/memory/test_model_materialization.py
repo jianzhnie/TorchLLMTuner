@@ -4,7 +4,10 @@ import pytest
 import torch
 from torch import nn
 
-from llmtuner.memory.materialization import materialize_meta_model
+from llmtuner.memory.materialization import (
+    materialize_meta_model,
+    model_materialization_buffers,
+)
 
 
 def meta_model():
@@ -15,6 +18,37 @@ def meta_model():
         model.output.weight = model.input.weight
         model.register_buffer("counter", torch.zeros(2), persistent=False)
     return model
+
+
+def test_declared_runtime_buffers_feed_allocation_without_replacing_parameters():
+    model = meta_model()
+    parameter = model.input.weight
+    rebuilt = torch.zeros(2)
+    device = torch.device("cpu")
+    calls = []
+
+    def buffers(actual_device):
+        assert model.input.weight.is_meta and model.counter.is_meta
+        calls.append(actual_device)
+        return {(model, "counter"): rebuilt}
+
+    model.materialization_buffers = buffers
+    runtime_buffers = model_materialization_buffers(model, device)
+    assert calls == [device]
+    assert model.input.weight is parameter and parameter.is_meta
+    materialize_meta_model(model, device, runtime_buffers=runtime_buffers)
+    assert model.counter is rebuilt
+    assert model.input.weight is model.output.weight is parameter
+
+
+def test_absent_buffer_builder_and_invalid_builder_preserve_meta_storage():
+    model = meta_model()
+    device = torch.device("cpu")
+    assert model_materialization_buffers(model, device) == {}
+    model.materialization_buffers = 3
+    with pytest.raises(TypeError, match="materialization_buffers must be callable"):
+        model_materialization_buffers(model, device)
+    assert model.input.weight.is_meta and model.counter.is_meta
 
 
 def test_allocation_preserves_parameter_identity_rng_and_shared_storage():

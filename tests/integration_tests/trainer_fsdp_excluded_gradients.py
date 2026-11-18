@@ -6,6 +6,7 @@ Use four ranks and arguments "custom ep" for EP2/efsdp2, excluded expert
 gate/up projections and independently computed nonzero router auxiliary loss.
 Append ac and/or compile to exercise full checkpointing and aot_eager.
 Use four ranks and append hsdp (without ep) for replicate2/shard2.
+Append restore to round-trip optimizer moments after the first update.
 Append masked for unequal valid-label counts, including a fully masked DP rank;
 prompt tokens still contribute to the independent router objective.
 """
@@ -18,6 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
+from torch.utils.checkpoint import DefaultDeviceType
 
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.model_config import ModelConfig
@@ -31,11 +33,11 @@ original_apply = assembly._apply_parallelism
 references = []
 
 
-def exclude(trainer, model, **kwargs):
-    if trainer.cfg.parallel.ep_size > 1:
+def exclude(model, *, cfg, **kwargs):
+    if cfg.parallel.ep_size > 1:
         source = model.layers[0].mlp.experts
         path = next(name for name, module in model.named_modules() if module is source)
-        trainer.cfg.parallel.fsdp_config.fsdp_apply_modules = {
+        cfg.parallel.fsdp_config.fsdp_apply_modules = {
             path: {"ignored_params": {source.gate_up_proj}, "hook_module": source}
         }
     else:
@@ -44,10 +46,10 @@ def exclude(trainer, model, **kwargs):
             for name, module in model.named_modules()
             if isinstance(module, torch.nn.Embedding)
         )
-        trainer.cfg.parallel.fsdp_config.fsdp_apply_modules = {"": {}}
-        trainer.cfg.parallel.fsdp_config.fsdp_ignored_modules = [path]
+        cfg.parallel.fsdp_config.fsdp_apply_modules = {"": {}}
+        cfg.parallel.fsdp_config.fsdp_ignored_modules = [path]
     references.append(copy.deepcopy(model))
-    original_apply(trainer, model, **kwargs)
+    return original_apply(model, cfg=cfg, **kwargs)
 
 
 def reference_parameter(reference, name, dims, ep_enabled):
@@ -88,15 +90,16 @@ def main():
     world = 4 if ep_enabled or hsdp else 2
     cfg = LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3_moe" if ep_enabled else "qwen3",
+            model_name_or_path="qwen3_moe",
             experts_implementation="eager" if ep_enabled else "native",
             arch_overrides={
+                "head_dim": 8,
                 "num_experts": 4,
                 "num_experts_per_tok": 2,
                 "moe_intermediate_size": 8,
             }
             if ep_enabled
-            else {},
+            else {"head_dim": 8, "mlp_only_layers": [0]},
             vocab_size=32,
             hidden_size=16,
             intermediate_size=32,
@@ -127,6 +130,8 @@ def main():
             raise ValueError("EP exclusion regression requires custom FSDP")
         cfg.parallel.ep_config.router_aux_loss_coef = 0.03
     trainer = None
+    previous_checkpoint_device = DefaultDeviceType.get_device_type()
+    DefaultDeviceType.set_device_type("cpu")
     try:
         with patch.object(assembly, "_apply_parallelism", exclude):
             trainer = Trainer(cfg)
@@ -208,7 +213,9 @@ def main():
             reference_optimizer.zero_grad(set_to_none=True)
             for batches in all_batches:
                 for batch in batches:
-                    logits = reference(batch.input_ids.flatten())
+                    logits = reference(
+                        batch.input_ids.flatten(), return_dict=True, use_cache=False
+                    ).logits
                     # Each independent row excludes its final next-token target.
                     loss = (
                         F.cross_entropy(
@@ -269,6 +276,51 @@ def main():
                     torch.testing.assert_close(
                         replicas[0], replica, atol=1e-6, rtol=1e-6
                     )
+            if step == 1 and "restore" in sys.argv:
+                saved = copy.deepcopy(trainer.optimizer.state_dict())
+                owned = tuple(trainer.optimizer.param_groups)
+                if "legacy_fused" in sys.argv:
+                    incompatible = copy.deepcopy(saved)
+                    for key in incompatible:
+                        if key.startswith("param_groups.") and key.endswith(".fused"):
+                            incompatible[key] = True
+                    try:
+                        trainer.optimizer.load_state_dict(incompatible)
+                    except ValueError as error:
+                        assert "mixed Tensor/DTensor group" in str(error), error
+                    else:
+                        raise AssertionError("Incompatible fused state was accepted")
+                    torch.testing.assert_close(
+                        trainer.optimizer.state_dict(), saved, atol=0, rtol=0
+                    )
+                changed = False
+                for optimizer in trainer.optimizer.optimizers:
+                    for state in optimizer.state.values():
+                        for key in ("exp_avg", "exp_avg_sq"):
+                            if key in state:
+                                moment = state[key]
+                                local = (
+                                    moment.to_local()
+                                    if isinstance(moment, DTensor)
+                                    else moment
+                                )
+                                changed |= bool(local.count_nonzero().item())
+                                moment.zero_()
+                assert changed, "Restore check must overwrite nonzero moments"
+                trainer.optimizer.load_state_dict(saved)
+                torch.testing.assert_close(
+                    trainer.optimizer.state_dict(), saved, atol=0, rtol=0
+                )
+                assert all(
+                    actual is expected
+                    for actual, expected in zip(
+                        trainer.optimizer.param_groups, owned, strict=True
+                    )
+                )
+                print(
+                    f"rank={dist.get_rank()}: optimizer moments restored exactly",
+                    flush=True,
+                )
             print(
                 f"rank={dist.get_rank()} step={step}: "
                 "excluded gradient and weight replicas agree",
@@ -278,6 +330,7 @@ def main():
         if cfg.training.compile:
             assert torch._dynamo.utils.counters["stats"]["unique_graphs"] > 0
     finally:
+        DefaultDeviceType.set_device_type(previous_checkpoint_device)
         if trainer is not None:
             trainer.close()
 

@@ -1186,3 +1186,99 @@ def test_memory_builder_does_not_overwrite_pending_owner(monkeypatch, tmp_path):
         profiler.build_memory_profiler()
     assert profiler.memory_profiler is original
     profiler.close()
+
+
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("boundary", ["step", "exit", "training_error"])
+def test_npu_raw_trace_failure_waits_for_native_transition(
+    tmp_path, monkeypatch, error_type, boundary
+):
+    failure = error_type("raw trace export failed")
+    calls = []
+
+    class NativeProfile:
+        def __init__(self, **kwargs):
+            self.ready = kwargs["on_trace_ready"]
+            self.step_num = 1
+
+        def __enter__(self):
+            return self
+
+        def step(self):
+            self.ready(self)
+            calls.append("transition completed")
+
+        def __exit__(self, *args):
+            if boundary != "step":
+                self.ready(self)
+            calls.append("closed")
+
+        def export_chrome_trace(self, path):
+            raise AssertionError("raw failure must stop JSON export")
+
+    def raw(trace):
+        calls.append("raw")
+        raise failure
+
+    native_api = SimpleNamespace(
+        ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
+        profile=NativeProfile,
+        schedule=lambda **kwargs: lambda step: step,
+        tensorboard_trace_handler=lambda *args, **kwargs: raw,
+    )
+    monkeypatch.setattr(profiler_module, "npu_profiler", native_api)
+    monkeypatch.setattr(profiler_module, "device_type", "npu")
+    profiler = Profiler(Config(enable_profiling=True), base_folder=str(tmp_path))
+    profiler.build_torch_profiler()
+    if boundary == "step":
+        with pytest.raises(error_type) as caught:
+            profiler.step()
+        assert caught.value is failure
+        assert calls == ["raw", "transition completed"]
+    elif boundary == "exit":
+        with pytest.raises(error_type) as caught:
+            profiler.close()
+        assert caught.value is failure
+    else:
+        training_error = ValueError("model failed")
+        assert profiler.__exit__(ValueError, training_error, None) is False
+    profiler.close()
+    profiler.close()
+    assert calls == (
+        ["raw", "transition completed", "closed"]
+        if boundary == "step"
+        else ["raw", "closed"]
+    )
+    assert profiler.torch_profiler is None
+    assert profiler._trace_error is None
+
+
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt, SystemExit])
+def test_real_trace_exit_export_failure_releases_native_recording(
+    tmp_path, monkeypatch, error_type
+):
+    failure = error_type("exit export failed")
+    config = Config(
+        enable_profiling=True,
+        profile_freq=4,
+        profiler_active=4,
+        profiler_warmup=0,
+    )
+    profiler = Profiler(config, base_folder=str(tmp_path / "failed"))
+
+    def fail_export(*args, **kwargs):
+        raise failure
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.profiler.profile, "export_chrome_trace", fail_export)
+        with pytest.raises(error_type) as caught:
+            with profiler:
+                torch.ones(2).add(1)
+        assert caught.value is failure
+    assert profiler.torch_profiler is None
+    profiler.close()
+    # Starting another native session detects leaked or twice-stopped recording
+    # state without inspecting PyTorch's private profiler internals.
+    with Profiler(config, base_folder=str(tmp_path / "healthy")):
+        torch.ones(2).mul(2)
+    assert list((tmp_path / "healthy").rglob("rank0_trace.json.gz"))

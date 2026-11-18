@@ -58,6 +58,7 @@ from torch.distributed.tensor import DTensor
 
 from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.config import ParallelConfig
+from llmtuner.models.contracts import DecoderStructure
 from llmtuner.parallel.fully_shard_parallel import apply_fsdp
 from llmtuner.parallel.topology import ParallelTopology
 from tests.integration_tests.harness import backend, init_distributed, moved
@@ -80,11 +81,15 @@ MODES = ("ddp", "shard", "hsdp")
 
 
 class TinyTokenDecoder(nn.Module):
-    """Minimal per-token decoder exposing the surface FSDP reads off a model.
+    """Minimal per-token decoder declaring its FSDP structure explicitly."""
 
-    The five attributes are the contract ``apply_fsdp_to_decoder`` requires
-    (the same ones ``HFTransformerModel`` exposes).
-    """
+    decoder_structure = DecoderStructure(
+        decoder="",
+        embedding="tok_embeddings",
+        blocks="layers",
+        norm="norm",
+        head="lm_head",
+    )
 
     def __init__(self) -> None:
         super().__init__()

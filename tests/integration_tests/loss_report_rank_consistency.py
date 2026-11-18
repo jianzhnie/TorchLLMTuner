@@ -37,13 +37,14 @@ VOCAB = 128
 def _cfg() -> LLMTunerConfig:
     return LLMTunerConfig(
         model=ModelConfig(
-            model_name_or_path="qwen3",
+            model_name_or_path="qwen3_moe",
             vocab_size=VOCAB,
             hidden_size=64,
             intermediate_size=128,
             num_hidden_layers=2,
             num_attention_heads=4,
             num_key_value_heads=4,
+            arch_overrides={"head_dim": 16, "mlp_only_layers": [0, 1]},
         ),
         parallel=ParallelConfig(data_parallel_shard_size=-1),
         optimizer=OptimizerConfig(learning_rate=1e-4),

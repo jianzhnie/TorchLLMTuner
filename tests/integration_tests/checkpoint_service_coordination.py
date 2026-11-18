@@ -5,6 +5,7 @@ are substitutes: this tests manager-owned retention threads and cleanup, not
 optional-package I/O or subprocesses.
 """
 
+import threading
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from unittest.mock import patch
 import torch.distributed as dist
 
 from llmtuner.components.checkpointer.backends import torch_checkpointing_backend as tc
+from llmtuner.components.checkpointer.core import base
 from llmtuner.config.checkpoint_config import CheckpointConfig
 
 
@@ -38,16 +40,18 @@ def check_failure(failing_rank, phase):
     def require_backend():
         if phase == "dependency" and dist.get_rank() == failing_rank:
             raise failure
-        return object()
+        return SimpleNamespace(
+            LocalFileSystemStorageConfig=lambda **kwargs: config.storage_config
+        )
 
-    original_info = tc.logger.info
+    original_info = base.logger.info
 
     def report(*args, **kwargs):
         if phase == "logging" and dist.get_rank() == failing_rank:
             raise failure
         original_info(*args, **kwargs)
 
-    original_start = tc.threading.Thread.start
+    original_start = threading.Thread.start
 
     def start(thread):
         if phase == "thread" and dist.get_rank() == failing_rank:
@@ -65,8 +69,8 @@ def check_failure(failing_rank, phase):
                 "BackendCheckpointStorage",
                 lambda storage: SimpleNamespace(remove=lambda path: None),
             ),
-            patch.object(tc.logger, "info", report),
-            patch.object(tc.threading.Thread, "start", start),
+            patch.object(base.logger, "info", report),
+            patch.object(threading.Thread, "start", start),
         ):
             try:
                 manager.__init__(

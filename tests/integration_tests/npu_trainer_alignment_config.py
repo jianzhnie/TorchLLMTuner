@@ -561,62 +561,6 @@ def build_candidate_30b_config(
     )
 
 
-def debug_candidate_config(
-    baseline: Mapping[str, Any], output: Path, steps: int, world: int
-):
-    from llmtuner.config.llmtuner_config import LLMTunerConfig
-    from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
-    from llmtuner.config.model_config import ModelConfig
-    from llmtuner.config.optimizer_config import OptimizerConfig
-    from llmtuner.config.training_config import TrainingConfig
-
-    return LLMTunerConfig(
-        model=ModelConfig(
-            model_name_or_path="qwen3",
-            vocab_size=2048,
-            hidden_size=256,
-            intermediate_size=3072,
-            num_hidden_layers=8,
-            num_attention_heads=16,
-            num_key_value_heads=8,
-            norm_backend=os.environ.get("LLMTUNER_ALIGNMENT_NORM_BACKEND", "native"),
-            qkv_projection=os.environ.get(
-                "LLMTUNER_ALIGNMENT_QKV_PROJECTION", "separate"
-            ),
-            rotary_init_device=os.environ.get(
-                "LLMTUNER_ALIGNMENT_ROTARY_INIT_DEVICE", "constructor"
-            ),
-            attention_backend=os.environ.get(
-                "LLMTUNER_ALIGNMENT_ATTENTION_BACKEND", "auto"
-            ),
-            arch_overrides={
-                "head_dim": 128,
-                "tie_word_embeddings": True,
-                "rope_parameters": {
-                    "rope_type": "default",
-                    "rope_theta": 1000000.0,
-                },
-            },
-        ),
-        optimizer=OptimizerConfig(
-            learning_rate=8e-4,
-            weight_decay=0.1,
-            betas=[0.9, 0.95],
-            implementation=baseline["optimizer"]["implementation"],
-            lr_scheduler_config=LRSchedulerConfig(
-                warmup_steps=2, total_steps=steps, decay_ratio=0.8
-            ),
-        ),
-        training=TrainingConfig(
-            steps=steps,
-            max_seq_len=32,
-            global_batch_size=world,
-            dump_folder=str(output),
-            deterministic=True,
-        ),
-    )
-
-
 def call_after_load(load: Callable, capture: Callable, *args, **kwargs):
     result = load(*args, **kwargs)
     capture()

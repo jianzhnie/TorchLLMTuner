@@ -16,7 +16,7 @@ run two validation batches after every training step.
 Add `moe` for native Qwen3 MoE with fixed routing and auxiliary loss;
 `ep2` additionally shards experts; `dp4` selects four worker ranks.
 Add `tp2` with dp4/moe for DP2 x TP2 fixed routing at EP1.
-Add `quantile` with moe/ep2 for DeepSeek-V3 sigmoid quantile routing.
+Add `shared_experts` with moe/ep2 to share the two experts modules before assembly.
 CPU only; no accelerator kernel coverage.
 """
 
@@ -25,13 +25,16 @@ import os
 import pickle
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from tempfile import mkdtemp
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.debug import CommDebugMode
+from torch.utils.checkpoint import DefaultDeviceType
 
 from llmtuner.accelerator.device import device_type
 from llmtuner.config.ema_config import EMAConfig
@@ -99,7 +102,7 @@ def worker(
     moe_enabled=False,
     ep_size=1,
     tp_size=1,
-    quantile_enabled=False,
+    shared_experts=False,
 ):
     folder = root / ("continuous" if name == "continuous" else "resumed")
     steps = (3 if async_mode == "async" else 2) if name == "initial" else 4
@@ -157,29 +160,13 @@ def worker(
     else:
         config.model.arch_overrides.update(mlp_only_layers=[0, 1])
     config.model.arch_overrides.setdefault("head_dim", 8)
-    if quantile_enabled:
-        config.model.model_name_or_path = "deepseek_v3"
-        config.model.arch_overrides = dict(
-            n_routed_experts=4,
-            num_experts_per_tok=2,
-            moe_intermediate_size=16,
-            n_shared_experts=1,
-            n_group=1,
-            topk_group=1,
-            first_k_dense_replace=0,
-            scoring_func="sigmoid",
-            norm_topk_prob=True,
-            q_lora_rank=None,
-            kv_lora_rank=8,
-            qk_nope_head_dim=4,
-            qk_rope_head_dim=4,
-            v_head_dim=4,
-        )
-        config.parallel.ep_config.fixed_router = False
-        config.parallel.ep_config.moe_quantile_balancing = True
     config.parallel.expert_parallel_size = ep_size
     config.parallel.tensor_parallel_size = tp_size
     config.parallel.data_parallel_shard_size = world_size // tp_size
+    if tp_size > 1:
+        # Qwen TP shards one row at a time; preserve the effective global batch.
+        config.training.gradient_accumulation_steps = tp_size
+        config.training.global_batch_size //= tp_size
     config.parallel.fsdp_config.fsdp_implementation = implementation
     config.training.activation_checkpoint_mode = "full" if recompute else "none"
     if validation_enabled:
@@ -202,9 +189,27 @@ def worker(
     config.training.ema_config = EMAConfig(
         half_life_fraction=0.5, step_bias=1, update_every_n_steps=2
     )
+    previous_checkpoint_device = DefaultDeviceType.get_device_type()
+    # torch-npu changes PyTorch's fallback even when all tensors are on CPU.
+    # Recompute must not query an invisible accelerator's autocast support.
+    DefaultDeviceType.set_device_type("cpu")
+    construction = nullcontext()
+    if shared_experts:
+        from llmtuner.trainer.runtime import assembly
+
+        build_model = assembly.build_model
+
+        def build_shared_model(*args, **kwargs):
+            model, model_config, load_initial_weights = build_model(*args, **kwargs)
+            layers = model.model.layers
+            layers[1].mlp.experts = layers[0].mlp.experts
+            return model, model_config, load_initial_weights
+
+        construction = patch.object(assembly, "build_model", build_shared_model)
     trainer = None
     try:
-        trainer = Trainer(config)
+        with construction:
+            trainer = Trainer(config)
         ema_steps = []
         original_ema_step = trainer.ema.step
 
@@ -215,16 +220,6 @@ def worker(
             ema_steps.append(current_step)
 
         trainer.ema.step = update_ema
-        if quantile_enabled:
-            from llmtuner.models.common.moe.layer import collect_moe_layers
-            from llmtuner.models.common.moe.routing import QuantileBalancedTopKRouter
-
-            quantile_layers = collect_moe_layers(trainer.model_parts[0])
-            assert len(quantile_layers) == 2
-            assert all(
-                isinstance(block.router, QuantileBalancedTopKRouter)
-                for block in quantile_layers
-            )
         # A pre-validation snapshot must own its storage: otherwise an in-place
         # model update could also mutate the expected value and hide a failure.
         probe_snapshot = snapshot(trainer)
@@ -270,6 +265,14 @@ def worker(
 
             blocks = collect_moe_layers(trainer.model_parts[0])
             assert len(blocks) == 2
+            if shared_experts:
+                first = blocks[0].routed_experts.inner_experts
+                second = blocks[1].routed_experts.inner_experts
+                assert first is second
+                for parameter_name in ("w1_EFD", "w3_EFD", "w2_EDF"):
+                    assert getattr(first, parameter_name) is getattr(
+                        second, parameter_name
+                    )
             for block in blocks:
                 expert = block.routed_experts.inner_experts.w1_EFD
                 assert expert.shape[0] == 2
@@ -367,7 +370,7 @@ def worker(
                     ),
                 }
                 if moe_enabled:
-                    assert len(state["buffers"]) == (6 if quantile_enabled else 4)
+                    assert len(state["buffers"]) == 4
                     assert len(state["instances"]) == 2
                 return state
 
@@ -381,13 +384,6 @@ def worker(
         initial_step = trainer.step
         trainer.train()
         assert ema_steps == list(range(initial_step + 1, steps + 1))
-        if quantile_enabled:
-            for block in quantile_layers:
-                assert torch.count_nonzero(block.expert_bias_E) > 0
-                assert not torch.count_nonzero(
-                    block.router.quantile_balancer.required_bias_histogram_EB
-                )
-                assert not torch.count_nonzero(block.tokens_per_expert_E)
         if validation_enabled:
             assert validation_steps == list(range(initial_step + 1, steps + 1))
         else:
@@ -399,6 +395,7 @@ def worker(
             if trainer is not None:
                 trainer.close()
         finally:
+            DefaultDeviceType.set_device_type(previous_checkpoint_device)
             if dist.is_initialized():
                 dist.destroy_process_group()
 
@@ -407,6 +404,8 @@ def main():
     if device_type != "cpu":
         raise RuntimeError("This check requires a CPU-only environment")
     if len(sys.argv) == 12 and sys.argv[1] == "worker":
+        if sys.argv[9] not in {"dense", "moe", "shared_moe"}:
+            raise ValueError("Worker model mode must be dense, moe or shared_moe")
         worker(
             Path(sys.argv[2]),
             sys.argv[3],
@@ -415,14 +414,16 @@ def main():
             compiled=sys.argv[6] == "compile",
             recompute=sys.argv[7] == "ac",
             validation_enabled=sys.argv[8] == "validate",
-            moe_enabled=sys.argv[9] in {"moe", "quantile"},
+            moe_enabled=sys.argv[9] in {"moe", "shared_moe"},
+            shared_experts=sys.argv[9] == "shared_moe",
             ep_size=int(sys.argv[10]),
             tp_size=int(sys.argv[11]),
-            quantile_enabled=sys.argv[9] == "quantile",
         )
         return
-    assert len(set(sys.argv[1:])) == len(sys.argv[1:])
-    assert set(sys.argv[1:]) <= {
+    options = set(sys.argv[1:])
+    if len(options) != len(sys.argv[1:]):
+        raise ValueError("Duplicate recovery test options")
+    supported_options = {
         "corpus",
         "first_fit",
         "async",
@@ -435,18 +436,18 @@ def main():
         "moe",
         "ep2",
         "tp2",
-        "quantile",
+        "shared_experts",
     }
+    if unsupported := options - supported_options:
+        raise ValueError(f"Unsupported recovery test options: {sorted(unsupported)}")
     if {"dp2", "dp4"} <= set(sys.argv[1:]):
         raise ValueError("Choose only one data parallel size")
     world_size = 4 if "dp4" in sys.argv[1:] else 2 if "dp2" in sys.argv[1:] else 1
     if "ep2" in sys.argv[1:] and ("moe" not in sys.argv[1:] or world_size < 2):
         raise ValueError("ep2 requires moe and dp2 or dp4")
+    if "shared_experts" in options and not {"moe", "ep2"} <= options:
+        raise ValueError("shared_experts requires moe and ep2")
     ep_size = 2 if "ep2" in sys.argv[1:] else 1
-    if "quantile" in sys.argv[1:] and (
-        "moe" not in sys.argv[1:] or "tp2" in sys.argv[1:] or ep_size != 2
-    ):
-        raise ValueError("quantile requires moe/ep2 and currently excludes tp2")
     tp_size = 2 if "tp2" in sys.argv[1:] else 1
     if tp_size > 1 and (world_size != 4 or "moe" not in sys.argv[1:] or ep_size != 1):
         raise ValueError("tp2 requires dp4 and moe, with ep2 disabled")
@@ -505,10 +506,10 @@ def main():
                 "compile" if compiled else "eager",
                 "ac" if recompute else "noac",
                 "validate" if "validate" in sys.argv[1:] else "novalidate",
-                "quantile"
-                if "quantile" in sys.argv[1:]
+                "shared_moe"
+                if "shared_experts" in options
                 else "moe"
-                if "moe" in sys.argv[1:]
+                if "moe" in options
                 else "dense",
                 str(ep_size),
                 str(tp_size),
@@ -527,14 +528,6 @@ def main():
         rank_id = f"dp_rank_{dp_rank}"
         initial = torch.load(root / f"initial{rank}.pt", weights_only=False)
         boundary = torch.load(root / f"loaded_boundary{rank}.pt", weights_only=False)
-        if "quantile" in sys.argv[1:]:
-            biases = [
-                value
-                for key, value in initial["model"].items()
-                if key.endswith("expert_bias_E")
-            ]
-            assert len(biases) == 2 and all(torch.count_nonzero(b) for b in biases)
-            assert not any("required_bias_histogram" in key for key in initial["model"])
         assert set(initial) == {
             "checkpoint_format",
             "model",
@@ -563,14 +556,16 @@ def main():
             assert rank_id in initial["dataloader"]
         else:
             assert initial["dataloader"]["steps"] == (
-                {str(dp_rank): 2} if world_size // tp_size > 1 else 2
+                {str(dp_rank): 2 * tp_size}
+                if world_size // tp_size > 1
+                else 2 * tp_size
             )
         assert_state_equal(boundary, initial)
         continuous = torch.load(root / f"continuous{rank}.pt", weights_only=False)
         resumed = torch.load(root / f"resume{rank}.pt", weights_only=False)
         assert continuous["train_state"] == {
             "step": 4,
-            "ntokens_seen": (4 * max(2, world_size) * 8 // (world_size)),
+            "ntokens_seen": (4 * max(2, world_size) * 8 // world_size),
         }
         assert continuous["lr_scheduler"] == {"last_epoch": 4}
         if corpus:
@@ -581,7 +576,9 @@ def main():
             assert continuous["dataloader"][rank_id] != initial["dataloader"][rank_id]
         else:
             assert continuous["dataloader"]["steps"] == (
-                {str(dp_rank): 4} if world_size // tp_size > 1 else 4
+                {str(dp_rank): 4 * tp_size}
+                if world_size // tp_size > 1
+                else 4 * tp_size
             )
         assert_state_equal(resumed, continuous)
         before = torch.load(root / f"initial_boundary{rank}.pt", weights_only=False)

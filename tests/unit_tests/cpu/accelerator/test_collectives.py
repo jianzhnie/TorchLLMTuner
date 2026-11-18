@@ -294,3 +294,57 @@ def test_parameter_precision_clipping_matches_native_bfloat16_coefficient():
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     for parameter, reference in zip(parameters, references, strict=True):
         torch.testing.assert_close(parameter.grad, reference.grad, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "error_type", [None, ValueError, KeyboardInterrupt, SystemExit]
+)
+def test_wait_finishes_before_error_coordination(monkeypatch, error_type):
+    group = object()
+    calls = []
+    failure = None if error_type is None else error_type("wait failed")
+    monkeypatch.setattr(collectives, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(collectives, "get_comm_device", lambda group: "cpu")
+
+    def wait():
+        calls.append("wait")
+        if failure is not None:
+            raise failure
+
+    def reduce(status, *, op, group):
+        assert calls == ["wait"]
+        assert group is expected_group
+        assert op == "min"
+        calls.append(status.item())
+
+    expected_group = group
+    monkeypatch.setattr(collectives, "all_reduce", reduce)
+    if failure is None:
+        collectives.synchronize_after_wait(wait, "Background upload", group=group)
+    else:
+        with pytest.raises(error_type) as caught:
+            collectives.synchronize_after_wait(wait, "Background upload", group=group)
+        assert caught.value is failure
+    assert calls == ["wait", int(failure is None)]
+
+
+@pytest.mark.parametrize("peer_failed", [False, True])
+def test_optional_wait_still_coordinates_peer_failure(monkeypatch, peer_failed):
+    monkeypatch.setattr(collectives, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(collectives, "get_comm_device", lambda group: "cpu")
+    statuses = []
+
+    def reduce(status, *, op, group):
+        statuses.append(status.item())
+        if peer_failed:
+            status.zero_()
+
+    monkeypatch.setattr(collectives, "all_reduce", reduce)
+    if peer_failed:
+        with pytest.raises(
+            RuntimeError, match="Background upload failed on another rank"
+        ):
+            collectives.synchronize_after_wait(None, "Background upload")
+    else:
+        collectives.synchronize_after_wait(None, "Background upload")
+    assert statuses == [1]

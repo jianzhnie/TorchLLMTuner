@@ -35,7 +35,9 @@ def main():
             dist.broadcast_object_list(roots, src=0)
             torch.manual_seed(123)
             model = torch.nn.Linear(2, 2, device=device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=0.01, foreach=False, fused=False
+            )
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
             model(torch.ones(2, 2, device=device)).square().sum().backward()
             optimizer.step()
@@ -131,7 +133,12 @@ def main():
                                 phase != "final state reporting"
                             )
                             failure = error_type("injected save reporting failure")
-                            original_info = distributed_checkpoint.logger.info
+                            reporting_logger = (
+                                base.logger
+                                if phase == "final model preparation"
+                                else distributed_checkpoint.logger
+                            )
+                            original_info = reporting_logger.info
 
                             def save_report(
                                 message,
@@ -160,9 +167,7 @@ def main():
                                     raise failure
                                 return original_info(message, *args, **kwargs)
 
-                            with patch.object(
-                                distributed_checkpoint.logger, "info", save_report
-                            ):
+                            with patch.object(reporting_logger, "info", save_report):
                                 caught = None
                                 try:
                                     manager.save(1, last_step=phase.startswith("final"))

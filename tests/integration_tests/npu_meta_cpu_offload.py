@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from llmtuner.memory.materialization import materialize_meta_model
-from llmtuner.trainer.runtime.assembly import _fsdp_managed_parameters
+from llmtuner.parallel.fully_shard_parallel.policies import fsdp_managed_parameters
 
 
 def main() -> None:
@@ -20,7 +20,7 @@ def main() -> None:
         model,
         device,
         parameter_device=torch.device("cpu"),
-        offloaded_parameters=_fsdp_managed_parameters(model),
+        offloaded_parameters=fsdp_managed_parameters(model),
     )
     assert model.weight is weight
     assert model.weight.device == device and model.bias.device == device

@@ -341,13 +341,16 @@ def build_model(*, tied: bool = False) -> Qwen3MoeForCausalLM:
 
 @pytest.mark.parametrize("tied", [False, True])
 @pytest.mark.parametrize("shared_layer", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
 def test_chunked_boundaries_and_actual_aliases_are_owned_by_root(
-    monkeypatch, tied, shared_layer
+    monkeypatch, tied, shared_layer, compiled
 ):
     model = build_model(tied=tied)
     model.model.config.tie_word_embeddings = not tied
     if shared_layer:
         model.norm.weight = model.layers[0].input_layernorm.weight
+    if compiled:
+        model = torch.compile(model, backend="eager")
     calls = []
     monkeypatch.setattr(
         apply, "fully_shard", lambda module, **options: calls.append((module, options))
@@ -2072,3 +2075,42 @@ def test_custom_fsdp_environment_is_checked_only_for_active_sharding(
     assert calls == []
     apply.validate_fsdp_environment(cfg, object())
     assert len(calls) == int(dense_size > 1 or (sparse_size or 1) > 1)
+
+
+def test_fsdp_managed_parameters_is_empty_without_fsdp_modules():
+    from llmtuner.parallel.fully_shard_parallel.policies import fsdp_managed_parameters
+
+    assert fsdp_managed_parameters(nn.Linear(3, 2)) == set()
+
+
+def test_fsdp_managed_parameters_reads_actual_shared_state():
+    from torch.distributed.fsdp import FSDPModule
+
+    from llmtuner.parallel.fully_shard_parallel.policies import fsdp_managed_parameters
+
+    class Unit(FSDPModule, nn.Linear):
+        def __new__(cls, state):
+            return object.__new__(cls)
+
+        def __init__(self, state):
+            nn.Linear.__init__(self, 3, 2)
+            self.state = state
+
+        def _get_fsdp_state(self):
+            return self.state
+
+    state = SimpleNamespace(_fsdp_param_groups=[])
+    first, second = Unit(state), Unit(state)
+    state._fsdp_param_groups = [
+        SimpleNamespace(
+            fsdp_params=[
+                SimpleNamespace(sharded_param=first.weight),
+                SimpleNamespace(sharded_param=first.weight),
+            ]
+        ),
+        SimpleNamespace(fsdp_params=[SimpleNamespace(sharded_param=second.bias)]),
+    ]
+    model = nn.ModuleList([first, second])
+    model.unmanaged = nn.Linear(3, 2)
+
+    assert fsdp_managed_parameters(model) == {first.weight, second.bias}

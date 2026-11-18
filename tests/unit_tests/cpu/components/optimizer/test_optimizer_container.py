@@ -863,3 +863,35 @@ def test_checkpoint_rejects_optimizer_groups_detached_from_assembly(
             container.state_dict()
         else:
             container.load_state_dict(saved)
+
+
+@pytest.mark.parametrize("distributed_count", [0, 1, 2])
+def test_fused_mixed_layout_fallback_preserves_group_ownership(
+    monkeypatch, distributed_count
+):
+    from llmtuner.parallel.assembly import capture_model_part_layouts
+
+    class DistributedParameter(nn.Parameter):
+        pass
+
+    # Exercise planning without a process group; actual DTensor updates are
+    # covered by trainer_fsdp_excluded_gradients.py on two CPU ranks.
+    monkeypatch.setattr(optimizer_module, "DTensor", DistributedParameter)
+    model = nn.Linear(2, 2)
+    for name in ("weight", "bias")[:distributed_count]:
+        setattr(model, name, DistributedParameter(getattr(model, name).detach()))
+    layout = capture_model_part_layouts([model])[0]
+    plan = OptimizersContainer._build_param_groups(
+        layout,
+        param_group_configs=[_catch_all()],
+        impl_kwargs={"fused": True, "foreach": False},
+    )
+    groups = plan["AdamW"].param_groups
+    assert len(groups) == 1
+    group = groups[0]
+    assert group["fused"] is (distributed_count != 1)
+    assert group["foreach"] is False
+    assert group["param_names"] == ["weight", "bias"]
+    assert group["params"][0] is model.weight
+    assert group["params"][1] is model.bias
+    assert group["lr"] == 0.1

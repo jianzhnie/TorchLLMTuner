@@ -21,7 +21,7 @@ def check_failure(failing_rank, error_type, phase):
         config = parse_config(
             [
                 "--model_name_or_path",
-                "qwen3",
+                "qwen3_moe",
                 "--vocab_size",
                 "32",
                 "--hidden_size",
@@ -50,6 +50,7 @@ def check_failure(failing_rank, error_type, phase):
         )
         config.parallel.data_parallel_shard_size = 2
         config.training.ema_config = EMAConfig(decay=0.75)
+        config.model.arch_overrides = {"head_dim": 8, "mlp_only_layers": [0, 1]}
         trainer = Trainer(config)
         try:
             trainer.step = 1

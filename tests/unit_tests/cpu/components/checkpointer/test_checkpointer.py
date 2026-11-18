@@ -2431,8 +2431,9 @@ def test_staging_group_construction_failure_releases_upload_group(
     try:
         model = nn.Linear(2, 2)
         optimizer = torch.optim.AdamW(model.parameters())
+        manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
         with pytest.raises(OSError) as caught:
-            DistributedCheckpointManager(
+            manager.__init__(
                 Config(enable=True, async_mode="async_with_pinned_mem"),
                 model_parts=[model],
                 optimizer=optimizer,
@@ -2441,6 +2442,9 @@ def test_staging_group_construction_failure_releases_upload_group(
                 folder=str(tmp_path),
             )
         assert caught.value is failure
+        # Retry while this case's cleanup injection is still installed, rather
+        # than leaving a partial instance for GC in another parametrized case.
+        manager.close()
         assert len(groups) == 1
         with pytest.raises(KeyError):
             dist.get_process_group_ranks(groups[0])
@@ -2450,9 +2454,7 @@ def test_staging_group_construction_failure_releases_upload_group(
 
 
 def test_dcp_construction_logging_failure_closes_started_worker(tmp_path, monkeypatch):
-    from llmtuner.components.checkpointer.backends import (
-        distributed_checkpoint as module,
-    )
+    from llmtuner.components.checkpointer.core import base as module
 
     failure = OSError("checkpoint startup log failed")
 
@@ -2483,6 +2485,7 @@ def test_dcp_construction_logging_failure_closes_started_worker(tmp_path, monkey
 def test_torch_checkpointing_failed_thread_start_closes_backend(
     tmp_path, monkeypatch, error_type, cleanup_fails, report_error
 ):
+    import threading
     from types import SimpleNamespace
 
     from llmtuner.components.checkpointer.backends import (
@@ -2525,7 +2528,7 @@ def test_torch_checkpointing_failed_thread_start_closes_backend(
     def fail_start(thread):
         raise original
 
-    monkeypatch.setattr(tc.threading.Thread, "start", fail_start)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
     # Retain the partial instance to check cleanup without relying on GC timing.
     manager = tc.TorchCheckpointingManager.__new__(tc.TorchCheckpointingManager)
     with pytest.raises(error_type) as caught:
@@ -3342,7 +3345,10 @@ def test_purge_join_failure_retains_live_worker_until_retry(
 
 
 @pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt, SystemExit])
-def test_dcp_retention_failure_still_closes_independent_stager(error_type):
+@pytest.mark.parametrize("failure_phase", ["sentinel", "join"])
+def test_dcp_retention_failure_still_closes_independent_stager(
+    error_type, failure_phase
+):
     from types import SimpleNamespace
 
     manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
@@ -3351,16 +3357,26 @@ def test_dcp_retention_failure_still_closes_independent_stager(error_type):
 
     def join():
         calls.append("join")
-        raise failure
+        if failure_phase == "join":
+            raise failure
+
+    def put(value):
+        calls.append("sentinel")
+        if failure_phase == "sentinel":
+            raise failure
 
     manager.purge_thread = SimpleNamespace(is_alive=lambda: True, join=join)
-    manager.purge_queue = SimpleNamespace(put=lambda value: calls.append("sentinel"))
+    manager.purge_queue = SimpleNamespace(put=put)
     manager.stager = SimpleNamespace(close=lambda: calls.append("stager"))
     manager.pg = manager.staging_pg = None
     with pytest.raises(error_type) as caught:
         manager._close()
     assert caught.value is failure
-    assert calls == ["sentinel", "join", "stager"]
+    assert calls == (
+        ["sentinel", "join", "stager"]
+        if failure_phase == "join"
+        else ["sentinel", "stager"]
+    )
     assert manager.stager is None
 
 
@@ -3617,3 +3633,176 @@ def test_native_format_version_is_validated_before_model_restore(tmp_path):
             torch.testing.assert_close(value, before[key], rtol=0, atol=0)
     finally:
         manager.close()
+
+
+@pytest.mark.parametrize("failure_index", [None, 0, 1])
+def test_optional_backend_state_callbacks_preserve_order_and_failure(failure_index):
+    calls = []
+    failure = ValueError("state snapshot failed")
+
+    class State:
+        def __init__(self, index):
+            self.index = index
+            self.payload = {"index": index}
+
+        def state_dict(self):
+            calls.append(self.index)
+            if self.index == failure_index:
+                raise failure
+            return self.payload
+
+        def load_state_dict(self, state):
+            raise AssertionError("snapshot must not restore live state")
+
+    first, second = State(0), State(1)
+    plain = object()
+    states = {"first": first, "plain": plain, "second": second}
+    manager_type = torch_checkpointing_backend.TorchCheckpointingManager
+    convert = manager_type._stateful_to_state_dict
+    if failure_index is not None:
+        with pytest.raises(ValueError) as caught:
+            convert(states)
+        assert caught.value is failure
+        assert calls == list(range(failure_index + 1))
+    else:
+        result = convert(states)
+        assert list(result) == list(states)
+        assert result["first"] is first.payload
+        assert result["plain"] is plain
+        assert result["second"] is second.payload
+        assert calls == [0, 1]
+    assert states == {"first": first, "plain": plain, "second": second}
+
+
+@pytest.mark.parametrize("uri", [False, True])
+def test_retention_exemption_preserves_old_step_outside_latest_horizon(tmp_path, uri):
+    if uri:
+        pytest.importorskip("fsspec")
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), foreach=False, fused=False)
+    manager = DistributedCheckpointManager(
+        Config(
+            enable=True,
+            interval=1,
+            keep_latest_k=2,
+            purge_exempt=lambda step: step == 1,
+        ),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=_schedule(optimizer),
+        states={},
+        folder=tmp_path.as_uri() if uri else str(tmp_path),
+    )
+    try:
+        for step in range(1, 6):
+            with torch.no_grad():
+                model.weight.fill_(step)
+            assert manager.save(step)
+        assert manager._find_load_step() == 5
+        with torch.no_grad():
+            model.weight.zero_()
+        assert manager.load()
+        torch.testing.assert_close(model.weight, torch.full_like(model.weight, 5))
+    finally:
+        manager.close()
+    assert sorted(path.name for path in (tmp_path / "checkpoint").iterdir()) == [
+        "step-1",
+        "step-4",
+        "step-5",
+    ]
+
+
+@pytest.mark.parametrize("error_type", [ValueError, PermissionError, KeyboardInterrupt])
+def test_retention_metadata_failure_does_not_queue_deletion(monkeypatch, error_type):
+    import queue
+    from types import SimpleNamespace
+
+    failure = error_type("unreadable checkpoint metadata")
+    manager = DistributedCheckpointManager.__new__(DistributedCheckpointManager)
+    manager.folder = "checkpoint"
+    manager.keep_latest_k = 2
+    manager.purge_exempt = None
+    manager.purge_queue = queue.Queue()
+    manager.purge_thread = SimpleNamespace(is_alive=lambda: False)
+    manager._storage = SimpleNamespace(
+        isdir=lambda path: True,
+        listdir=lambda path: ["step-1", "step-2", "step-3"],
+        isfile=lambda path: True,
+    )
+
+    def read_metadata():
+        raise failure
+
+    monkeypatch.setattr(
+        "llmtuner.components.checkpointer.backends.distributed_checkpoint."
+        "_storage_setup",
+        lambda *args, **kwargs: SimpleNamespace(read_metadata=read_metadata),
+    )
+    with pytest.raises(error_type) as caught:
+        manager._purge_stale_checkpoints(saving_step=4)
+    assert caught.value is failure
+    assert manager.purge_queue.empty()
+
+
+@pytest.mark.parametrize("final_step", [1, 2])
+def test_optional_native_model_export_is_valid_but_not_automatic_resume(
+    tmp_path, final_step
+):
+    if torch_checkpointing_backend.CHECKPOINTING_IMPORT_ERROR is not None:
+        pytest.skip("torch_checkpointing is unavailable")
+    manager_type = torch_checkpointing_backend.TorchCheckpointingManager
+    model = nn.Linear(3, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    config = Config(enable=True, interval=1, keep_latest_k=0)
+
+    def build(folder, config=config):
+        return manager_type(
+            config,
+            model_parts=[model],
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            states={},
+            folder=str(folder),
+        )
+
+    manager = build(tmp_path)
+    expected = {key: value.clone() for key, value in model.state_dict().items()}
+    try:
+        assert manager.save(1)
+        with torch.no_grad():
+            model.weight.add_(1)
+        exported = {key: value.clone() for key, value in model.state_dict().items()}
+        assert manager.save(final_step, last_step=True)
+        checkpoint = tmp_path / "checkpoint" / f"step-{final_step}"
+        if final_step == 1:
+            checkpoint /= "model-export"
+        assert manager._is_valid_checkpoint(str(checkpoint))
+        assert not manager._is_resumable_checkpoint(str(checkpoint))
+        assert manager._find_load_step() == 1
+    finally:
+        manager.close()
+
+    resumed = build(tmp_path)
+    try:
+        assert resumed.load(-1)
+        torch.testing.assert_close(model.state_dict(), expected, rtol=0, atol=0)
+    finally:
+        resumed.close()
+
+    # Explicit model-only imports remain supported for both native export paths.
+    imported = build(
+        tmp_path / "initial",
+        Config(
+            enable=True,
+            load_only=True,
+            keep_latest_k=0,
+            initial_load_model_only=True,
+            initial_load_path=str(checkpoint),
+        ),
+    )
+    try:
+        assert imported.load(-1)
+        torch.testing.assert_close(model.state_dict(), exported, rtol=0, atol=0)
+    finally:
+        imported.close()

@@ -8,7 +8,7 @@ from torch import nn
 from llmtuner.components.loss import chunked_lm_head_cross_entropy, cross_entropy_loss
 from llmtuner.components.loss_contract import LossFunctions
 from llmtuner.config.llmtuner_config import LLMTunerConfig
-from llmtuner.config.training_config import resolve_batch_size_per_rank
+from llmtuner.config.training_config import TrainingConfig, resolve_batch_size_per_rank
 from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.parallel.assembly import ModelPartLayout, ParallelAssembly
 from llmtuner.trainer.runtime import assembly
@@ -16,6 +16,23 @@ from llmtuner.trainer.runtime import batch as batch_runtime
 from llmtuner.trainer.runtime.builders import TrainingBuilders
 from llmtuner.trainer.runtime.environment import RuntimeEnvironment
 from llmtuner.trainer.trainer import Trainer
+
+
+@pytest.mark.parametrize("chunks", [1, 2])
+def test_loss_factory_receives_original_structural_configuration(chunks):
+    config = SimpleNamespace(
+        training=TrainingConfig(chunked_loss_num_chunks=chunks), marker=object()
+    )
+    loss = LossFunctions(cross_entropy_loss, chunked_lm_head_cross_entropy)
+    received = []
+
+    def factory(actual):
+        received.append(actual)
+        assert actual.marker is config.marker
+        return loss
+
+    assert assembly.build_loss_functions(config, factory=factory) is loss
+    assert len(received) == 1 and received[0] is config
 
 
 def test_profiler_factory_returns_unentered_owner_with_explicit_cleanup():
@@ -563,3 +580,48 @@ def test_default_and_injected_optimizer_services_preserve_state_and_rng():
                 close = getattr(resource, "close", None)
                 if callable(close):
                     close()
+
+
+@pytest.mark.parametrize("invalid_hook", [False, "invalid", 3])
+def test_invalid_runtime_validator_is_rejected_before_model_construction(
+    monkeypatch, invalid_hook
+):
+    class Model(nn.Module):
+        validate_runtime = invalid_hook
+
+        def __init__(self, config):
+            pytest.fail(
+                "Invalid runtime validator must be rejected before construction"
+            )
+
+    cfg = LLMTunerConfig()
+    config = SimpleNamespace(model_type="injected")
+    monkeypatch.setattr(assembly, "build_model_config_for", lambda cfg: config)
+    monkeypatch.setattr(cfg.model, "update_architecture", lambda config: None)
+    monkeypatch.setattr(assembly, "resolve_model_class", lambda config: Model)
+    rng = torch.get_rng_state().clone()
+    with pytest.raises(TypeError, match="Model.validate_runtime must be callable"):
+        assembly.build_model(cfg, parallel_dims=None, device=torch.device("cpu"))
+    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid_hook", [False, "invalid", 3])
+def test_invalid_training_buffer_initializer_is_not_silently_skipped(
+    monkeypatch, invalid_hook
+):
+    class Model(nn.Module):
+        initialize_training_buffers = invalid_hook
+
+        def __init__(self, config):
+            super().__init__()
+
+    cfg = LLMTunerConfig()
+    cfg.model.initialization_device = "cpu"
+    config = SimpleNamespace(model_type="injected")
+    monkeypatch.setattr(assembly, "build_model_config_for", lambda cfg: config)
+    monkeypatch.setattr(cfg.model, "update_architecture", lambda config: None)
+    monkeypatch.setattr(assembly, "resolve_model_class", lambda config: Model)
+    with pytest.raises(
+        TypeError, match="Model.initialize_training_buffers must be callable"
+    ):
+        assembly.build_model(cfg, parallel_dims=None, device=torch.device("cpu"))

@@ -10,6 +10,7 @@ flow only, not torch_checkpointing I/O or its distributed protocol.
 import pickle
 from contextlib import nullcontext
 from datetime import timedelta
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -21,6 +22,7 @@ from llmtuner.components.checkpointer.backends.torch_checkpointing_backend impor
     TorchCheckpointingManager,
 )
 from llmtuner.components.checkpointer.core.checkpoint_keys import (
+    CHECKPOINT_FORMAT,
     DATALOADER,
     EMA,
     LR_SCHEDULER,
@@ -47,15 +49,20 @@ def main():
         manager._manager_config = SimpleNamespace(storage_config=None)
         manager._is_resumable_checkpoint = lambda path: True
         manager.states = {MODEL: model, EMA: ema}
-        for key in (LR_SCHEDULER, DATALOADER, TRAIN_STATE, RNG_STATE):
+        for key, failing_rank in product(
+            (CHECKPOINT_FORMAT, LR_SCHEDULER, DATALOADER, TRAIN_STATE, RNG_STATE),
+            (0, 1),
+        ):
             failure = ValueError(f"rank-local {key} restore failed")
 
             class LocalState:
                 def state_dict(self):
                     return {}
 
-                def load_state_dict(self, state, failure=failure):
-                    if dist.get_rank() == 0:
+                def load_state_dict(
+                    self, state, failure=failure, failing_rank=failing_rank
+                ):
+                    if dist.get_rank() == failing_rank:
                         raise failure
 
             caught = None
@@ -64,10 +71,11 @@ def main():
             except (ValueError, RuntimeError) as error:
                 caught = error
             assert caught is not None
-            if dist.get_rank() == 0:
+            if dist.get_rank() == failing_rank:
                 assert caught is failure
             else:
-                assert f"Checkpoint {key} restoration" in str(caught)
+                phase = "RNG" if key == RNG_STATE else key
+                assert f"Checkpoint {phase} restoration" in str(caught)
             dist.barrier()
 
         rng = RNGCheckpointState(torch.device("cpu"))

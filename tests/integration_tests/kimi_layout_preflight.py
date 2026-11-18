@@ -95,7 +95,7 @@ def main():
                 path = f"{roots[0]}/{category}-{corruption}"
                 dcp.save(damaged, checkpoint_id=path)
                 target = build()
-                swap_moe_blocks(target.model)
+                swap_moe_blocks(target)
                 optimizer = OptimizerState(target)
                 ema = EMA(model_parts=[target], decay=0.5)
                 states = {

@@ -33,6 +33,24 @@ class _CustomModel(PreTrainedModel):
     config_class = _CustomConfig
 
 
+def test_trainer_rejects_conditional_task_before_loading_model(monkeypatch):
+    def load():
+        raise AssertionError("Task validation must precede model class loading")
+
+    monkeypatch.setattr(architecture, "_MODELS", {})
+    register_model(
+        ModelSpec.from_types(
+            _CustomConfig.model_type,
+            config_type=_CustomConfig,
+            model_class_loader=load,
+            task="conditional_generation",
+        )
+    )
+    assert get_model_spec(_CustomConfig.model_type, task=None) is not None
+    with pytest.raises(ValueError, match="Trainer requires task='causal_lm'"):
+        resolve_model_class(_CustomConfig())
+
+
 @pytest.mark.parametrize("loaded", [None, object, lambda config: nn.Identity()])
 def test_model_loader_must_return_module_class(loaded):
     specification = ModelSpec.from_types(

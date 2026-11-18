@@ -15,7 +15,6 @@ from tests.integration_tests.npu_trainer_alignment_config import (
     build_candidate_30b_config,
     call_after_load,
     construction_dtype,
-    debug_candidate_config,
     effective_forward_positions,
     expected_dtensor_shard,
     input_fingerprints,
@@ -189,20 +188,11 @@ def test_runtime_manifest_identifies_loaded_source():
         alignment_runtime_manifest(("nonexistent_alignment_source_module",))
 
 
-def test_default_debugmodel_selection_and_config_are_unchanged(monkeypatch, tmp_path):
+def test_default_model_selection_preserves_baseline_arguments(monkeypatch):
     monkeypatch.delenv("LLMTUNER_ALIGNMENT_MODEL", raising=False)
     argv = ["--module", "qwen3", "--config", "qwen3_debugmodel"]
     assert selected_model() is None
     assert baseline_cli_args(argv) == argv
-    config = debug_candidate_config(
-        {"optimizer": {"implementation": "for-loop"}}, tmp_path, 1, 1
-    )
-    assert config.model.model_name_or_path == "qwen3"
-    assert config.model.vocab_size == 2048
-    assert config.model.arch_overrides["tie_word_embeddings"] is True
-    assert config.optimizer.learning_rate == 8e-4
-    assert config.optimizer.lr_scheduler_config.warmup_steps == 2
-    assert config.training.max_seq_len == 32
     assert construction_dtype(False) is None
 
 

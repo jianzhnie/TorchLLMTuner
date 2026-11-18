@@ -763,6 +763,42 @@ def test_explicit_v4_model_matches_native_hf_forward() -> None:
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "compressed_type", ["compressed_sparse_attention", "heavily_compressed_attention"]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_uncached_full_checkpoint_matches_eager_gradients(
+    monkeypatch, compressed_type, dtype
+):
+    from torch.utils.checkpoint import DefaultDeviceType
+
+    from llmtuner.memory.activation_checkpoint import wrap_full
+
+    monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
+    config = small_config()
+    config.layer_types[0] = compressed_type
+    config._attn_implementation = "eager"
+    config._experts_implementation = "eager"
+    eager = DeepseekV4ForCausalLM(config).to(dtype)
+    checkpointed = DeepseekV4ForCausalLM(config).to(dtype)
+    checkpointed.load_state_dict(eager.state_dict())
+    for index, layer in enumerate(checkpointed.model.layers):
+        checkpointed.model.layers[index] = wrap_full(layer)
+    tokens = torch.tensor([[1, 3, 7, 2], [5, 4, 8, 9]])
+    expected = eager(tokens, labels=tokens, use_cache=False)
+    actual = checkpointed(tokens, labels=tokens, use_cache=False)
+    torch.testing.assert_close(actual.logits, expected.logits, rtol=0, atol=0)
+    torch.testing.assert_close(actual.loss, expected.loss, rtol=0, atol=0)
+    expected.loss.backward()
+    actual.loss.backward()
+    for source, target in zip(
+        eager.parameters(), checkpointed.parameters(), strict=True
+    ):
+        assert (source.grad is None) == (target.grad is None)
+        if source.grad is not None:
+            torch.testing.assert_close(target.grad, source.grad, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("return_cache", [False, True])
 @pytest.mark.parametrize(
     "compressed_type", ["compressed_sparse_attention", "heavily_compressed_attention"]

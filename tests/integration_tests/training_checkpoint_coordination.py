@@ -4,6 +4,7 @@ Run with torchrun --nproc_per_node=2. Uses the real train_step and optimizer;
 checkpoint staging and batch preparation are substituted local operations.
 """
 
+from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,7 +12,23 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
+from llmtuner.models.execution import ModelExecutionCapabilities
+from llmtuner.trainer.runtime.engine import TrainingEngine
 from llmtuner.trainer.trainer import Trainer
+
+
+def bind_engine(trainer):
+    for model in trainer.model_parts:
+        model.execution_capabilities = ModelExecutionCapabilities()
+    trainer.training_engine = TrainingEngine(
+        model_parts=trainer.model_parts,
+        parallel_dims=None,
+        device=trainer.device,
+        chunked_loss_num_chunks=1,
+        param_context=nullcontext,
+        optimizer=trainer.optimizer,
+        lr_scheduler=trainer.lr_scheduler,
+    )
 
 
 def check_validation_staging():
@@ -22,6 +39,7 @@ def check_validation_staging():
             trainer.device = torch.device("cpu")
             model = torch.nn.Linear(2, 2)
             trainer.model_parts = [model]
+            bind_engine(trainer)
             failure = error_type("validation staging failed")
 
             def wait(*, failing_rank=failing_rank, failure=failure):
@@ -66,6 +84,8 @@ def main():
                 trainer.device = torch.device("cpu")
                 trainer.lr_scheduler = SimpleNamespace(get_metrics=lambda: {})
                 trainer.should_log = lambda: False
+                trainer.metrics = SimpleNamespace(add_valid_tokens=lambda count: None)
+                bind_engine(trainer)
                 trainer.microbatch = lambda batch: {
                     "num_valid_tokens": 2,
                     "num_routing_tokens": 2,
@@ -94,7 +114,7 @@ def main():
                     caught = error
                 assert caught is not None
                 if dist.get_rank() == failing_rank:
-                    assert caught is original
+                    assert caught is original, repr(caught)
                 else:
                     assert isinstance(caught, RuntimeError)
                     assert str(caught) == (

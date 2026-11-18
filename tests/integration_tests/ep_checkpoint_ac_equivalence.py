@@ -1,9 +1,11 @@
-"""EP checkpoint with activation wrappers: real DCP model/optimizer/EMA restore.
+"""EP checkpoint naming with activation wrappers and real DCP state restore.
 
     PYTHONPATH=. torchrun --nproc_per_node=2 \
         tests/integration_tests/ep_checkpoint_ac_equivalence.py
 
 Also restore the full expert checkpoint into EP=1 on each rank.
+Updates use assigned gradients, so this checks wrapper transparency for model,
+optimizer and EMA persistence, not activation recomputation or model math.
 """
 
 import shutil

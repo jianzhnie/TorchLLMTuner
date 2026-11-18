@@ -880,3 +880,37 @@ def test_adam_restore_preserves_supported_scalar_counters(optimizer_type, counte
     optimizer.step()
     assert optimizer.state[parameter]["step"].item() == expected + 1
     assert torch.isfinite(parameter).all()
+
+
+@pytest.mark.parametrize("distributed_count", [0, 1, 2])
+def test_saved_fused_adam_rejects_only_mixed_parameter_layout(
+    monkeypatch, distributed_count
+):
+    from llmtuner.components.optimizer import state_dict as module
+
+    class DistributedParameter(torch.nn.Parameter):
+        pass
+
+    monkeypatch.setattr(module, "DTensor", DistributedParameter)
+    params = [
+        (DistributedParameter if index < distributed_count else torch.nn.Parameter)(
+            torch.ones(2)
+        )
+        for index in range(2)
+    ]
+    optimizer = torch.optim.AdamW(
+        [{"params": params, "param_names": ["first", "second"]}],
+        fused=False,
+        foreach=False,
+    )
+    saved = module.get_flat_optim_state_dict(optimizer)
+    for name in ("first", "second"):
+        saved[f"param_groups.{name}.fused"] = True
+    if distributed_count == 1:
+        with pytest.raises(ValueError, match="mixed Tensor/DTensor group"):
+            module.unflatten_optim_state_dict(optimizer, flat_state=saved)
+    else:
+        restored = module.unflatten_optim_state_dict(optimizer, flat_state=saved)
+        assert restored["param_groups"][0]["fused"] is True
+    assert optimizer.param_groups[0]["fused"] is False
+    assert not optimizer.state

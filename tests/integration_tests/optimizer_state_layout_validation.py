@@ -129,7 +129,11 @@ def main():
                     f"counter validation communications rank={rank}: "
                     f"{debug.get_comm_counts()}"
                 )
-                assert debug.get_total_counts() == 1, debug.get_comm_counts()
+                # Layout preflight and state validation each coordinate once.
+                # Reading a counter must not add DTensor redistribution work.
+                assert dict(debug.get_comm_counts()) == {
+                    torch.ops.c10d.allreduce_: 2
+                }, debug.get_comm_counts()
             outcomes = [None, None]
             dist.all_gather_object(outcomes, (type(error).__name__, str(error)))
             assert outcomes[0][0] == "ValueError", (kind, outcomes)

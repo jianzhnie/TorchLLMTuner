@@ -26,13 +26,16 @@ from __future__ import annotations
 
 import copy
 
+import torch
+
 from tests.caps import require_env
 
+# Initialize torch before probing spmd_types: torch-npu's FSDP imports may
+# otherwise re-enter a partially initialized spmd_types module.
 require_env("spmd_types")
 
 
 import pytest
-import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import DefaultDeviceType

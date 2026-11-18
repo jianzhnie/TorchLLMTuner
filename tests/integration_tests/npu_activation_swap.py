@@ -37,7 +37,7 @@ def _run(
     config = LLMTunerConfig(
         parallel=ParallelConfig(tensor_parallel_size=tp_size),
         model=ModelConfig(
-            model_name_or_path="qwen3_moe" if moe else "qwen3",
+            model_name_or_path="qwen3_moe",
             vocab_size=64,
             hidden_size=32,
             intermediate_size=64,
@@ -46,12 +46,13 @@ def _run(
             num_key_value_heads=2,
             arch_overrides=(
                 {
+                    "head_dim": 8,
                     "num_experts": 4,
                     "num_experts_per_tok": 2,
                     "moe_intermediate_size": 16,
                 }
                 if moe
-                else {}
+                else {"head_dim": 8, "mlp_only_layers": [0, 1]}
             ),
         ),
         training=TrainingConfig(
@@ -64,6 +65,9 @@ def _run(
             checkpoint_config=CheckpointConfig(enable=False),
         ),
     )
+    if tp_size > 1:
+        # TP currently requires a single row to preserve its attention layout.
+        config.training.global_batch_size = 1
     trainer = Trainer(config)
     if tp_size > 1:
         assert any(

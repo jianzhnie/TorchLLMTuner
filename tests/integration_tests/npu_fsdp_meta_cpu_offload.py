@@ -8,8 +8,8 @@ from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.memory.materialization import materialize_meta_model
 from llmtuner.models.qwen.qwen3.model import Qwen3MoeForCausalLM
 from llmtuner.parallel.fully_shard_parallel.fully_shard_parallel import apply_fsdp
+from llmtuner.parallel.fully_shard_parallel.policies import fsdp_managed_parameters
 from llmtuner.parallel.topology import ParallelTopology
-from llmtuner.trainer.runtime.assembly import _fsdp_managed_parameters
 from tests.integration_tests.harness import init_distributed
 
 
@@ -51,7 +51,7 @@ def main() -> None:
         )
         topology.build_device_mesh()
         apply_fsdp(model, parallel, topology)
-        managed = _fsdp_managed_parameters(model)
+        managed = fsdp_managed_parameters(model)
         assert managed
         unmanaged = set(model.parameters()) - managed
         assert unmanaged
@@ -62,7 +62,7 @@ def main() -> None:
             offloaded_parameters=managed,
             runtime_buffers=model.materialization_buffers(device),
         )
-        assert _fsdp_managed_parameters(model) == managed
+        assert fsdp_managed_parameters(model) == managed
         assert all(parameter.device.type == "cpu" for parameter in managed)
         assert all(parameter.device == device for parameter in unmanaged)
         with torch.no_grad():

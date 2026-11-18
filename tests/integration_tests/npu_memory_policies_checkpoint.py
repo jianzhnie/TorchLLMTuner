@@ -47,7 +47,14 @@ def _config(directory: Path, combined: bool, steps: int) -> LLMTunerConfig:
 def _run(directory: Path, combined: bool, steps: int):
     trainer = Trainer(_config(directory, combined, steps))
     try:
-        trainer.train()
+        trainer.checkpointer.load(trainer.cfg.checkpoint.load_step)
+        source = trainer.data_iterator()
+        while trainer.step < steps:
+            trainer.step += 1
+            trainer.train_step(source)
+            trainer.checkpointer.save(trainer.step, last_step=trainer.step == steps)
+        trainer.checkpointer.maybe_wait_for_staging()
+        trainer.checkpointer.maybe_wait_for_saving()
         model = {
             name: value.detach().cpu().clone()
             for name, value in trainer.training_engine.model.state_dict().items()
