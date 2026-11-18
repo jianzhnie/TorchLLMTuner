@@ -1,7 +1,7 @@
 """Context parallelism: model-owned backends and input sharding.
 
 ``context_parallel.py`` is the public entry and wires CP onto a model.
-``plan.py`` selects backend targets and checks PP ownership without mutation.
+``plan.py`` selects backend targets and validates local ownership without mutation.
 ``attention.py`` holds attention redistribution, while
 ``input_sharding.py`` owns batch and mask sharding.
 

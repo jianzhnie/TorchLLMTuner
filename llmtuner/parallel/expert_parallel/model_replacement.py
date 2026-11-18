@@ -154,7 +154,7 @@ def swap_moe_blocks(
 
     decoder_layers = tuple(decoder_layers_for_ep(model))
 
-    # Bind targets after preceding stages (TP/PP) have stabilized this instance.
+    # Bind targets after TP has stabilized this instance.
     degree = 1 if ep_group is None else dist.get_world_size(ep_group)
     execution_plan = resolved_plan or ep_plan.resolve_ep_plan(
         model,

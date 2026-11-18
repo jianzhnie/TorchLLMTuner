@@ -29,6 +29,7 @@ from llmtuner.config.llmtuner_config import LLMTunerConfig
 from ..accelerator.collectives import (
     all_reduce,
     set_pg_timeouts,
+    synchronize_after_wait,
     synchronize_local_errors,
 )
 from ..components.checkpointer.core.base import BaseCheckpointManager
@@ -436,18 +437,11 @@ class Trainer:
         # Forward can mutate checkpointed state too: running buffers and
         # embedding max_norm weights are examples. Finish the previous snapshot
         # before model execution; background upload may still overlap training.
-        staging_failure: BaseException | None = None
-        try:
-            self.checkpointer.maybe_wait_for_staging()
-        except BaseException as error:
-            staging_failure = error
-        # Waiting can involve background communication; agree only after the
-        # wait returns, before any rank starts model execution.
-        with synchronize_local_errors(
-            "Training checkpoint staging", group=self.error_group
-        ):
-            if staging_failure is not None:
-                raise staging_failure
+        synchronize_after_wait(
+            self.checkpointer.maybe_wait_for_staging,
+            "Training checkpoint staging",
+            group=self.error_group,
+        )
 
         def executed_groups() -> Iterator[StepResult]:
             while microbatches:
@@ -777,14 +771,14 @@ class Trainer:
             resource = getattr(self, name, None)
             if resource is None:
                 continue
-            close = getattr(resource, "close", None)
-            if name in ("ema", "lr_scheduler", "optimizer") and not callable(close):
-                # Tensor-only services need no shutdown, but their ownership
-                # must end so dependent resources can be released below.
-                setattr(self, name, None)
-                continue
-            setattr(self, name, None)
             try:
+                close = getattr(resource, "close", None)
+                if name in ("ema", "lr_scheduler", "optimizer") and not callable(close):
+                    # Tensor-only services need no shutdown, but their ownership
+                    # must end so dependent resources can be released below.
+                    setattr(self, name, None)
+                    continue
+                setattr(self, name, None)
                 close()
             except BaseException as error:
                 # A failed close leaves ownership indeterminate. Keep every

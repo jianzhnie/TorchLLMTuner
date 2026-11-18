@@ -331,6 +331,14 @@ def unflatten_optim_state_dict(
         fqns = param_group["param_names"]
         params = param_group["params"]
         restored_group = _restore_param_group(param_group, flat_state=flat_state)
+        if is_adam and restored_group.get("fused"):
+            distributed = sum(isinstance(param, DTensor) for param in params)
+            if 0 < distributed < len(params):
+                raise ValueError(
+                    "Cannot restore fused Adam for a mixed Tensor/DTensor group; "
+                    "convert the checkpoint group to fused=False, foreach=False "
+                    "before loading"
+                )
         ids: list[int] = []
         for fqn, param in zip(fqns, params, strict=True):
             if fqn in seen_fqns:

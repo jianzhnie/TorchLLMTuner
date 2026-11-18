@@ -19,13 +19,17 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ....accelerator.collectives import all_reduce, synchronize_local_errors
+from ....accelerator.collectives import (
+    all_reduce,
+    synchronize_after_wait,
+    synchronize_local_errors,
+)
 from ....accelerator.distributed import (
     get_default_group,
     get_world_size,
@@ -45,6 +49,13 @@ if TYPE_CHECKING:
     from ....parallel.assembly import ModelPartLayout
 
 logger = get_logger(__name__)
+
+
+class CheckpointRetention(TypedDict):
+    """Policy captured before save submission and reused after publication."""
+
+    saving_step: int
+    staging_dir_prefix: str | None
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -139,6 +150,7 @@ class BaseCheckpointManager(ABC):
     enable_first_step_checkpoint: bool
     staging_future: Future | None
     save_future: Future | None
+    _pending_retention: CheckpointRetention | None
     folder: str
     keep_latest_k: int
     states: dict[str, Any]
@@ -224,8 +236,8 @@ class BaseCheckpointManager(ABC):
 
         The state keys go in this order on purpose. ``model`` first, then
         ``optimizer`` passed through unwrapped -- it is an ``OptimizersContainer``
-        whose ``state_dict`` is already flat and FQN-keyed (the format DCP needs
-        to reshard a pipeline checkpoint) and which materializes state before DCP
+        whose ``state_dict`` is already flat and FQN-keyed for DCP resharding
+        and which materializes state before DCP
         plans a load. ``lr_scheduler`` last, because a load runs in this order and
         the scheduler's restore reads optimizer group ``initial_lr`` values. Without
         it a
@@ -289,9 +301,10 @@ class BaseCheckpointManager(ABC):
         self.last_save_in_hf = config.last_save_in_hf
         self.export_dtype = EXPORT_DTYPE_MAP[config.export_dtype]
 
-        # -- retention policy (the threads that enforce it are the backend's) --
+        # -- retention policy and its worker --
         self.keep_latest_k = config.keep_latest_k
         self.purge_exempt = config.purge_exempt
+        self.purge_thread: threading.Thread | None = None
 
     # A disabled manager returns early from ``__init__``, and a failed manager
     # raises partway through it, so in neither case do the attributes below
@@ -537,6 +550,9 @@ class BaseCheckpointManager(ABC):
                 time.monotonic() - started
             )
 
+    def __del__(self) -> None:
+        self.close()
+
     def close(self) -> None:
         """Release background threads and other resources.
 
@@ -603,16 +619,26 @@ class BaseCheckpointManager(ABC):
         if first_error is not None:
             raise first_error
 
+    def _save_retention(self, curr_step: int) -> CheckpointRetention:
+        """Backend retention options, resolved inside the preflight boundary."""
+        return {"saving_step": curr_step, "staging_dir_prefix": None}
+
+    def _prepare_save(self, curr_step: int) -> CheckpointRetention:
+        """Drain the prior upload before checking retention for a new save.
+
+        Called only after all ranks agree to save. Backend option discovery is
+        local; upload completion may communicate and stays outside that guard.
+        Reuse the returned options when recording publication or pending work.
+        """
+        self._wait_for_pending_save()
+        with synchronize_local_errors("Checkpoint retention preflight"):
+            retention = self._save_retention(curr_step)
+            self._purge_stale_checkpoints(**retention)
+        return retention
+
     def _wait_for_pending_staging(self) -> None:
         """Drain staging and agree before any rank discovers a restore source."""
-        failure: BaseException | None = None
-        try:
-            self.maybe_wait_for_staging()
-        except BaseException as error:
-            failure = error
-        with synchronize_local_errors("Checkpoint load staging"):
-            if failure is not None:
-                raise failure
+        synchronize_after_wait(self.maybe_wait_for_staging, "Checkpoint load staging")
 
     def _wait_for_pending_save(self) -> None:
         """Drain a previous save and agree before saving or loading state.
@@ -621,14 +647,7 @@ class BaseCheckpointManager(ABC):
         may communicate, so wait outside the local error coordination region.
         Keep close() local: destructors need not run on every rank together.
         """
-        failure: BaseException | None = None
-        try:
-            self.maybe_wait_for_saving()
-        except BaseException as error:
-            failure = error
-        with synchronize_local_errors("Checkpoint pending save"):
-            if failure is not None:
-                raise failure
+        synchronize_after_wait(self.maybe_wait_for_saving, "Checkpoint pending save")
 
     def maybe_wait_for_saving(self) -> None:
         """Block until the last asynchronous save completes.
@@ -694,10 +713,9 @@ class BaseCheckpointManager(ABC):
             return True
         return last_step or curr_step % self.interval == 0
 
-    def _create_checkpoint_id(self, step: int, folder: str = "") -> str:
+    def _create_checkpoint_id(self, step: int) -> str:
         """Standardized checkpoint path, e.g. ``checkpoints/step-100``."""
-        folder = folder or self.folder
-        return filesystem.join(folder, f"step-{step}")
+        return filesystem.join(self.folder, f"step-{step}")
 
     def _create_final_checkpoint_id(self, step: int) -> str:
         """Resolve the final path on all ranks, preserving a resumable checkpoint."""
@@ -751,6 +769,29 @@ class BaseCheckpointManager(ABC):
             if key not in self.exclude_from_loading
         }
 
+    def _cast_export_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Cast model export floats while preserving integer and extra state."""
+        return {
+            key: value.to(self.export_dtype)
+            if isinstance(value, torch.Tensor)
+            and value.is_floating_point()
+            and value.dtype != self.export_dtype
+            else value
+            for key, value in state.items()
+        }
+
+    def _prepare_final_model_state(self, curr_step: int) -> dict[str, Any]:
+        """Read model export state before coordinating local casts and reporting."""
+        # Model state collection may communicate; keep it outside the local guard.
+        state = self.states[MODEL].state_dict()
+        with synchronize_local_errors("Checkpoint final model preparation"):
+            state = self._cast_export_state(state)
+            logger.info(
+                f"Saving a model only checkpoint in {self.export_dtype} "
+                f"at last step, step {curr_step}."
+            )
+        return state
+
     @abstractmethod
     def _save(
         self, curr_step: int, last_step: bool = False, *, should_save: bool
@@ -769,6 +810,32 @@ class BaseCheckpointManager(ABC):
     def _close(self) -> None:
         """Implement ``close``. Only called when checkpointing is enabled."""
 
+    def _start_checkpoint_services(self) -> None:
+        """Start retention and report readiness after backend ownership exists."""
+        if self.keep_latest_k > 0:
+            self.purge_queue: queue.Queue[str | None] = queue.Queue()
+            self.purge_thread = threading.Thread(
+                target=purge_thread,
+                args=(self.purge_queue, self._storage.remove),
+                daemon=True,
+            )
+            self.purge_thread.start()
+        logger.info(
+            "Checkpointing active. Checkpoints will be loaded from and saved "
+            f"to {self.folder}"
+        )
+
+    def _close_purge_worker(self) -> None:
+        """Drain queued retention work; retain ownership if joining is interrupted.
+
+        Backends call this alongside independent IO cleanup, including after
+        partial service construction. A failed join must remain retryable.
+        """
+        worker = getattr(self, "purge_thread", None)
+        if worker is not None and worker.is_alive():
+            self.purge_queue.put(None)
+            worker.join()
+
     def _should_purge(self) -> bool:
         """Whether this rank should purge stale checkpoints.
 
@@ -781,10 +848,6 @@ class BaseCheckpointManager(ABC):
             and is_main_process()
             and self._storage.isdir(self.folder)
         )
-
-    def _is_purge_exempt(self, step: int) -> bool:
-        """Whether the configured exemption protects ``step`` from deletion."""
-        return self.purge_exempt is not None and self.purge_exempt(step)
 
     def _parse_step(self, dirname: str) -> int | None:
         """Parse a canonical ``step-N`` checkpoint directory name."""
@@ -803,12 +866,8 @@ class BaseCheckpointManager(ABC):
     def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
         """Whether automatic loading may select ``checkpoint_dir``."""
 
-    def _find_load_step(self, folder: str = "", max_step: int | None = None) -> int:
-        """The highest step in ``folder`` that can actually be loaded.
-
-        Args:
-            folder: directory to scan. Defaults to ``self.folder``.
-            max_step: ignore checkpoints after this step when provided.
+    def _find_load_step(self) -> int:
+        """The highest resumable step in this manager's checkpoint folder.
 
         Returns:
             The step number, or -1 when the folder holds no loadable checkpoint.
@@ -819,7 +878,7 @@ class BaseCheckpointManager(ABC):
             avoids reading older metadata after the result is known, especially
             on remote storage.
         """
-        folder = folder or self.folder
+        folder = self.folder
         if not self._storage.isdir(folder):
             return -1
 
@@ -827,8 +886,6 @@ class BaseCheckpointManager(ABC):
         for dirname in self._storage.listdir(folder):
             step = self._parse_step(dirname)
             if step is None:
-                continue
-            if max_step is not None and step > max_step:
                 continue
             candidates.append((step, dirname))
         for step, dirname in sorted(candidates, reverse=True):
@@ -886,13 +943,10 @@ class BaseCheckpointManager(ABC):
                 step = self._parse_step(dirname)
                 if step is None:
                     continue
-                if self._is_valid_checkpoint(checkpoint_dir):
-                    retained = (
-                        checkpoints
-                        if self._is_resumable_checkpoint(checkpoint_dir)
-                        else exports
-                    )
-                    retained.append((step, checkpoint_dir))
+                if self._is_resumable_checkpoint(checkpoint_dir):
+                    checkpoints.append((step, checkpoint_dir))
+                elif self._is_valid_checkpoint(checkpoint_dir):
+                    exports.append((step, checkpoint_dir))
                 else:
                     abandoned.append(checkpoint_dir)
 
@@ -902,7 +956,7 @@ class BaseCheckpointManager(ABC):
                 category.sort()
                 num_to_purge = max(0, len(category) - self.keep_latest_k)
                 for step, checkpoint_dir in category[:num_to_purge]:
-                    if self._is_purge_exempt(step):
+                    if self.purge_exempt is not None and self.purge_exempt(step):
                         logger.info(
                             "Checkpointer is preserving checkpoint %s outside "
                             "keep_latest_k.",

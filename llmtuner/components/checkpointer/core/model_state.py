@@ -1,6 +1,6 @@
 """Checkpoint state view over model parts, with stable tensor storage.
 
-Adapted from torchtitan ``components/checkpointer/base.py``. Flatten pipeline
+Adapted from torchtitan ``components/checkpointer/base.py``. Combine local model
 parts and gather/slice EP expert state without depending on manager policies.
 """
 
@@ -32,7 +32,6 @@ from ....parallel.expert_parallel.checkpointing import (
 )
 from .chunked_tensor import ChunkedCheckpointTensor, chunk_layout
 from .layout_conversion import (
-    RestoreLayout,
     export_parallel_state,
     resolve_restore_layout,
     restore_parallel_state,
@@ -66,7 +65,7 @@ class ModelCheckpointState(Stateful):
     Serves two purposes:
 
     1. **Flattening.** Combines the state dicts of several modules (individual
-       chunks under pipeline parallelism) into one flat view, so the
+       local model parts) into one flat view, so the
        checkpointing code interacts with them through a single interface.
     2. **Stable-storage caching.** Caches the flattened state dict and, on every
        ``state_dict()`` call, returns tensors backed by the *same* storage.
@@ -293,7 +292,7 @@ class ModelCheckpointState(Stateful):
     def validate_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Validate full checkpoint keys and shapes without copying or communicating."""
         # Validate the combined view before any part copies weights. strict=False
-        # below permits other PP parts and auxiliary checkpoint categories, but
+        # below permits other model parts and auxiliary checkpoint categories, but
         # must not permit missing local model state or late shape failures.
         self._validate_local_model_bindings()
         missing = self._metadata.keys() - state_dict.keys()
@@ -375,8 +374,17 @@ class ModelCheckpointState(Stateful):
         # partially mutate state and fail. Replacing the dictionary preserves
         # caller-owned input even when it is the previous cache itself.
         self.release_cache()
-        local_state = self._restore_local_state(state_dict, layout=restore_layout)
-        # Each PP part consumes its own keys from the combined model state.
+        destination = (
+            self.local_state_dict() if restore_layout.requires_local_state else None
+        )
+        local_state = restore_parallel_state(
+            state_dict,
+            local_state=destination,
+            model_parts=self.model,
+            expert_shards=self._ep_shards,
+            layout=restore_layout,
+        )
+        # Each local model part consumes its keys from the combined model state.
         # Other parts' keys are ignored; checkpoint state categories are separate.
         # Load hooks may communicate, so run them outside the local error
         # boundary. Agree on their outcome before restoring optimizer state.
@@ -391,16 +399,3 @@ class ModelCheckpointState(Stateful):
         ):
             if restore_error is not None:
                 raise restore_error
-
-    def _restore_local_state(
-        self, state_dict: dict[str, Any], *, layout: RestoreLayout
-    ) -> dict[str, Any]:
-        """Apply a layout resolved inside the caller's validation boundary."""
-        local_state = self.local_state_dict() if layout.requires_local_state else None
-        return restore_parallel_state(
-            state_dict,
-            local_state=local_state,
-            model_parts=self.model,
-            expert_shards=self._ep_shards,
-            layout=layout,
-        )

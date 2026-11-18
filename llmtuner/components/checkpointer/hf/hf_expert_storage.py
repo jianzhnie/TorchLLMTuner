@@ -72,12 +72,8 @@ class GroupedExpertHuggingFaceStorageReader(IndexedHuggingFaceStorageReader):
             if target in metadata.state_dict_metadata:
                 raise ValueError(f"Mixed fused and individual HF experts: {target}")
             projection_count = projection_counts[target]
-            expected = {
-                (expert, projection)
-                for expert in range(self.layout.num_experts)
-                for projection in range(projection_count)
-            }
-            if set(sources) != expected:
+            # Indices are in range and unique, so the count proves coverage.
+            if len(sources) != self.layout.num_experts * projection_count:
                 raise ValueError(f"Incomplete individual HF experts for {target}")
             first = next(iter(sources.values()))[1]
             shape = first.size

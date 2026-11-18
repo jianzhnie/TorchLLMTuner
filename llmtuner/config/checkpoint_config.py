@@ -12,10 +12,10 @@ from llmtuner.components.checkpointer.core.checkpoint_keys import (
     MODEL,
     OPTIMIZER,
 )
-from llmtuner.components.checkpointer.storage import filesystem
 from llmtuner.config.utils import require_integer_at_least
 from llmtuner.errors import ConfigError
 from llmtuner.utils.logging import get_logger
+from llmtuner.utils.paths import is_remote
 
 logger = get_logger(__name__)
 
@@ -127,6 +127,8 @@ class CheckpointConfig:
         for name in ("sharded_tensor_parallel", "sharded_expert_parallel"):
             if getattr(self, name) and self.backend != "dcp":
                 raise ConfigError(f"checkpoint.{name} requires backend='dcp'")
+        if not isinstance(self.folder, str):
+            raise ConfigError("checkpoint.folder must be a string.")
         if not self.folder.strip():
             raise ConfigError("checkpoint.folder must not be empty.")
         if self.backend not in ("dcp", "torch_checkpointing"):
@@ -134,16 +136,16 @@ class CheckpointConfig:
                 "checkpoint.backend must be 'dcp' or 'torch_checkpointing', "
                 f"got {self.backend!r}"
             )
+        if self.export_dtype not in ("float16", "bfloat16", "float32"):
+            raise ConfigError(
+                "checkpoint.export_dtype must be float16, bfloat16 or float32, "
+                f"got {self.export_dtype!r}"
+            )
         require_integer_at_least(self, "interval", group="checkpoint")
-        if not isinstance(self.load_step, int) or isinstance(self.load_step, bool):
-            raise ConfigError(
-                f"checkpoint.load_step must be an integer >= -1, got {self.load_step!r}"
-            )
-        if self.load_step < -1:
-            raise ConfigError(
-                f"checkpoint.load_step must be >= -1, got {self.load_step}"
-            )
+        require_integer_at_least(self, "load_step", group="checkpoint", minimum=-1)
         require_integer_at_least(self, "keep_latest_k", group="checkpoint", minimum=0)
+        if self.purge_exempt is not None and not callable(self.purge_exempt):
+            raise ConfigError("checkpoint.purge_exempt must be callable or None")
         if self.keep_latest_k == 1:
             raise ConfigError(
                 "checkpoint.keep_latest_k must not be 1: at least 2 replicas "
@@ -169,7 +171,7 @@ class CheckpointConfig:
             self.initial_load_path = self.initial_load_path.strip()
             if not (
                 self.initial_load_path.startswith("/")
-                or filesystem.is_remote(self.initial_load_path)
+                or is_remote(self.initial_load_path)
             ):
                 raise ConfigError(
                     "checkpoint.initial_load_path must be an absolute path or "
@@ -184,7 +186,11 @@ class CheckpointConfig:
                 "checkpoint.last_save_in_hf requires last_save_model_only=True."
             )
 
-        async_lowered = self.async_mode.lower()
+        async_lowered = (
+            self.async_mode.lower()
+            if isinstance(self.async_mode, str)
+            else self.async_mode
+        )
         if async_lowered not in ("disabled", "async", "async_with_pinned_mem"):
             raise ConfigError(
                 "checkpoint.async_mode must be one of "
@@ -195,7 +201,7 @@ class CheckpointConfig:
         # Remote (fsspec) checkpoint IO supports only the native DCP format. HF
         # safetensors read/write to a remote URI is not implemented, so reject
         # the combination up front instead of failing deep inside DCP.
-        if self.last_save_in_hf and filesystem.is_remote(self.folder):
+        if self.last_save_in_hf and is_remote(self.folder):
             raise ConfigError(
                 "checkpoint.last_save_in_hf is not supported with a remote "
                 f"checkpoint.folder, got {self.folder}"
@@ -203,7 +209,7 @@ class CheckpointConfig:
         if (
             self.initial_load_in_hf
             and self.initial_load_path
-            and filesystem.is_remote(self.initial_load_path)
+            and is_remote(self.initial_load_path)
         ):
             raise ConfigError(
                 "checkpoint.initial_load_in_hf is not supported with a remote "

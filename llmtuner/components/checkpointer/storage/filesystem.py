@@ -11,6 +11,8 @@ import os
 import posixpath
 import shutil
 
+from llmtuner.utils.paths import is_remote
+
 try:
     from fsspec.core import url_to_fs
 except ImportError as error:
@@ -20,27 +22,11 @@ else:
     _FSSPEC_IMPORT_ERROR = None
 
 
-def is_remote(path: str | os.PathLike[str]) -> bool:
-    """Whether ``path`` is a remote fsspec URI rather than a local path.
-
-    The ``"://"`` heuristic is the same one PyTorch DCP's
-    ``FileSystem.validate_checkpoint_id`` uses.
-    """
-    return "://" in os.fspath(path)
-
-
 def resolve(path: str | os.PathLike[str]):
     """Return ``(fs, path)`` for a remote URI via fsspec."""
     if url_to_fs is None:
         raise ImportError("Remote checkpoints require fsspec") from _FSSPEC_IMPORT_ERROR
     return url_to_fs(os.fspath(path))
-
-
-def exists(path: str | os.PathLike[str]) -> bool:
-    if is_remote(path):
-        fs, p = resolve(path)
-        return fs.exists(p)
-    return os.path.exists(path)
 
 
 def isdir(path: str | os.PathLike[str]) -> bool:

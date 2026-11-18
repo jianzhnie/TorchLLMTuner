@@ -1,41 +1,18 @@
-"""The DCP checkpoint manager: sharded I/O, async saving, HF export.
+"""Native DCP checkpoints with asynchronous staging and HF export.
 
-Vendored from torchtitan's checkpoint component. The
-``torch.distributed.checkpoint`` backend provides two distinct
-things:
+The base manager owns cadence, discovery, retention and resume selection.
+This backend owns DCP readers/writers, staging futures and its host process
+groups. Shared state adaptation handles restore preflight and completion;
+model/parallel state owners handle key and tensor-layout conversion.
 
-* **A sharded layout.** Under FSDP each rank holds one shard of every parameter
-  and only needs to write that shard; DCP records the global layout and stitches
-  the shards back together on load. llmtuner's old ``torch.save``-per-rank format
-  could not express that -- it happened to work only because every run it was
-  used for had one rank owning the whole tensor.
-* **Async saving and lazy loading.** ``async_save`` stages to host memory and
-  writes from a background thread, so the next training step does not wait on
-  disk. ``load`` reads into the live state dict in place, so a resumed run does
-  not materialize a second copy of the model.
-
-Two departures from torchtitan, both subtractions:
-
-* **No ``structured_logger``.** torchtitan wraps saves in ``sl.log_trace_span``
-  and reports the async write's duration as a structured scalar from a
-  ``save_future`` callback. The spans go; the duration stays, as a
-  ``logger.info`` line from the same callback.
-
-* **No ``torchtitan.tools.filesystem``.** The local equivalent is
-  ``checkpointer/filesystem``, which has the same API for the paths this module
-  uses. Deletion ignores missing paths and reports other failures, so a purge
-  of an already-deleted directory is a no-op while permission or storage
-  errors remain visible in the purge thread's logs.
-
-``DistributedCheckpointAsyncMode.DISABLED`` is the default here, matching torchtitan.
-"""
+On Ascend, owned Gloo groups carry host planning objects. Virtual optimizer
+storage uses dedicated planners and staging; ordinary device state keeps the
+native DCP path. Close retains live resources after interrupted waits."""
 
 from __future__ import annotations
 
 import enum
 import os
-import queue
-import threading
 import time
 from concurrent.futures import Future
 from copy import copy
@@ -67,7 +44,7 @@ if TYPE_CHECKING:
     from ....parallel.assembly import ModelPartLayout
 
 from ....utils.logging import get_logger
-from ..core.base import BaseCheckpointManager, purge_thread
+from ..core.base import BaseCheckpointManager
 from ..core.checkpoint_keys import (
     DATALOADER,
     EMA,
@@ -80,13 +57,11 @@ from ..core.checkpoint_keys import (
 )
 from ..core.layout_migration import load_changed_source_layout
 from ..core.state_adaptation import (
-    adapt_hf_model_state,
+    finish_checkpoint_restore,
+    hf_model_restore,
+    local_state_preflight,
     materialize_local_checkpoint_states,
-    prepare_hf_model_state,
-    prepare_local_state_preflight,
-    restore_rng_state,
-    validate_local_preflight_selection,
-    validate_local_state_preflight,
+    prepare_hf_export,
 )
 from ..hf.hf_storage import save_hf_checkpoint
 from ..storage.checkpoint_writer import GenerationFileSystemWriter
@@ -174,73 +149,62 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         sd_adapter: Any | None = None,
     ) -> None:
         self._validate_constructor_configuration(config, async_mode=config.async_mode)
-        if not config.enable:
-            super().__init__(
-                config,
-                model_parts=model_parts,
-                optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
-                ema=ema,
-                runtime_layouts=runtime_layouts,
-                states=states,
-                folder=folder,
-            )
-            return
-
-        # Only local preflight belongs here: model state construction below
-        # may gather EP weights and must remain outside this boundary.
-        with synchronize_local_errors("Checkpoint preflight"):
-            effective_folder = filesystem.join(folder, config.folder)
-            if config.last_save_in_hf and filesystem.is_remote(effective_folder):
-                raise ValueError(
-                    "checkpoint.last_save_in_hf is not supported with a remote "
-                    f"effective checkpoint folder, got {effective_folder}"
-                )
-            self._storage = FilesystemCheckpointStorage()
-
-            self.sd_adapter = sd_adapter
-            # Runtime assembly supplies the HF wrapper adapter. Direct callers
-            # must provide an adapter before enabling format-specific options.
-            if self.sd_adapter is None:
-                hf_options = [
-                    name
-                    for name, enabled in (
-                        ("last_save_in_hf", config.last_save_in_hf),
-                        ("initial_load_in_hf", config.initial_load_in_hf),
-                    )
-                    if enabled
-                ]
-                if hf_options:
+        if config.enable:
+            # Only local preflight belongs here: model state construction below
+            # may gather EP weights and must remain outside this boundary.
+            with synchronize_local_errors("Checkpoint preflight"):
+                effective_folder = filesystem.join(folder, config.folder)
+                if config.last_save_in_hf and filesystem.is_remote(effective_folder):
                     raise ValueError(
-                        f"checkpoint.{', '.join(hf_options)} is not wired: the HF "
-                        "safetensors paths need a state_dict adapter. "
-                        "Use the native DCP format, or supply one by "
-                        "passing sd_adapter to DistributedCheckpointManager."
+                        "checkpoint.last_save_in_hf is not supported with a remote "
+                        f"effective checkpoint folder, got {effective_folder}"
                     )
+                self._storage = FilesystemCheckpointStorage()
 
-            # -- async and distributed infrastructure --
-            try:
-                self.async_mode = DistributedCheckpointAsyncMode(config.async_mode)
-            except ValueError as e:
-                raise ValueError(
-                    f"Unknown checkpoint async_mode {config.async_mode}"
-                ) from e
+                self.sd_adapter = sd_adapter
+                # Runtime assembly supplies the HF wrapper adapter. Direct callers
+                # must provide an adapter before enabling format-specific options.
+                if self.sd_adapter is None:
+                    hf_options = [
+                        name
+                        for name, enabled in (
+                            ("last_save_in_hf", config.last_save_in_hf),
+                            ("initial_load_in_hf", config.initial_load_in_hf),
+                        )
+                        if enabled
+                    ]
+                    if hf_options:
+                        raise ValueError(
+                            f"checkpoint.{', '.join(hf_options)} is not wired: the HF "
+                            "safetensors paths need a state_dict adapter. "
+                            "Use the native DCP format, or supply one by "
+                            "passing sd_adapter to DistributedCheckpointManager."
+                        )
 
-            storage_protocols = ()
-            if filesystem.is_remote(effective_folder):
-                storage_protocols = filesystem.resolve(effective_folder)[0].protocol
-                if isinstance(storage_protocols, str):
-                    storage_protocols = (storage_protocols,)
-            if "memory" in storage_protocols and (
-                self.async_mode == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM
-                or (dist.is_initialized() and dist.get_world_size() > 1)
-            ):
-                raise UnsupportedCombinationError(
-                    "memory:// checkpoint storage is process-local and cannot be "
-                    "shared by distributed ranks or the async_with_pinned_mem "
-                    "save subprocess. Use a shared local/file://, s3:// or "
-                    "gs:// folder."
-                )
+                # -- async and distributed infrastructure --
+                try:
+                    self.async_mode = DistributedCheckpointAsyncMode(config.async_mode)
+                except ValueError as e:
+                    raise ValueError(
+                        f"Unknown checkpoint async_mode {config.async_mode}"
+                    ) from e
+
+                storage_protocols = ()
+                if filesystem.is_remote(effective_folder):
+                    storage_protocols = filesystem.resolve(effective_folder)[0].protocol
+                    if isinstance(storage_protocols, str):
+                        storage_protocols = (storage_protocols,)
+                if "memory" in storage_protocols and (
+                    self.async_mode
+                    == DistributedCheckpointAsyncMode.ASYNC_WITH_PINNED_MEM
+                    or (dist.is_initialized() and dist.get_world_size() > 1)
+                ):
+                    raise UnsupportedCombinationError(
+                        "memory:// checkpoint storage is process-local and cannot be "
+                        "shared by distributed ranks or the async_with_pinned_mem "
+                        "save subprocess. Use a shared local/file://, s3:// or "
+                        "gs:// folder."
+                    )
 
         super().__init__(
             config,
@@ -265,8 +229,6 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         self.staging_future: Future | None = None
         self.save_future: Future | None = None
 
-        # -- retention policy (the values came from the base class) --
-        self.purge_thread: threading.Thread | None = None
         try:
             if dist.is_initialized() and (
                 self.async_mode
@@ -287,18 +249,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             ):
                 self.staging_pg = dist.new_group(backend="gloo")
             with synchronize_local_errors("Checkpoint services construction"):
-                if self.keep_latest_k > 0:
-                    self.purge_queue: queue.Queue[str | None] = queue.Queue()
-                    self.purge_thread = threading.Thread(
-                        target=purge_thread,
-                        args=(self.purge_queue, self._storage.remove),
-                        daemon=True,
-                    )
-                    self.purge_thread.start()
-                logger.info(
-                    "Checkpointing active. Checkpoints will be loaded from and saved "
-                    f"to {self.folder}"
-                )
+                self._start_checkpoint_services()
         except BaseException:
             # Release locally acquired groups and any started thread. Local
             # service errors have already been coordinated above.
@@ -318,19 +269,8 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         # the object as unusable rather than reading attributes that are absent.
         self._initialized = True
 
-    def __del__(self) -> None:
-        self.close()
-
     def _close(self) -> None:
-        releases = []
-        if (
-            hasattr(self, "purge_thread")
-            and self.purge_thread
-            and self.purge_thread.is_alive()
-        ):
-            self.purge_queue.put(None)
-            releases.append(self.purge_thread.join)
-
+        releases = [self._close_purge_worker]
         if self.stager is not None:
 
             def close_stager() -> None:
@@ -428,17 +368,8 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 raise ValueError("sd_adapter is required for to_hf=True")
             if async_mode != DistributedCheckpointAsyncMode.DISABLED:
                 raise ValueError("HF exports require synchronous checkpoint saving")
-            save_hf_checkpoint(
-                getattr(self.sd_adapter, "to_hf_export", self.sd_adapter.to_hf)(
-                    state_dict
-                ),
-                checkpoint_id,
-                getattr(
-                    self.sd_adapter,
-                    "hf_export_fqn_to_index_mapping",
-                    self.sd_adapter.fqn_to_index_mapping,
-                ),
-            )
+            hf_state, indices = prepare_hf_export(self.sd_adapter, state_dict)
+            save_hf_checkpoint(hf_state, checkpoint_id, indices)
             if enable_garbage_collection:
                 with synchronize_local_errors("Checkpoint garbage collection"):
                     GarbageCollection.collect("GC collection invoked by checkpointer.")
@@ -550,38 +481,34 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         if not from_hf:
             # Read only local compatibility records before DCP can write into
             # live model/optimizer tensors, including Kimi layout migrations.
-            with synchronize_local_errors("Checkpoint local preflight preparation"):
-                preflight_states, preflight_destination = prepare_local_state_preflight(
-                    states
-                )
-            validate_local_preflight_selection(preflight_states)
-            if preflight_states:
-                loader_metadata = preflight_destination.get(DATALOADER, {})
-                if "dp_world_size" in loader_metadata:
-                    # Cursor structure depends on DP ownership. Reject degree
-                    # changes before planning rank-specific cursor destinations.
-                    degree = {
-                        DATALOADER: {"dp_world_size": loader_metadata["dp_world_size"]}
-                    }
-                    dcp.load(degree, checkpoint_id=checkpoint_id, process_group=self.pg)
-                    with synchronize_local_errors(
-                        "Checkpoint dataloader preflight validation"
-                    ):
-                        require_same_dp_degree(
-                            degree[DATALOADER]["dp_world_size"],
-                            loader_metadata["dp_world_size"],
+            with local_state_preflight(states) as preflight_destination:
+                if preflight_destination:
+                    loader_metadata = preflight_destination.get(DATALOADER, {})
+                    if "dp_world_size" in loader_metadata:
+                        # Cursor structure depends on DP ownership. Reject degree
+                        # changes before planning rank-specific cursor destinations.
+                        degree = {
+                            DATALOADER: {
+                                "dp_world_size": loader_metadata["dp_world_size"]
+                            }
+                        }
+                        dcp.load(
+                            degree, checkpoint_id=checkpoint_id, process_group=self.pg
                         )
-                preflight_planner = CheckpointLoadPlanner()
-                dcp.load(
-                    preflight_destination,
-                    checkpoint_id=checkpoint_id,
-                    planner=preflight_planner,
-                    process_group=self.pg,
-                )
-                validate_local_state_preflight(
-                    preflight_states,
-                    preflight_destination,
-                )
+                        with synchronize_local_errors(
+                            "Checkpoint dataloader preflight validation"
+                        ):
+                            require_same_dp_degree(
+                                degree[DATALOADER]["dp_world_size"],
+                                loader_metadata["dp_world_size"],
+                            )
+                    preflight_planner = CheckpointLoadPlanner()
+                    dcp.load(
+                        preflight_destination,
+                        checkpoint_id=checkpoint_id,
+                        planner=preflight_planner,
+                        process_group=self.pg,
+                    )
             if load_changed_source_layout(
                 checkpoint_id,
                 states=states,
@@ -596,25 +523,18 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         state_dict = self._flatten_model_state(states)
 
         if from_hf:
-            hf_state_dict = prepare_hf_model_state(
-                self.sd_adapter,
-                state_dict,
-                error_group=getattr(self.sd_adapter, "error_group", None),
-            )
-            with synchronize_local_errors("HF checkpoint reader preparation"):
-                hf_storage_reader = self.sd_adapter.get_hf_storage_reader(checkpoint_id)
-
-            dcp.load(
-                hf_state_dict, storage_reader=hf_storage_reader, process_group=self.pg
-            )
-
-            state_dict = adapt_hf_model_state(
-                self.sd_adapter,
-                states.get(MODEL),
-                hf_state_dict,
-                error_group=getattr(self.sd_adapter, "error_group", None),
-            )
-            states[MODEL].load_state_dict(state_dict)
+            with hf_model_restore(
+                self.sd_adapter, states[MODEL], state_dict
+            ) as hf_state_dict:
+                with synchronize_local_errors("HF checkpoint reader preparation"):
+                    hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
+                        checkpoint_id
+                    )
+                dcp.load(
+                    hf_state_dict,
+                    storage_reader=hf_storage_reader,
+                    process_group=self.pg,
+                )
         else:
             # DCP's Stateful callback order is not an optimizer-before-scheduler
             # contract. Restore the scheduler only after optimizer groups load.
@@ -657,16 +577,9 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             if MODEL in states:
                 states[MODEL].load_state_dict(state_dict)
 
-        # Reseed EMA from the just-loaded weights if it wasn't itself restored
-        # (excluded via exclude_from_loading, or a model_only load -- which is
-        # also how EMA gets turned on mid-run against a checkpoint that
-        # predates it). MODEL is never excludable, so its presence means model
-        # weights were actually restored to reseed from.
-        with synchronize_local_errors("Checkpoint EMA cold start"):
-            if MODEL in states and EMA in self.states and EMA not in states:
-                self.states[EMA].reset_from_model()
-        if not from_hf:
-            restore_rng_state(states, state_dict)
+        finish_checkpoint_restore(
+            self.states, states, state_dict, restore_rng=not from_hf
+        )
 
     def _save(
         self, curr_step: int, last_step: bool = False, *, should_save: bool
@@ -684,9 +597,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
         if not should_save:
             return False
 
-        self._wait_for_pending_save()
-        with synchronize_local_errors("Checkpoint retention preflight"):
-            self._purge_stale_checkpoints(saving_step=curr_step)
+        retention = self._prepare_save(curr_step)
 
         begin = time.monotonic()
         checkpoint_phase = (
@@ -703,7 +614,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                 time.monotonic() - begin
             )
             with synchronize_local_errors("Checkpoint completed retention"):
-                self._purge_stale_checkpoints(saving_step=curr_step, completed=True)
+                self._purge_stale_checkpoints(**retention, completed=True)
             with synchronize_local_errors("Checkpoint save final reporting"):
                 logger.info(
                     f"Last step checkpoint completed in {time.monotonic() - begin:.2f}s"
@@ -790,7 +701,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
                     )
                 # Own the live worker before any fallible post-launch cleanup.
                 self.save_future = result
-                self._pending_retention = {"saving_step": curr_step}
+                self._pending_retention = retention
                 with synchronize_local_errors("Checkpoint garbage collection"):
                     GarbageCollection.collect("GC collection invoked by checkpointer.")
 
@@ -807,7 +718,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             )
 
         if async_save_started_at is not None:
-            self._pending_retention = {"saving_step": curr_step}
+            self._pending_retention = retention
             # Submission may return before staging finishes. Report upload
             # completion separately from the foreground save call.
             assert self.save_future is not None
@@ -841,7 +752,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
 
         if async_save_started_at is None:
             with synchronize_local_errors("Checkpoint completed retention"):
-                self._purge_stale_checkpoints(saving_step=curr_step, completed=True)
+                self._purge_stale_checkpoints(**retention, completed=True)
         with synchronize_local_errors("Checkpoint save completion reporting"):
             logger.info(
                 f"Finished {checkpoint_phase} the checkpoint in "
@@ -960,23 +871,7 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             )
 
         if self.last_save_model_only:
-            states = self.states[MODEL].state_dict()
-
-            # state_dict above may communicate; conversion and reporting are
-            # local and must succeed on every rank before writer construction.
-            with synchronize_local_errors("Checkpoint final model preparation"):
-                states = {
-                    k: v.to(self.export_dtype)
-                    if isinstance(v, torch.Tensor)
-                    and v.is_floating_point()
-                    and v.dtype != self.export_dtype
-                    else v
-                    for k, v in states.items()
-                }
-                logger.info(
-                    f"Saving a model only checkpoint in {self.export_dtype} "
-                    f"at last step, step {curr_step}."
-                )
+            states = self._prepare_final_model_state(curr_step)
         else:
             with synchronize_local_errors("Checkpoint final state reporting"):
                 logger.info(f"Saving a full checkpoint at last step, step {curr_step}.")

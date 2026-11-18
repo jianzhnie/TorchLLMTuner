@@ -13,12 +13,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 import torch
 from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import FSDPModule
 
 from ...accelerator.collectives import synchronize_local_errors
 from ...components.checkpointer.backends.distributed_checkpoint import (
@@ -47,7 +46,10 @@ from ...components.optimizer.optimizer import OptimizersContainer
 from ...components.optimizer.state_residency import validate_checkpoint_configuration
 from ...components.profiler import Profiler
 from ...errors import UnsupportedCombinationError
-from ...memory.materialization import materialize_meta_model
+from ...memory.materialization import (
+    materialize_meta_model,
+    model_materialization_buffers,
+)
 from ...models.common.aux_loss import register_aux_loss_metrics_hook
 from ...models.common.moe.bias_update import (
     register_moe_balancing_hook,
@@ -62,6 +64,7 @@ from ...models.registry import resolve_state_format
 from ...parallel import compatibility
 from ...parallel.assembly import ModelPartLayout, validate_model_part_layouts
 from ...parallel.execution import ExecutionLayout
+from ...parallel.fully_shard_parallel.policies import fsdp_managed_parameters
 from ...parallel.parallelize import parallelize_model
 from ...utils import logging as logging_utils
 from .builders import TrainingBuilders
@@ -73,6 +76,7 @@ if TYPE_CHECKING:
 
     from ...config.llmtuner_config import LLMTunerConfig
     from ...config.observability_config import ProfilerConfig
+    from ...config.training_config import TrainingConfig
     from ...datasets.contracts import BaseDataLoader
     from ...parallel.topology import ParallelTopology
     from .builders import ProfilerFactory, ProfilerOwner
@@ -217,7 +221,9 @@ def build_model(
         )
     model_class = resolve_model_class(text_config)
     validate_runtime = getattr(model_class, "validate_runtime", None)
-    if callable(validate_runtime):
+    if validate_runtime is not None:
+        if not callable(validate_runtime):
+            raise TypeError(f"{model_class.__name__}.validate_runtime must be callable")
         validate_runtime(text_config, device)
     if initialize_from_meta:
         for method in ("initialize_parameters", "materialization_buffers"):
@@ -231,38 +237,14 @@ def build_model(
     else:
         model = model_class(text_config).to(device)
         initialize_buffers = getattr(model, "initialize_training_buffers", None)
-        if callable(initialize_buffers):
+        if initialize_buffers is not None:
+            if not callable(initialize_buffers):
+                raise TypeError(
+                    f"{type(model).__name__}.initialize_training_buffers "
+                    "must be callable"
+                )
             initialize_buffers()
     return model, model_config, load_initial_weights
-
-
-def _fsdp_managed_parameters(model: torch.nn.Module) -> set[torch.nn.Parameter]:
-    return {
-        fsdp_param.sharded_param
-        for module in model.modules()
-        if isinstance(module, FSDPModule)
-        for group in module._get_fsdp_state()._fsdp_param_groups
-        for fsdp_param in group.fsdp_params
-    }
-
-
-def _model_materialization_buffers(
-    model: torch.nn.Module, device: torch.device
-) -> dict[tuple[torch.nn.Module, str], torch.Tensor]:
-    """Ask the explicit model to rebuild non-checkpoint buffers.
-
-    Buffer reconstruction is a model contract. Keeping this adapter here makes
-    older explicit models fail at materialization with a useful error instead
-    of allowing uninitialized runtime state into training.
-    """
-    builder = getattr(model, "materialization_buffers", None)
-    if builder is None:
-        return {}
-    if not callable(builder):
-        raise TypeError(
-            f"{type(model).__name__}.materialization_buffers must be callable"
-        )
-    return builder(device)
 
 
 def _apply_parallelism(
@@ -312,9 +294,9 @@ def _apply_parallelism(
                 device,
                 parameter_device=parameter_device,
                 offloaded_parameters=(
-                    _fsdp_managed_parameters(orchestration) if cpu_offload else None
+                    fsdp_managed_parameters(orchestration) if cpu_offload else None
                 ),
-                runtime_buffers=_model_materialization_buffers(orchestration, device),
+                runtime_buffers=model_materialization_buffers(orchestration, device),
             )
         except BaseException as error:
             materialization_error = error
@@ -395,10 +377,18 @@ def prepare_parallel_model(
     )
 
 
+class _LossConfiguration(Protocol):
+    @property
+    def training(self) -> TrainingConfig: ...
+
+
+_LossConfigT = TypeVar("_LossConfigT", bound=_LossConfiguration)
+
+
 def build_loss_functions(
-    cfg: LLMTunerConfig,
+    cfg: _LossConfigT,
     *,
-    factory: Callable[[LLMTunerConfig], LossFunctions] | None = None,
+    factory: Callable[[_LossConfigT], LossFunctions] | None = None,
     error_group: ProcessGroup | None = None,
 ) -> LossFunctions:
     """Select and validate the configured loss service."""

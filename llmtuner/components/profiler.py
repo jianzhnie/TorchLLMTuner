@@ -248,6 +248,7 @@ class Profiler:
         self._base_folder = base_folder
         self.torch_profiler: torch.profiler.profile | None = None
         self.memory_profiler: MemoryProfiler | None = None
+        self._trace_error: BaseException | None = None
         self._entered = False
         self._used = False
 
@@ -308,6 +309,9 @@ class Profiler:
                     logger.exception("Failed to stop allocator memory history")
                 except BaseException:
                     pass  # Preserve the primary error and continue resource cleanup.
+        trace_error, self._trace_error = self._trace_error, None
+        if first_error is None:
+            first_error = trace_error
         if exc_val is None and first_error is not None:
             raise first_error
         return False
@@ -320,6 +324,9 @@ class Profiler:
         """Advance every active profiler by one training iteration."""
         if self.torch_profiler is not None:
             self.torch_profiler.step()
+        if self._trace_error is not None:
+            error, self._trace_error = self._trace_error, None
+            raise error
         if self.memory_profiler is not None:
             self.memory_profiler.step()
 
@@ -340,9 +347,12 @@ class Profiler:
         rank = get_distributed_rank()
         start_step = self._global_step
         last_trace_step: int | None = None
+        raw_trace_handler = None
 
-        def trace_handler(prof):
+        def export_trace(prof):
             nonlocal last_trace_step
+            if raw_trace_handler is not None:
+                raw_trace_handler(prof)
             global_step = start_step + prof.step_num
             directory_name = PROFILE_ITER_DIR.format(step=global_step)
             if global_step == last_trace_step:
@@ -363,6 +373,16 @@ class Profiler:
                 "Finished dumping profiler traces in %.2f seconds",
                 time.monotonic() - begin,
             )
+
+        def trace_handler(prof):
+            # Let the native profiler finish its state transition before an
+            # export failure escapes. Retrying stop after an interrupted trace
+            # callback can stop an already stopped native recording twice.
+            try:
+                export_trace(prof)
+            except BaseException as error:
+                if self._trace_error is None:
+                    self._trace_error = error
 
         logger.info("Profiling active. Traces will be saved at %s", trace_dir)
         os.makedirs(trace_dir, exist_ok=True)
@@ -404,10 +424,6 @@ class Profiler:
             raw_trace_handler = profiler_api.tensorboard_trace_handler(
                 os.path.join(trace_dir, "raw"), analyse_flag=False
             )
-
-            def on_trace_ready(prof):
-                raw_trace_handler(prof)
-                trace_handler(prof)
 
         activities = profiler_activities(profiler_api)
 

@@ -393,17 +393,21 @@ class DeepseekV4Model(HFDeepseekV4Model):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
-        # Preserve the native distinction between internal attention state and
-        # the caller-owned cache returned by this invocation.
+        # Uncached training must not capture mutable KV/compressor state in
+        # activation-checkpoint inputs: backward replays the same layer call.
         return_cache = past_key_values if use_cache else None
-        if past_key_values is None:
+        if past_key_values is None and use_cache:
             past_key_values = DynamicCache(config=self.config)
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         if position_ids is None:
             position_ids = (
                 torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
-                + past_key_values.get_seq_length()
+                + (
+                    past_key_values.get_seq_length()
+                    if past_key_values is not None
+                    else 0
+                )
             ).unsqueeze(0)
         if isinstance(attention_mask, dict):
             causal_mask = next(iter(attention_mask.values()))

@@ -1,4 +1,4 @@
-"""Instance-scoped NPU metadata communication for torch_checkpointing."""
+"""Instance-scoped metadata communication for non-CUDA checkpoint backends."""
 
 from __future__ import annotations
 
@@ -52,8 +52,9 @@ def _gather_pickled_metadata(
     return result
 
 
-def adapt_npu_metadata_gather(manager: Any) -> bool:
-    if not dist.is_initialized() or get_comm_device().type != "npu":
+def adapt_metadata_gather(manager: Any) -> bool:
+    # Upstream hard-codes CUDA buffers even for CPU/Gloo checkpoints.
+    if not dist.is_initialized() or get_comm_device().type == "cuda":
         return False
     if DefaultMetadataManager is None:
         raise ImportError(
@@ -64,5 +65,5 @@ def adapt_npu_metadata_gather(manager: Any) -> bool:
     if type(metadata) is not DefaultMetadataManager:
         return False
     metadata._all_gather_pickled_data = MethodType(_gather_pickled_metadata, metadata)
-    logger.info("Applied instance-scoped NPU metadata gather")
+    logger.info("Applied instance-scoped device-aware metadata gather")
     return True

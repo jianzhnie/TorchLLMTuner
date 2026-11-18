@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
 from ...accelerator.collectives import synchronize_local_errors
@@ -422,14 +423,27 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
             group_impl_kwargs = (
                 {} if param_group_config.optimizer_name == "DistMuon" else impl_kwargs
             )
-            optimizer_groups.param_groups.append(
-                {
-                    "params": params,
-                    "param_names": param_names,
-                    **group_impl_kwargs,
-                    **param_group_config.optimizer_kwargs,
-                }
-            )
+            group = {
+                "params": params,
+                "param_names": param_names,
+                **group_impl_kwargs,
+                **param_group_config.optimizer_kwargs,
+            }
+            if (
+                param_group_config.optimizer_name in {"Adam", "AdamW"}
+                and group.get("fused")
+                and 0
+                < sum(isinstance(param, DTensor) for param in params)
+                < len(params)
+            ):
+                # Fused dispatch cannot mix Tensor and DTensor operands. Preserve
+                # group identity/order for schedulers and checkpoint recovery.
+                group.update(fused=False, foreach=False)
+                logger.info(
+                    "Mixed Tensor/DTensor optimizer group %s uses for-loop Adam.",
+                    param_group_config.pattern,
+                )
+            optimizer_groups.param_groups.append(group)
             optimizer_groups.patterns.append(param_group_config.pattern)
             optimizer_groups.config_indices.append(config_index)
 

@@ -6,6 +6,20 @@ import torch
 from torch import nn
 
 
+def model_materialization_buffers(
+    model: nn.Module, device: torch.device
+) -> dict[tuple[nn.Module, str], torch.Tensor]:
+    """Ask the model for runtime buffers; materialization validates ownership."""
+    builder = getattr(model, "materialization_buffers", None)
+    if builder is None:
+        return {}
+    if not callable(builder):
+        raise TypeError(
+            f"{type(model).__name__}.materialization_buffers must be callable"
+        )
+    return builder(device)
+
+
 def materialize_meta_model(
     model: nn.Module,
     device: torch.device,

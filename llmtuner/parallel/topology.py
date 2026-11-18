@@ -33,6 +33,35 @@ __all__ = [
 ]
 
 
+def _unflatten_mesh(
+    world_mesh: DeviceMesh,
+    dim_names: tuple[str, ...],
+    dim_sizes: tuple[int, ...],
+    *,
+    device_type: str,
+) -> DeviceMesh:
+    """Unflatten the world mesh to create the required mesh dimensions.
+
+    Keep all axes backed by usable process groups so mesh slicing works
+    consistently across PyTorch versions and parallel combinations.
+    """
+    # ``DeviceMesh._unflatten`` is private and only present from torch
+    # 2.12 on. On older builds (torch 2.9, the Ascend/torch_npu stack)
+    # rebuild the identical row-major n-D layout over the same world
+    # ranks with the public ``init_device_mesh``. Each view then carries
+    # its own process groups instead of sharing the world mesh's, which
+    # matches the "DeviceMesh recreates process groups for each view"
+    # behaviour already relied on above.
+    unflatten = getattr(world_mesh, "_unflatten", None)
+    if unflatten is not None:
+        return unflatten(
+            0,
+            dim_sizes,
+            dim_names,
+        )
+    return init_device_mesh(device_type, dim_sizes, mesh_dim_names=dim_names)
+
+
 @dataclass(frozen=True, slots=True)
 class ParallelTopologySnapshot:
     """Resolved degrees without process-group ownership or mutable mesh caches."""
@@ -170,7 +199,7 @@ class ParallelTopology:
         if name == "dp_shard":
             # Keep the DP storage axis alive at size 1 so ``fully_shard`` can
             # install MixedPrecisionPolicy and discriminate the DP submesh on
-            # TP/DDP/PP-only.
+            # TP-only or DDP-only runs.
             return True
         if name == "efsdp":
             # We always keep the efsdp if EP is larger than 1 because we need
@@ -223,32 +252,6 @@ class ParallelTopology:
         if self._world_mesh is not None:
             return self._world_mesh
 
-        def unflatten_mesh(
-            world_mesh: DeviceMesh,
-            dim_names: tuple[str, ...],
-            dim_sizes: tuple[int, ...],
-        ) -> DeviceMesh:
-            """Unflatten the world mesh to create the required mesh dimensions.
-
-            Keep all axes backed by usable process groups so mesh slicing works
-            consistently across PyTorch versions and parallel combinations.
-            """
-            # ``DeviceMesh._unflatten`` is private and only present from torch
-            # 2.12 on. On older builds (torch 2.9, the Ascend/torch_npu stack)
-            # rebuild the identical row-major n-D layout over the same world
-            # ranks with the public ``init_device_mesh``. Each view then carries
-            # its own process groups instead of sharing the world mesh's, which
-            # matches the "DeviceMesh recreates process groups for each view"
-            # behaviour already relied on above.
-            unflatten = getattr(world_mesh, "_unflatten", None)
-            if unflatten is not None:
-                return unflatten(
-                    0,
-                    dim_sizes,
-                    dim_names,
-                )
-            return init_device_mesh(device_type, dim_sizes, mesh_dim_names=dim_names)
-
         logger.info(
             f"Building device mesh with parallelism: "
             f"dp_replicate={self.dp_replicate}, "
@@ -262,10 +265,11 @@ class ParallelTopology:
         world_mesh = init_device_mesh(
             device_type, (self.world_size,), mesh_dim_names=("world",)
         )
-        dataloading_mesh = unflatten_mesh(
+        dataloading_mesh = _unflatten_mesh(
             world_mesh,
             ("batch", "cp", "tp"),
             (batch, self.cp, self.tp),
+            device_type=device_type,
         )
         loss_mesh = dataloading_mesh["batch", "cp", "tp"]._flatten("loss_mesh")
         # Two mesh views over the same devices:
@@ -274,22 +278,25 @@ class ParallelTopology:
         # fully_shard() so FSDP can shard parameters along dp_shard.
         # spmd_dense_mesh_for_fwdbwd (dp, cp, tp) is used for forward/backward
         # typechecking, with dp folding dp_replicate * dp_shard into one axis.
-        full_dense_mesh_for_fsdp = unflatten_mesh(
+        full_dense_mesh_for_fsdp = _unflatten_mesh(
             world_mesh,
             ("dp_replicate", "dp_shard", "cp", "tp"),
             (self.dp_replicate, self.dp_shard, self.cp, self.tp),
+            device_type=device_type,
         )
-        full_dense_mesh_for_fwdbwd = unflatten_mesh(
+        full_dense_mesh_for_fwdbwd = _unflatten_mesh(
             world_mesh,
             ("dp", "cp", "tp"),
             (batch, self.cp, self.tp),
+            device_type=device_type,
         )
         spmd_dense_mesh_for_fwdbwd = full_dense_mesh_for_fwdbwd["dp", "cp", "tp"]
 
-        full_sparse_mesh = unflatten_mesh(
+        full_sparse_mesh = _unflatten_mesh(
             world_mesh,
             ("dp_replicate", "efsdp", "ep"),
             (self.dp_replicate, efsdp, self.ep),
+            device_type=device_type,
         )
 
         global_meshes = {
@@ -313,10 +320,11 @@ class ParallelTopology:
             "efsdp": full_sparse_mesh["efsdp"],
         }
         if self.cp_kv * self.cp_ulysses == self.cp and self.cp > 1:
-            cp_axes_mesh = unflatten_mesh(
+            cp_axes_mesh = _unflatten_mesh(
                 world_mesh,
                 ("batch", "cp_kv", "cp_ulysses", "tp"),
                 (batch, self.cp_kv, self.cp_ulysses, self.tp),
+                device_type=device_type,
             )
             single_axis_meshes["cp_kv"] = cp_axes_mesh["cp_kv"]
             single_axis_meshes["cp_ulysses"] = cp_axes_mesh["cp_ulysses"]

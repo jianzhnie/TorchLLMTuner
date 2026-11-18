@@ -64,8 +64,9 @@ def build_step_metrics(
     loss_sum = accumulated_loss / global_valid_tokens
 
     if loss_mesh is not None:
-        local_loss_sum = accumulated_loss.clone()
+        local_loss_sum = accumulated_loss
         if sequence_mesh is not None:
+            local_loss_sum = accumulated_loss.clone()
             all_reduce(local_loss_sum, group=sequence_mesh.get_group())
         local_max = (
             local_loss_sum / local_valid_tokens

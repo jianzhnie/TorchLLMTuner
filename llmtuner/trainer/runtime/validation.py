@@ -23,7 +23,11 @@ from llmtuner.parallel.compatibility import (
 from llmtuner.utils.logging import get_logger
 from llmtuner.utils.seeding import preserve_rng_state
 
-from ...accelerator.collectives import all_reduce, synchronize_local_errors
+from ...accelerator.collectives import (
+    all_reduce,
+    synchronize_after_wait,
+    synchronize_local_errors,
+)
 from ...datasets.contracts import (
     BaseDataLoader,
     Batch,
@@ -252,17 +256,9 @@ def validate(
 
     # Validation follows save() in the training loop. Eval forward can still
     # mutate state (for example embedding max_norm); finish the snapshot first.
-    staging_failure: BaseException | None = None
-    try:
-        if wait_for_staging is not None:
-            wait_for_staging()
-    except BaseException as error:
-        staging_failure = error
-    with synchronize_local_errors(
-        "Validation checkpoint staging", group=engine.error_group
-    ):
-        if staging_failure is not None:
-            raise staging_failure
+    synchronize_after_wait(
+        wait_for_staging, "Validation checkpoint staging", group=engine.error_group
+    )
 
     model_contexts = ExitStack()
     with ExitStack() as resources:

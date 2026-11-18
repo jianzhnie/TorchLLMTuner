@@ -6,7 +6,6 @@ same-layout recovery keeps the sharded DCP path and its memory behavior.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -32,7 +31,7 @@ from .checkpoint_keys import (
     TRAIN_STATE,
 )
 from .state_adaptation import (
-    restore_categories_before_rng,
+    restore_checkpoint_callbacks,
     restore_rng_state,
     select_local_preflight_states,
     validate_local_preflight_selection,
@@ -234,17 +233,9 @@ def load_changed_source_layout(
     for category in (OPTIMIZER, EMA):
         if category in states:
             loaded[category] = place(loaded[category], templates[category])
-    for category in restore_categories_before_rng(states):
-        # Only built-in metadata callbacks are local. Model, optimizer, EMA
-        # and custom states may communicate and keep their own boundaries.
-        with (
-            synchronize_local_errors(f"{name} checkpoint {category} restoration")
-            if category in (LR_SCHEDULER, DATALOADER, TRAIN_STATE)
-            else nullcontext()
-        ):
-            states[category].load_state_dict(
-                model if category == MODEL else loaded[category]
-            )
+    restore_checkpoint_callbacks(
+        states, {**loaded, MODEL: model}, phase_prefix=f"{name} checkpoint"
+    )
     with synchronize_local_errors("Checkpoint EMA cold start"):
         if ema_to_reset is not None:
             ema_to_reset.reset_from_model()

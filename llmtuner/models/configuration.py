@@ -242,12 +242,19 @@ def unwrap_text_config(config: Any) -> Any:
 
 
 def resolve_model_class(config: Any) -> type[nn.Module]:
-    """Resolve a registered local implementation without an external fallback."""
-    specification = get_model_spec(config.model_type)
+    """Resolve the Trainer's causal language model, without external fallback."""
+    specification = get_model_spec(config.model_type, task=None)
     if specification is None:
         raise ValueError(
             f"No local model registered for {config.model_type!r}; "
             "register an explicit implementation before training. "
             "Automatic Transformers model fallback is disabled."
+        )
+    if specification.task != "causal_lm":
+        raise ValueError(
+            f"Trainer requires task='causal_lm', but {config.model_type!r} is "
+            f"registered for task={specification.task!r}. "
+            "Conditional model registration does not provide a multimodal "
+            "Trainer data or execution contract."
         )
     return specification.resolve_model_class()

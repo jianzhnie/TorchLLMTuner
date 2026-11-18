@@ -102,8 +102,12 @@ class ModelPartLayout:
             names.setdefault(parameter, name)
         return MappingProxyType(names)
 
-    def validate(self, model: nn.Module) -> None:
-        """Reject stale execution declarations, identities and alias ordering."""
+    def validate(self, model: nn.Module) -> Mapping[str, str]:
+        """Validate ownership and return its unambiguous model-state names.
+
+        The returned mapping belongs to this validation pass, not a cache: a
+        later refresh or parameter replacement requires validation again.
+        """
         if self.topology is not None and not isinstance(
             self.topology, ParallelTopologySnapshot
         ):
@@ -137,7 +141,7 @@ class ModelPartLayout:
             raise ValueError("Model layout replacement target is no longer registered")
         # Every state consumer relies on an unambiguous wrapper-free name,
         # including consumers which only validate ownership before construction.
-        _ = self.state_parameter_names
+        return self.state_parameter_names
 
     def snapshot(self) -> ModelPartLayoutSnapshot:
         """Bind a state consumer to final parameters and execution metadata."""
@@ -210,7 +214,7 @@ def validate_model_part_layouts(
     parameter_owners: dict[nn.Parameter, int] = {}
     name_owners: dict[str, int] = {}
     for index, (model, layout) in enumerate(zip(model_parts, layouts, strict=True)):
-        layout.validate(model)
+        state_names = layout.validate(model)
         for parameter in dict.fromkeys(layout.parameter_bindings.values()):
             previous = parameter_owners.setdefault(parameter, index)
             if previous != index:
@@ -218,7 +222,7 @@ def validate_model_part_layouts(
                     f"Parameter ownership overlaps across model parts {previous} "
                     f"and {index}; cross-part shared parameters are unsupported"
                 )
-        for name in layout.state_parameter_names.values():
+        for name in state_names.values():
             previous = name_owners.setdefault(name, index)
             if previous != index:
                 raise ValueError(

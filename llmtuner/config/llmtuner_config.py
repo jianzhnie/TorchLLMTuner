@@ -129,7 +129,7 @@ class LLMTunerConfig:
             checkpoint = self.training.checkpoint_config
             # Host-local moments cannot enter HCCL full-tensor gather. The
             # existing chunked adapters preserve local ownership without data
-            # collectives; PP/CP and async modes impose no swap-specific ban.
+            # collectives; CP and async modes impose no swap-specific ban.
             if checkpoint.enable:
                 for degree, sharded, flag in (
                     (

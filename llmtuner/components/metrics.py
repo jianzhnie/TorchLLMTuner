@@ -281,7 +281,6 @@ class MetricsProcessor:
         self.parallel_dims = parallel_dims
         self.logger = self._build_metric_logger(
             config=config,
-            parallel_dims=parallel_dims,
             dump_folder=dump_folder,
             config_dict=config_dict,
             tag=config.tag if tag is None else tag,
@@ -362,10 +361,10 @@ class MetricsProcessor:
         self,
         *,
         config: MetricsConfig,
-        parallel_dims: ParallelTopology | None,
         dump_folder: str,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
+        metrics_rank: int = 0,
     ) -> metric_loggers.BaseLogger:
         """Build the sink this rank should write to.
 
@@ -375,13 +374,8 @@ class MetricsProcessor:
         if not (config.enable_tensorboard or config.enable_wandb):
             return metric_loggers.BaseLogger()
 
-        if not config.save_for_all_ranks:
-            if parallel_dims is None:
-                metrics_rank = 0
-            else:
-                metrics_rank = 0
-            if get_distributed_rank() != metrics_rank:
-                return metric_loggers.BaseLogger()
+        if not config.save_for_all_ranks and get_distributed_rank() != metrics_rank:
+            return metric_loggers.BaseLogger()
 
         base_log_dir = os.path.join(
             dump_folder,

@@ -262,9 +262,7 @@ def _validate_compressor_configuration(
             "DeepSeek V4 Compressor CP currently requires strategy='ulysses'"
         )
     if cfg.tp_size != 1:
-        raise ValueError(
-            "DeepSeek V4 Compressor CP TP/PP composition is not implemented"
-        )
+        raise ValueError("DeepSeek V4 Compressor CP with TP is not implemented")
     if cfg.cp_config.context_parallel_load_balancer is not None:
         raise ValueError(
             "Compressor CP requires contiguous shards with no load balancer"

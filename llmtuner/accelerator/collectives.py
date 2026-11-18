@@ -31,7 +31,7 @@ The single non-obvious line kept from upstream is the ``DTensor`` branch in
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 
@@ -639,6 +639,29 @@ def synchronize_local_errors(
         if error is not None:
             raise error
         raise RuntimeError(f"{phase} failed on another rank")
+
+
+def synchronize_after_wait(
+    wait: Callable[[], None] | None,
+    phase: str,
+    *,
+    group: dist.ProcessGroup | None = None,
+) -> None:
+    """Finish background work before agreeing whether peers may continue.
+
+    Every group member must enter. Waiting may communicate and stays outside
+    the local-only error boundary. This cannot recover a blocked or dead peer.
+    A missing optional wait still participates in error coordination.
+    """
+    failure: BaseException | None = None
+    try:
+        if wait is not None:
+            wait()
+    except BaseException as error:
+        failure = error
+    with synchronize_local_errors(phase, group=group):
+        if failure is not None:
+            raise failure
 
 
 class PartialToInvariantAllReduce(torch.autograd.Function):

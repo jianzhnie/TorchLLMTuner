@@ -43,6 +43,16 @@ def disable_fsdp_gradient_division(model: nn.Module) -> None:
         module.set_gradient_divide_factor(1.0)
 
 
+def fsdp_managed_parameters(model: nn.Module) -> set[nn.Parameter]:
+    """Return final parameter ownership across FSDP units and shared groups."""
+    return {
+        parameter.sharded_param
+        for module in iter_fsdp_modules(model)
+        for group in module._get_fsdp_state()._fsdp_param_groups
+        for parameter in group.fsdp_params
+    }
+
+
 def fsdp_shard_size(dp_mesh: DeviceMesh) -> int:
     """How many ranks FSDP shards a parameter's dim 0 over, on ``dp_mesh``.
 

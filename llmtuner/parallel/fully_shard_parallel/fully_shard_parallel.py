@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch._dynamo.eval_frame import OptimizedModule
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
@@ -263,10 +264,13 @@ def apply_fsdp_to_decoder(
         else nullcontext()
     ):
         strategy = get_fsdp_strategy(fsdp_implementation)
-        structure = getattr(model, "decoder_structure", None)
+        declaration_owner = model
+        while isinstance(declaration_owner, OptimizedModule):
+            declaration_owner = declaration_owner._orig_mod
+        structure = getattr(declaration_owner, "decoder_structure", None)
         if not isinstance(structure, DecoderStructure):
             raise TypeError("Decoder FSDP requires a model-owned DecoderStructure")
-        decoder = structure.bind(model)
+        decoder = structure.bind(declaration_owner)
         all_modules = tuple(model.modules())
         if root_owned_boundaries and (
             fsdp_implementation != "native" or cpu_offload or ep_degree > 1

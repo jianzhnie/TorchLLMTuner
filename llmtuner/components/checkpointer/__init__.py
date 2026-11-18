@@ -1,63 +1,25 @@
-"""Checkpointing: the manager contract, and the backends that implement it.
+"""Checkpoint managers and intentional lazy public exports.
 
-Ported from torchtitan's ``components/checkpointer/``. Four packages:
+core owns checkpoint policy and state adaptation; backends own byte IO and
+backend resources; storage supplies paths, planners and staging; hf supplies
+safetensors publication and expert storage. Model format rules remain owned by
+models, and parallel state conversion remains owned by parallel.
 
-* ``core`` -- manager contracts, state keys and state adaptation. ``core.base``
-  owns retention, step discovery, async draining and load selection without
-  knowing how bytes are written.
-* ``backends`` -- the DCP and optional torch-checkpointing managers. DCP shards
-  under FSDP, saves asynchronously and loads in place. The optional backend
-  defers its package imports and raises an install hint when constructed.
-* ``storage`` -- filesystem paths, DCP readers/writers, planners and staging.
-* ``hf`` -- Hugging Face storage and model-specific expert layouts.
+Training state is registered under core.checkpoint_keys: model, optimizer,
+lr_scheduler, dataloader, train_state, optional ema, rng_state and format metadata.
+ModelCheckpointState wraps final local model ownership. Optimizer and EMA state
+use FQN keys; scheduler and data state preserve progress across resume. Excluded
+EMA cold-starts from loaded weights; RNG restores after other callbacks.
 
-``core.model_state`` adapts model parts to the checkpoint state interface.
-``storage.storage`` defines the path-operation contract;
-``storage.filesystem`` provides the filesystem adapter.
-Model name normalization lives in ``utils/module_names.py``.
-
-State keys. A checkpoint uses the names defined in ``core.checkpoint_keys``: ``model``,
-``optimizer``, ``lr_scheduler``, ``dataloader``, ``train_state``, ``ema``.
-llmtuner fills in the first two plus whatever the caller passes in ``states``:
-
-* ``model`` -- a ``ModelCheckpointState`` over the model chunks.
-* ``optimizer`` -- the ``OptimizersContainer`` itself, passed through. It is
-  already a ``Stateful`` whose state dict is flat and FQN-keyed, which is what
-  DCP needs to reshard a pipeline checkpoint, and it materializes a fresh
-  optimizer's Adam moments before DCP plans a load.
-* ``train_state`` -- the run's ``TrainingProgress`` object, exposing ``step``
-  and ``ntokens_seen`` through ``state_dict``/``load_state_dict``. Trainer's
-  public counter attributes delegate to this same object, so loading updates
-  the live run without the checkpointer retaining the entire Trainer.
-* ``lr_scheduler`` -- the ``LRSchedulersContainer`` from
-  ``components/optimizer/lr_scheduler.py``, always registered. It holds one
-  integer, ``last_epoch``, that nothing else in the checkpoint carries: the
-  optimizer restores group ``initial_lr`` values and the saved ``lr``, but
-  the step count is the scheduler's own, and a resumed run's fresh scheduler
-  starts it at 0. Without it the curve restarts on the step after a resume --
-  invisible while the lr is constant, wrong for the rest of the run once warmup
-  or decay is set.
-* ``dataloader`` -- the ``BaseDataLoader``, registered only when it is loadable.
-  Both synthetic and Grain loaders support cursor restoration.
-* ``ema`` -- the ``EMA`` pseudo-optimizer from
-  ``components/optimizer/ema.py``, registered only when the run configures one
-  (``training.ema_config``). Its state dict is the same flat, FQN-keyed layout
-  as optimizer state. A load that restores the model but not this key -- an
-  ``exclude_from_loading=["ema"]`` load, or any model-only load -- cold-starts
-  the average from the just-loaded weights (see
-  ``backends.distributed_checkpoint.DistributedCheckpointManager``).
-"""
+Exports stay lazy so configuration can import dependency-free state keys without
+loading torch.distributed or optional checkpoint backends."""
 
 from importlib import import_module
 
 from ...utils.lazy_exports import resolve_export
 
-# Lazy (PEP 562): ``core.checkpoint_keys`` / ``storage.filesystem`` are lightweight
-# are read by ``llmtuner/config``, which must stay importable without the
-# torch.distributed surface ``core.base``/``backends.distributed_checkpoint`` pulls in
-# (DTensor and friends are absent on older torch). Eager re-exports would make
-# any submodule import pay
-# for the backends.
+# Configuration imports only dependency-free state keys. Keep package exports
+# lazy so importing those keys does not load distributed or optional backends.
 _EXPORT_SOURCES = {
     "BaseCheckpointManager": "core.base",
     "CheckpointStorage": "storage.storage",

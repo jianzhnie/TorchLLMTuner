@@ -156,6 +156,9 @@ class LoggerContainer(BaseLogger):
                 if first_error is None:
                     first_error = error
                 else:
-                    logger.exception("Additional metrics logger cleanup failure")
+                    try:
+                        logger.exception("Additional metrics logger cleanup failure")
+                    except BaseException:
+                        pass  # Keep draining sinks and preserve the first failure.
         if first_error is not None:
             raise first_error
