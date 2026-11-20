@@ -17,7 +17,7 @@ from weakref import WeakSet
 import torch
 
 from experiments.pipeline_parallel.capabilities import (
-    has as capability,
+    has_microbatch_drivers,
 )
 from llmtuner.components.loss_contract import validate_normalization_tokens
 from llmtuner.errors import EnvironmentUnsupportedError
@@ -99,7 +99,7 @@ def validate_pipeline_schedule(schedule: Any, stages: list[Any]) -> None:
     if getattr(schedule, "_has_backward", None) is not True:
         raise ValueError("Training pipeline schedule must enable backward")
     methods = ["_step_microbatches"]
-    if capability("pipelining_microbatch_drivers"):
+    if has_microbatch_drivers():
         methods.append("eval")
     for name in methods:
         if not callable(getattr(schedule, name, None)):
@@ -147,7 +147,7 @@ def run_microbatches(
             stage.has_backward = schedule._has_backward
             stage.clear_runtime_states()
         bind_stage_rng(schedule)
-        if capability("pipelining_microbatch_drivers"):
+        if has_microbatch_drivers():
             schedule._step_microbatches(
                 args, kwargs, targets, losses, return_outputs=False
             )
@@ -175,7 +175,7 @@ def run_eval_microbatches(
         stage_modes = [stage.has_backward for stage in stages]
         previous = schedule._has_backward
         try:
-            if capability("pipelining_microbatch_drivers"):
+            if has_microbatch_drivers():
                 schedule.eval(
                     arg_mbs=args, kwarg_mbs=kwargs, target_mbs=targets, losses=losses
                 )

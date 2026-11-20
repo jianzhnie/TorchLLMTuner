@@ -12,6 +12,16 @@ from typing import TYPE_CHECKING
 
 from torch.distributed.device_mesh import DeviceMesh
 
+from llmtuner.trainer.runtime.reductions import (
+    logical_tokens_per_rank as logical_tokens_per_rank,
+)
+from llmtuner.trainer.runtime.reductions import (
+    resolve_loss_reduction_meshes as resolve_loss_reduction_meshes,
+)
+from llmtuner.trainer.runtime.reductions import (
+    resolve_training_reduction_meshes as resolve_dense_reduction_meshes,
+)
+
 if TYPE_CHECKING:
     from experiments.pipeline_parallel.topology import ParallelTopology
 
@@ -24,53 +34,16 @@ class TrainingReductionMeshes:
     sequence_mesh: DeviceMesh | None
 
 
-def logical_tokens_per_rank(
-    num_tokens: int, parallel_dims: ParallelTopology | None
-) -> int:
-    """Remove CP/TP replicas from loader token accounting."""
-    sequence_shards = (
-        1 if parallel_dims is None else parallel_dims.cp * parallel_dims.tp
-    )
-    return num_tokens // sequence_shards
-
-
-def resolve_loss_reduction_meshes(
-    parallel_dims: ParallelTopology | None,
-) -> tuple[DeviceMesh | None, DeviceMesh | None]:
-    """Return the DP token-count mesh and the loss-sum mesh."""
-    if parallel_dims is None:
-        return None, None
-    dp_mesh = parallel_dims.get_optional_mesh("dp")
-    loss_is_sharded = parallel_dims.dp_cp_enabled or parallel_dims.tp_enabled
-    loss_mesh = parallel_dims.get_optional_mesh("loss") if loss_is_sharded else dp_mesh
-    return dp_mesh, loss_mesh
-
-
 def resolve_training_reduction_meshes(
     parallel_dims: ParallelTopology | None,
 ) -> TrainingReductionMeshes:
-    """Resolve the four meshes used by one training step."""
-    dp_mesh, loss_mesh = resolve_loss_reduction_meshes(parallel_dims)
-    if parallel_dims is None:
-        return TrainingReductionMeshes(None, None, None, None)
-    sequence_axes = [
-        axis
-        for axis, enabled in (
-            ("cp", parallel_dims.cp_enabled),
-            ("tp", parallel_dims.tp_enabled),
-        )
-        if enabled
-    ]
-    sequence_mesh = (
-        parallel_dims.get_optional_mesh(sequence_axes) if sequence_axes else None
-    )
-    if sequence_mesh is not None and len(sequence_axes) > 1:
-        # The reduction sites hand this mesh to one all_reduce, and
-        # ``DeviceMesh.get_group`` refuses a mesh with more than one dimension.
-        sequence_mesh = sequence_mesh._flatten("sequence_loss")
+    """Add pipeline stage reduction to the shared token/loss mesh selection."""
+    meshes = resolve_dense_reduction_meshes(parallel_dims)
     return TrainingReductionMeshes(
-        dp_mesh=dp_mesh,
-        pp_mesh=parallel_dims.get_optional_mesh("pp"),
-        loss_mesh=loss_mesh,
-        sequence_mesh=sequence_mesh,
+        dp_mesh=meshes.dp_mesh,
+        pp_mesh=(
+            parallel_dims.get_optional_mesh("pp") if parallel_dims is not None else None
+        ),
+        loss_mesh=meshes.loss_mesh,
+        sequence_mesh=meshes.sequence_mesh,
     )

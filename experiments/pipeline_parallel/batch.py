@@ -2,22 +2,15 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
-
-import torch
-from torch.distributed import ProcessGroup
+from typing import TYPE_CHECKING
 
 from experiments.pipeline_parallel.loader_builder import (
     build_dataloader as build_dataset_dataloader,
 )
-from llmtuner.accelerator.collectives import synchronize_local_errors
 from llmtuner.config.training_config import resolve_batch_size_per_rank
 from llmtuner.datasets.contracts import (
     BaseDataLoader,
-    Batch,
-    TrainerBatch,
 )
-from llmtuner.models.execution import validate_prepared_model_inputs
 from llmtuner.trainer.runtime.batch import (
     AccumulationBatch,
     batch_generator,
@@ -26,6 +19,7 @@ from llmtuner.trainer.runtime.batch import (
     fetch_batch,
     move_batch_to_device,
     prepare_microbatch,
+    prepare_model_inputs,
     validated_batch_token_counts,
 )
 
@@ -79,34 +73,3 @@ def build_rank_dataloader(
         repeat=repeat,
         dataset=dataset,
     )
-
-
-def prepare_model_inputs(
-    model: torch.nn.Module,
-    batch: Batch | TrainerBatch,
-    *,
-    device: torch.device,
-    parallel_dims: Any,
-    error_group: ProcessGroup | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-    """Connect a batch to the explicit model's input contract.
-
-    Collator token counts are not model inputs. Unread accumulation groups stay
-    on the host until this function consumes them.
-    """
-    if isinstance(batch, dict):
-        batch = {
-            key: value for key, value in batch.items() if key != "num_valid_tokens"
-        }
-    with synchronize_local_errors("Training batch preprocessing", group=error_group):
-        prepare_inputs = getattr(model, "prepare_inputs", None)
-        if not callable(prepare_inputs):
-            raise TypeError(
-                f"{type(model).__name__} must implement "
-                "prepare_inputs(batch, parallel_dims=...)"
-            )
-        prepared = prepare_inputs(
-            move_batch_to_device(batch, device),
-            parallel_dims=parallel_dims,
-        )
-        return validate_prepared_model_inputs(prepared)

@@ -31,7 +31,6 @@ from llmtuner.components.loss_contract import (
     ChunkedLossBackward,
     LossSum,
     validate_loss_sum,
-    validate_normalization_tokens,
 )
 from llmtuner.datasets.contracts import Batch, TrainerBatch
 from llmtuner.models.common.moe.bias_update import collect_routing_load_metrics
@@ -39,6 +38,7 @@ from llmtuner.models.contracts import DecoderStructure
 from llmtuner.models.execution import ModelExecutionCapabilities
 from llmtuner.trainer.runtime.batch import prepare_model_inputs
 from llmtuner.trainer.runtime.engine import _TrainingStepOperations
+from llmtuner.trainer.runtime.engine import loss_vocab_kwargs as loss_vocab_kwargs
 from llmtuner.trainer.runtime.gradients import allreduce_replicated_tp_grads
 from llmtuner.trainer.runtime.results import (
     AccumulationResult,
@@ -47,20 +47,6 @@ from llmtuner.trainer.runtime.results import (
 )
 
 ParamContext = Callable[[], AbstractContextManager[Any]]
-
-
-def loss_vocab_kwargs(
-    parallel_dims: ParallelTopology | None,
-    *,
-    layout: ExecutionLayout | None = None,
-) -> dict[str, Any]:
-    """Bind loss reduction to declared output ownership, never module attributes."""
-    tp_mesh = None if parallel_dims is None else parallel_dims.get_optional_mesh("tp")
-    if layout is not None:
-        return layout.loss_kwargs(None if tp_mesh is None else tp_mesh.get_group())
-    if tp_mesh is not None:
-        raise ValueError("TP loss requires an explicit ExecutionLayout")
-    return {}
 
 
 @dataclass(slots=True)
@@ -297,27 +283,6 @@ class TrainingEngine(_TrainingStepOperations):
             extra_kwargs=extra_kwargs,
             global_valid_tokens=global_valid_tokens,
         )
-
-    def forward_backward_dense(
-        self,
-        inputs: torch.Tensor,
-        labels: torch.Tensor,
-        *,
-        extra_kwargs: dict[str, Any],
-        global_valid_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run one non-PP accumulation group without selecting execution policy."""
-        with synchronize_local_errors(
-            "Training loss normalization validation", group=self.error_group
-        ):
-            validate_normalization_tokens(global_valid_tokens, device=labels.device)
-        with self.param_context(), spmd_context(self.parallel_dims):
-            return self._dense_backward(
-                inputs,
-                labels,
-                extra_kwargs=extra_kwargs,
-                global_valid_tokens=global_valid_tokens,
-            )
 
     def finish_step(
         self,

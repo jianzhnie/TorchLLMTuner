@@ -9,25 +9,19 @@ The console owns the process-group lifetime. It closes the trainer and destroys
 the group on exit, preserving the original error if cleanup also fails.
 
 Examples:
-    python -m llmtuner --steps 20
-    torchrun --nproc_per_node=2 -m llmtuner --data_parallel_shard_size -1
-    python -m llmtuner --steps 20 --enable --interval 10 --dump_folder ./outputs
-    python -m llmtuner --steps 20 --enable_tensorboard
-    python -m llmtuner --steps 20 --dataset local_jsonl \\
-        --dataset_path ./corpus.jsonl --tokenizer_path ./tokenizer
-    python -m llmtuner --steps 20 --enable_profiling --profile_freq 4
+    python -m experiments.pipeline_parallel.cli --steps 20
+    torchrun --nproc_per_node=2 -m experiments.pipeline_parallel.cli \\
+        --pipeline_parallel_size 2 --num_pp_microbatches 2
+    python -m experiments.pipeline_parallel.cli --steps 20 --enable \\
+        --interval 10 --dump_folder ./outputs
 """
 
 from __future__ import annotations
 
-import os
-import sys
 from collections.abc import Sequence
 
-import torch.distributed as dist
 from transformers import HfArgumentParser
 
-import llmtuner
 from experiments.pipeline_parallel.cli_config import PARSER_GROUPS, cli_view
 from experiments.pipeline_parallel.config import LLMTunerConfig
 from experiments.pipeline_parallel.parallel_config import (
@@ -38,6 +32,7 @@ from experiments.pipeline_parallel.parallel_config import (
     PipelineParallelConfig,
     TensorParallelConfig,
 )
+from experiments.pipeline_parallel.trainer import Trainer
 from llmtuner.config.checkpoint_config import CheckpointConfig
 from llmtuner.config.data_config import DataloaderConfig
 from llmtuner.config.lr_scheduler_config import LRSchedulerConfig
@@ -45,10 +40,7 @@ from llmtuner.config.model_config import ModelConfig
 from llmtuner.config.observability_config import MetricsConfig, ProfilerConfig
 from llmtuner.config.optimizer_config import OptimizerConfig
 from llmtuner.config.training_config import TrainingConfig
-from llmtuner.errors import ConfigError
-from llmtuner.utils.logging import get_logger
-
-logger = get_logger(__name__)
+from llmtuner.trainer.cli import run_training
 
 
 def parse_config(args: Sequence[str] | None = None) -> LLMTunerConfig:
@@ -88,67 +80,7 @@ def parse_config(args: Sequence[str] | None = None) -> LLMTunerConfig:
 
 
 def main() -> None:
-    cfg = parse_config()
-    if cfg.checkpoint.create_seed_checkpoint:
-        world_size = (
-            dist.get_world_size()
-            if dist.is_initialized()
-            else int(os.environ.get("WORLD_SIZE", "1"))
-        )
-        if world_size != 1:
-            raise ConfigError(
-                "Must create a seed checkpoint using a single device, to "
-                "disable sharding."
-            )
-        if not cfg.checkpoint.enable:
-            raise ConfigError(
-                "Must enable checkpointing when creating a seed checkpoint."
-            )
-    trainer = None
-    try:
-        # The public lazy export keeps configuration parsing independent of the
-        # training engine while all import statements stay at module scope.
-        trainer = llmtuner.Trainer(cfg)
-        if cfg.checkpoint.create_seed_checkpoint:
-            # Mirrors torchtitan ``train.py``: a seed checkpoint is the unsharded
-            # step-0 model, so it must be written from a single process (any
-            # sharding would bake one rank's shard layout into the artifact), and
-            # Loading treats step-0 as model-only (checkpointer/core/base.py).
-            if trainer.checkpointer.save(curr_step=0, last_step=True):
-                print("Created seed checkpoint at step 0")
-        else:
-            trainer.train()
-    finally:
-        # Trainer.close releases model-side resources but deliberately leaves
-        # the process group alive for callers that run another collective (for
-        # example validation or post-run aggregation).  The console entrypoint
-        # owns the process-group lifetime and tears it down here, matching
-        # torchtitan's train.py lifecycle.
-        training_error = sys.exc_info()[1]
-        try:
-            if trainer is not None:
-                trainer.close()
-        except BaseException:
-            if training_error is None:
-                raise
-            try:
-                logger.exception("Resource cleanup failed after an entry-point error")
-            except BaseException:
-                pass  # Keep the primary entry-point error when reporting fails.
-        finally:
-            cleanup_error = sys.exc_info()[1]
-            try:
-                if dist.is_initialized():
-                    dist.destroy_process_group()
-            except BaseException:
-                if training_error is None and cleanup_error is None:
-                    raise
-                try:
-                    logger.exception(
-                        "Process-group cleanup failed after an entry-point error"
-                    )
-                except BaseException:
-                    pass  # Preserve the active training or resource cleanup error.
+    run_training(parse_config(), trainer_factory=Trainer)
 
 
 if __name__ == "__main__":

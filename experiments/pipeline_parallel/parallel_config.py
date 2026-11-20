@@ -76,6 +76,9 @@ class ParallelConfig(BaseParallelConfig):
     def non_dp_sizes(self) -> int:
         return super().non_dp_sizes() * self.pipeline_parallel_size
 
-    def validate(self) -> None:
-        super().validate()
-        self.pp_config.validate()
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        require_integer_at_least(self, "pipeline_parallel_size", group="parallel")
+        if not isinstance(self.pp_config, PipelineParallelConfig):
+            raise ConfigError("parallel.pp_config must be PipelineParallelConfig")
+        self.pp_config.__post_init__()

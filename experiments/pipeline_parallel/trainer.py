@@ -14,7 +14,6 @@ all stages. The process group belongs to the entry point, not ``Trainer.close``.
 
 from __future__ import annotations
 
-import sys
 from collections import deque
 from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, nullcontext
@@ -42,6 +41,7 @@ from experiments.pipeline_parallel.topology import ParallelTopology
 from llmtuner.accelerator.collectives import (
     all_reduce,
     set_pg_timeouts,
+    synchronize_after_wait,
     synchronize_local_errors,
 )
 from llmtuner.components.checkpointer.core.base import BaseCheckpointManager
@@ -55,7 +55,6 @@ from llmtuner.datasets.contracts import (
 )
 from llmtuner.memory.activation_swap import ActivationSwapResources
 from llmtuner.parallel.fully_shard_parallel.resources import FSDPCommunicationResources
-from llmtuner.parallel.model_compile import rollback_compile_settings_on_error
 from llmtuner.trainer.runtime import validation as validation_runtime
 from llmtuner.trainer.runtime.assembly import build_profiler
 from llmtuner.trainer.runtime.gradients import check_step_condition
@@ -65,9 +64,9 @@ from llmtuner.trainer.runtime.training_observer import (
     TrainingObserver,
     install_dispatch_timers,
 )
+from llmtuner.trainer.trainer import Trainer as BaseTrainer
 from llmtuner.utils.garbage_collection import GarbageCollection
 from llmtuner.utils.logging import get_logger, set_log_ranks
-from llmtuner.utils.seeding import rollback_execution_settings_on_error
 
 # Rank-aware: the helper attaches a handler whose filter passes below-ERROR
 # lines only on the log ranks (rank 0 by default), so a torchrun run logs one
@@ -137,43 +136,9 @@ class Trainer:
     def ntokens_seen(self, value: int) -> None:
         self.progress.ntokens_seen = value
 
-    def __init__(
-        self, cfg: LLMTunerConfig, *, builders: TrainingBuilders | None = None
-    ):
-        """Build runtime services in lifecycle order, cleaning up partial failures."""
-        self._builders = builders
-        compile_settings = nullcontext()
-        if getattr(getattr(cfg, "training", None), "compile", False):
-            compile_settings = rollback_compile_settings_on_error()
-        with rollback_execution_settings_on_error(), compile_settings:
-            try:
-                self._assemble_runtime(cfg)
-            except BaseException:
-                # Failed construction never returns an object to the caller, so
-                # release resources already acquired by partial assembly here.
-                try:
-                    self.close()
-                except BaseException:
-                    try:
-                        logger.exception(
-                            "Resource cleanup failed during trainer construction"
-                        )
-                    except BaseException:
-                        pass  # Construction must retain the original assembly error.
-                raise
+    __init__ = BaseTrainer.__init__
 
-    def _retain_model_resources(self, model: torch.nn.Module) -> None:
-        """Keep partially transformed models alive for construction cleanup."""
-        if self.fsdp_communication_resources is None:
-            self.fsdp_communication_resources = FSDPCommunicationResources(())
-        if self.activation_swap_resources is None:
-            self.activation_swap_resources = ActivationSwapResources(())
-        for owner in (
-            self.fsdp_communication_resources,
-            self.activation_swap_resources,
-        ):
-            if all(part is not model for part in owner.model_parts):
-                owner.model_parts += (model,)
+    _retain_model_resources = BaseTrainer._retain_model_resources
 
     def _assemble_runtime(self, cfg: LLMTunerConfig) -> None:
         """Acquire services in order and retain each owner before the next build.
@@ -334,18 +299,7 @@ class Trainer:
         )
         return prepared
 
-    def forward_backward_step(
-        self,
-        microbatch: batch_runtime.AccumulationBatch,
-        *,
-        global_valid_tokens: torch.Tensor,
-    ) -> StepResult:
-        """Execute one accumulation group through the assembled engine."""
-        return self.training_engine.forward_backward(
-            microbatch["batch"],
-            global_valid_tokens=global_valid_tokens,
-            valid_tokens=microbatch["num_valid_tokens"],
-        )
+    forward_backward_step = BaseTrainer.forward_backward_step
 
     def before_gradient_clipping(self) -> None:
         """Run diagnostics after gradient reduction and before clipping."""
@@ -446,18 +400,11 @@ class Trainer:
         # Forward can mutate checkpointed state too: running buffers and
         # embedding max_norm weights are examples. Finish the previous snapshot
         # before model execution; background upload may still overlap training.
-        staging_failure: BaseException | None = None
-        try:
-            self.checkpointer.maybe_wait_for_staging()
-        except BaseException as error:
-            staging_failure = error
-        # Waiting can involve background communication; agree only after the
-        # wait returns, before any rank starts model execution.
-        with synchronize_local_errors(
-            "Training checkpoint staging", group=self.error_group
-        ):
-            if staging_failure is not None:
-                raise staging_failure
+        synchronize_after_wait(
+            self.checkpointer.maybe_wait_for_staging,
+            "Training checkpoint staging",
+            group=self.error_group,
+        )
 
         def executed_groups() -> Iterator[StepResult]:
             while microbatches:
@@ -536,29 +483,7 @@ class Trainer:
         """
         return validation_runtime.should_validate(self.cfg.validation, step)
 
-    def validate(self, step: int) -> None:
-        """Run one eval-mode, gradient-free pass and log its loss.
-
-        The body lives in ``runtime/validation.py`` (gradient-free via its own
-        ``torch.no_grad``); see there for the reporting contract.
-        """
-        if self.validation_resources is None:
-            self.validation_resources = (
-                validation_runtime.ValidationDataLoaderResources()
-            )
-        validation_runtime.validate(
-            self.training_engine,
-            loader_resources=self.validation_resources,
-            cfg=self.cfg,
-            metrics=self.metrics,
-            token_counter=self.count_valid_tokens,
-            step=step,
-            wait_for_staging=(
-                self.checkpointer.maybe_wait_for_staging
-                if self.checkpointer is not None
-                else None
-            ),
-        )
+    validate = BaseTrainer.validate
 
     # -- step cadence ------------------------------------------------------------
 
@@ -573,33 +498,7 @@ class Trainer:
 
     # -- the loop ---------------------------------------------------------------
 
-    def train(self) -> None:
-        try:
-            loaded = self.checkpointer.load(self.cfg.checkpoint.load_step)
-            with synchronize_local_errors(
-                "Training resume reporting", group=self.error_group
-            ):
-                if loaded:
-                    logger.info(f"Resuming from step {self.step}")
-
-            self._run_training()
-        finally:
-            # Teardown lives in ``close`` rather than inline so a caller that
-            # drives the trainer programmatically -- rather than through
-            # ``train`` -- gets the same cleanup from the same place. It is in
-            # a ``finally`` so a run that dies mid-loop still finishes the
-            # checkpoint it had already started writing.
-            training_error = sys.exc_info()[1]
-            try:
-                self.close()
-            except BaseException:
-                if training_error is None:
-                    raise
-                try:
-                    logger.exception("Resource cleanup failed after a training error")
-                except BaseException:
-                    # Reporting must not replace the active training failure.
-                    pass
+    train = BaseTrainer.train
 
     def _run_training(self) -> None:
         """Initialize loop-scoped services and run optimizer steps."""
@@ -696,119 +595,8 @@ class Trainer:
                             device=self.device,
                         )
 
-    def _cancel_incomplete_step(self) -> None:
-        """Restore the completed-step counter and save its latest state."""
-        # An accumulation window is atomic: none of an incomplete step's
-        # batches may contribute to an optimizer update or checkpoint step.
-        self.step -= 1
-        with synchronize_local_errors(
-            "Training exhaustion reporting", group=self.error_group
-        ):
-            logger.warning("Ran out of data; the last step was canceled.")
-        saved = self.step > 0 and self.checkpointer.save(self.step, last_step=True)
-        with synchronize_local_errors(
-            "Training exhausted checkpoint reporting", group=self.error_group
-        ):
-            if saved:
-                logger.info(f"Saved checkpoint for step {self.step}")
+    _cancel_incomplete_step = BaseTrainer._cancel_incomplete_step
 
-    def _report_completed_step(
-        self,
-        step_metrics: dict[str, float] | None,
-        *,
-        observer: TrainingObserver | None,
-    ) -> None:
-        """Log, checkpoint and validate one completed update in that order."""
-        # Agree on local logging success before peers enter checkpoint collectives.
-        with synchronize_local_errors(
-            "Training metric reporting", group=self.error_group
-        ):
-            if step_metrics is not None:
-                self.metrics.log(
-                    self.step,
-                    global_avg_loss=step_metrics["loss"],
-                    global_max_loss=step_metrics["max_loss"],
-                    grad_norm=step_metrics["grad_norm"],
-                    extra_metrics={
-                        key: value
-                        for key, value in step_metrics.items()
-                        if key not in ("loss", "max_loss", "grad_norm")
-                    },
-                )
+    _report_completed_step = BaseTrainer._report_completed_step
 
-        saved = self.checkpointer.save(self.step, last_step=self.step == self.cfg.steps)
-        with synchronize_local_errors(
-            "Training checkpoint reporting", group=self.error_group
-        ):
-            if saved:
-                logger.info(f"Saved checkpoint for step {self.step}")
-                if observer is not None:
-                    self.metrics.log_resources(
-                        self.step, self.checkpointer.observation_metrics.copy()
-                    )
-
-        if self.should_validate(self.step):
-            self.validate(self.step)
-
-    def close(self) -> None:
-        """Release trainer resources in dependency order.
-
-        Drain checkpoint writes while the loader they may reference is alive,
-        then close reporting and data resources. Restore process-wide GC state
-        last. Successful releases are not repeated; failed owners remain for
-        retry, including during partial initialization. Release independent
-        resources even after failure, but keep the loader alive while an
-        interrupted checkpoint drain may still reference it.
-        """
-        first_error: BaseException | None = None
-        # A retained checkpointer may still read source tensors and loader state.
-        # Retained FSDP communication may still reduce/offload optimizer tensors.
-        # Release independent resources; retry dependents after their owners drain.
-        for name, dependencies in (
-            ("profiler_resource", ()),
-            ("checkpointer", ()),
-            ("dispatch_timer_resources", ()),
-            ("fsdp_communication_resources", ("checkpointer",)),
-            (
-                "activation_swap_resources",
-                ("checkpointer", "fsdp_communication_resources"),
-            ),
-            ("validation_resources", ()),
-            ("metrics", ()),
-            ("dataloader", ("checkpointer",)),
-            ("ema", ("checkpointer", "fsdp_communication_resources")),
-            ("lr_scheduler", ("checkpointer",)),
-            (
-                "optimizer",
-                ("checkpointer", "fsdp_communication_resources", "lr_scheduler"),
-            ),
-            ("gc_handler", ()),
-        ):
-            if any(getattr(self, owner, None) is not None for owner in dependencies):
-                continue
-            resource = getattr(self, name, None)
-            if resource is None:
-                continue
-            close = getattr(resource, "close", None)
-            if name in ("ema", "lr_scheduler", "optimizer") and not callable(close):
-                # Tensor-only services need no shutdown, but their ownership
-                # must end so dependent resources can be released below.
-                setattr(self, name, None)
-                continue
-            setattr(self, name, None)
-            try:
-                close()
-            except BaseException as error:
-                # A failed close leaves ownership indeterminate. Keep every
-                # resource owner for retry, including injected checkpoint
-                # managers that do not expose a retry capability flag.
-                setattr(self, name, resource)
-                if first_error is None:
-                    first_error = error
-                try:
-                    logger.exception("Failed to close trainer resource %s", name)
-                except BaseException:
-                    # Continue releasing resources even when the sink is broken.
-                    pass
-        if first_error is not None:
-            raise first_error
+    close = BaseTrainer.close

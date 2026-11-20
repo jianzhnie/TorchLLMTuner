@@ -1,5 +1,6 @@
 """Pipeline-specific ownership metadata layered over generic local layouts."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from experiments.pipeline_parallel.ownership import PipelineParameterOwnership
@@ -18,8 +19,8 @@ class ModelPartLayout(BaseModelPartLayout):
                 self.replacements.parameter_targets
             )
 
-    def validate(self, model) -> None:
-        super(ModelPartLayout, self).validate(model)
+    def validate(self, model) -> Mapping[str, str]:
+        state_names = super(ModelPartLayout, self).validate(model)
         registered = set(self.parameter_bindings.values())
         if self.pipeline_ownership is not None and any(
             target not in registered
@@ -27,6 +28,7 @@ class ModelPartLayout(BaseModelPartLayout):
             for target in targets
         ):
             raise ValueError("Pipeline parameter target is no longer registered")
+        return state_names
 
     def snapshot(self):
         snapshot = super(ModelPartLayout, self).snapshot()

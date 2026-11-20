@@ -18,6 +18,7 @@ from llmtuner.accelerator.device import device_type
 from llmtuner.config.llmtuner_config import LLMTunerConfig
 from llmtuner.config.parallel_config import ParallelConfig
 from llmtuner.errors import ConfigError
+from llmtuner.parallel.topology import ParallelTopology as BaseTopology
 from llmtuner.parallel.topology import ParallelTopologySnapshot as BaseSnapshot
 from llmtuner.parallel.topology import _unflatten_mesh
 from llmtuner.utils.logging import get_logger
@@ -172,17 +173,7 @@ class ParallelTopology:
                 f"dp_shard * cp * tp ({sparse_region})"
             )
 
-    def _mesh_exist(self, name: str, size: int) -> bool:
-        if name == "dp_shard":
-            # Keep the DP storage axis alive at size 1 so ``fully_shard`` can
-            # install MixedPrecisionPolicy and discriminate the DP submesh on
-            # TP/DDP/PP-only.
-            return True
-        if name == "efsdp":
-            # We always keep the efsdp if EP is larger than 1 because we need
-            # FSDP wrapping to help the MoE layers do mixed precision training.
-            return True if self.ep > 1 else False
-        return size > 1
+    _mesh_exist = BaseTopology._mesh_exist
 
     def build_device_mesh(self) -> DeviceMesh:
         """
@@ -360,146 +351,17 @@ class ParallelTopology:
                 f"expected {expected_size}, got {actual_size}"
             )
 
-    def get_optional_mesh(
-        self,
-        dims: str | list[str],
-        *,
-        include_singleton_axes: bool = False,
-    ) -> DeviceMesh | None:
-        """Get a device mesh by dimension name(s), returning None if not enabled.
+    # Reuse queries without inheriting dataclass fields: PP keeps its existing
+    # constructor order and supplies its own mesh construction/axis visibility.
+    get_optional_mesh = BaseTopology.get_optional_mesh
 
-        Args:
-            dims: Names of the mesh dimension. Valid options include:
-                 'pp', 'batch', 'loss', 'dp_replicate', 'dp', 'dp_shard',
-                 'cp', 'tp', 'ep', 'efsdp'.
-            include_singleton_axes: Include axes with size 1 in the returned
-                 submesh. This is used for distributed parameter and buffer
-                 registration so spmd_types can handle size-1 axis filtering.
+    get_mesh = BaseTopology.get_mesh
 
-        Returns:
-            DeviceMesh for the requested dimension(s), or None if:
-            - The dimension size is 1 (parallelism not enabled)
-            - The dimension doesn't exist
-            Note: 'dp_shard' always exists (for mixed precision via
-            fully_shard()), and 'efsdp' exists when ep > 1, even if their
-            size is 1.
+    spmd_dense_mesh = BaseTopology.spmd_dense_mesh
 
-        Raises:
-            ValueError: If the requested dimension name(s) is not valid.
-        """
-        if isinstance(dims, str):
-            dims = [dims]
-        if not dims or len(set(dims)) != len(dims):
-            raise ValueError("mesh dimensions must be nonempty and unique")
+    spmd_sparse_mesh = BaseTopology.spmd_sparse_mesh
 
-        if not self._single_axis_meshes:
-            self.build_device_mesh()
-
-        for mesh_name in dims:
-            if mesh_name not in self._single_axis_meshes:
-                raise ValueError(
-                    f"Invalid mesh dim: '{mesh_name}'. "
-                    f"Valid dimensions are: {list(self._single_axis_meshes.keys())}"
-                )
-
-        if not include_singleton_axes and any(
-            not self._mesh_exist(dim, self._single_axis_meshes[dim].size())
-            for dim in dims
-        ):
-            return None
-
-        if len(dims) == 1:
-            return self._single_axis_meshes[dims[0]]
-
-        # Cache to ensure mesh equality by object identity.
-        key = tuple(dims)
-        if key in self._multi_axis_meshes:
-            return self._multi_axis_meshes[key]
-
-        candidates = [
-            (name, global_mesh)
-            for name, global_mesh in self._global_meshes.items()
-            if global_mesh.mesh_dim_names is not None
-            and set(dims).issubset(set(global_mesh.mesh_dim_names))
-        ]
-        if not candidates:
-            raise ValueError(f"Invalid mesh name combinations {dims}.")
-        submesh = candidates[0][1][key]
-        self._multi_axis_meshes[key] = submesh
-        return submesh
-
-    def get_mesh(self, dims: str | list[str]) -> DeviceMesh:
-        """Get a device mesh by dimension name(s), raising if not available.
-
-        Args:
-            dims: Names of the mesh dimension. Valid options include:
-                 'pp', 'batch', 'loss', 'dp_replicate', 'dp', 'dp_shard',
-                 'cp', 'tp', 'ep', 'efsdp'.
-
-        Returns:
-            DeviceMesh for the requested dimension(s).
-
-        Raises:
-            ValueError: If the mesh is not available (dimension size = 1 or not
-                enabled), or if the requested dimension name(s) is not valid.
-        """
-        mesh = self.get_optional_mesh(dims)
-        if mesh is None:
-            enabled_str = (
-                "enabled (size > 1)" if isinstance(dims, str) else "all enabled"
-            )
-            raise ValueError(
-                f"Mesh '{dims}' is not available. "
-                f"Ensure the corresponding parallelism dimension is {enabled_str}."
-            )
-        return mesh
-
-    def spmd_dense_mesh(self) -> DeviceMesh:
-        """Dense SPMD mesh used for forward/backward typechecking."""
-        if not self._single_axis_meshes:
-            self.build_device_mesh()
-        return self._global_meshes["spmd_dense_for_fwdbwd"]
-
-    def spmd_sparse_mesh(self) -> DeviceMesh | None:
-        """Sparse SPMD mesh used inside expert dispatch."""
-        if not self._single_axis_meshes:
-            self.build_device_mesh()
-        return self._global_meshes.get("spmd_sparse_for_fwdbwd")
-
-    def get_all_one_dimensional_meshes(self) -> dict[str, DeviceMesh]:
-        """Get all enabled one-dimensional device meshes.
-
-        Returns a dictionary of enabled one-dimensional device meshes, allowing you to
-        access their process groups.
-
-        Note:
-            Logically inactive axes are excluded by ``_mesh_exist``. For
-            example, ``efsdp`` is hidden when EP is disabled, even though the
-            underlying DeviceMesh has a usable process group for that view.
-
-        Returns:
-            dict[str, DeviceMesh]: A dictionary mapping mesh dimension names to their
-                corresponding DeviceMesh objects. Only includes meshes where:
-                - ndim == 1 (one-dimensional)
-                - parallelism is enabled (size > 1)
-                - the axis is logically active
-
-        Example:
-            >>> parallel_dims = ParallelTopology(
-            ...     dp_replicate=2, dp_shard=2, cp=1, tp=2, pp=1, ep=1, world_size=8
-            ... )
-            >>> meshes = parallel_dims.get_all_one_dimensional_meshes()
-            >>> print(meshes.keys())
-            dict_keys(['batch', 'loss', 'dp_replicate', 'tp', 'dp', 'dp_shard'])
-
-        """
-        if not self._single_axis_meshes:
-            self.build_device_mesh()
-        return {
-            k: v
-            for k, v in self._single_axis_meshes.items()
-            if v.ndim == 1 and v.size() > 1 and self._mesh_exist(k, v.size())
-        }
+    get_all_one_dimensional_meshes = BaseTopology.get_all_one_dimensional_meshes
 
     @property
     def dp_enabled(self):
