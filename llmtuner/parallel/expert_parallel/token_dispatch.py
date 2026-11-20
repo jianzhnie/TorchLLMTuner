@@ -22,9 +22,6 @@ from torch.distributed._functional_collectives import all_to_all_single
 
 from ...accelerator.distributed import get_world_size
 from ...errors import EnvironmentUnsupportedError
-from ...utils.logging import get_logger
-
-logger = get_logger(__name__)
 
 # torch ships two functional all-to-alls. ``all_to_all_single`` has NO autograd
 # kernel -- calling it on a tensor that needs grad makes torch warn that the

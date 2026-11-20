@@ -409,17 +409,18 @@ def _restore_param_group(
         # by optimizer.step() and learning-rate schedulers after loading.
         return {**param_group, "params": [], "param_names": list(fqns)}
     new_group: dict[str, Any] = {"params": [], "param_names": list(fqns)}
+    first_fqn, other_fqns = fqns[0], fqns[1:]
     for key in param_group:
         if key in ("params", "param_names"):
             continue
-        flat_key = f"param_groups.{fqns[0]}.{key}"
+        flat_key = f"param_groups.{first_fqn}.{key}"
         if flat_key not in flat_state:
             raise KeyError(
                 f"Optimizer param group key {key!r} not found in checkpoint "
-                f"(looked up via param {fqns[0]!r})."
+                f"(looked up via param {first_fqn!r})."
             )
         new_group[key] = flat_state[flat_key]
-        for fqn in fqns[1:]:
+        for fqn in other_fqns:
             other_key = f"param_groups.{fqn}.{key}"
             if other_key not in flat_state:
                 raise KeyError(
@@ -434,7 +435,7 @@ def _restore_param_group(
             )
             if not matches:
                 raise ValueError(
-                    f"Cannot merge optimizer parameters {fqns[0]!r} and "
+                    f"Cannot merge optimizer parameters {first_fqn!r} and "
                     f"{fqn!r}: checkpoint group option {key!r} differs"
                 )
     return new_group

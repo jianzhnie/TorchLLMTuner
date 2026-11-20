@@ -236,12 +236,11 @@ class BaseCheckpointManager(ABC):
 
         The state keys go in this order on purpose. ``model`` first, then
         ``optimizer`` passed through unwrapped -- it is an ``OptimizersContainer``
-        whose ``state_dict`` is already flat and FQN-keyed for DCP resharding
-        and which materializes state before DCP
-        plans a load. ``lr_scheduler`` last, because a load runs in this order and
-        the scheduler's restore reads optimizer group ``initial_lr`` values. Without
-        it a
-        resumed run's fresh scheduler restarts ``last_epoch`` at 0, so a warmup
+        whose ``state_dict`` is flat and FQN-keyed for DCP resharding and
+        materializes state before DCP plans a load. Scheduler restoration follows
+        optimizer restoration because it reads optimizer group ``initial_lr``.
+        Without its saved state, a fresh scheduler restarts ``last_epoch`` at 0,
+        so a warmup
         or decay curve restarts on the step after a resume.
         """
         self._observation_metrics: dict[str, float] = {}
@@ -811,8 +810,8 @@ class BaseCheckpointManager(ABC):
         """Implement ``close``. Only called when checkpointing is enabled."""
 
     def _start_checkpoint_services(self) -> None:
-        """Start retention and report readiness after backend ownership exists."""
-        if self.keep_latest_k > 0:
+        """Start retention on its deleting rank, then report backend readiness."""
+        if self.keep_latest_k > 0 and is_main_process():
             self.purge_queue: queue.Queue[str | None] = queue.Queue()
             self.purge_thread = threading.Thread(
                 target=purge_thread,
@@ -914,58 +913,60 @@ class BaseCheckpointManager(ABC):
         After successful completion include the new checkpoint in that horizon.
         Resumable checkpoints and model-only exports have independent horizons.
         """
-        if self._should_purge():
-            saving_dirnames = {f"step-{saving_step}"}
-            if staging_dir_prefix:
-                saving_dirnames.add(f"{staging_dir_prefix}step-{saving_step}")
+        if not self._should_purge():
+            return
 
-            staging_pattern = (
-                re.compile(rf"{re.escape(staging_dir_prefix)}{self._STEP_DIR_PATTERN}")
-                if staging_dir_prefix
-                else None
-            )
-            checkpoints: list[tuple[int, str]] = []
-            exports: list[tuple[int, str]] = []
-            abandoned: list[str] = []
+        saving_dirnames = {f"step-{saving_step}"}
+        if staging_dir_prefix:
+            saving_dirnames.add(f"{staging_dir_prefix}step-{saving_step}")
 
-            for dirname in self._storage.listdir(self.folder):
-                if dirname in saving_dirnames and not (
-                    completed and dirname == f"step-{saving_step}"
-                ):
+        staging_pattern = (
+            re.compile(rf"{re.escape(staging_dir_prefix)}{self._STEP_DIR_PATTERN}")
+            if staging_dir_prefix
+            else None
+        )
+        checkpoints: list[tuple[int, str]] = []
+        exports: list[tuple[int, str]] = []
+        abandoned: list[str] = []
+
+        for dirname in self._storage.listdir(self.folder):
+            if dirname in saving_dirnames and not (
+                completed and dirname == f"step-{saving_step}"
+            ):
+                continue
+
+            checkpoint_dir = filesystem.join(self.folder, dirname)
+            # torch_checkpointing uses this pattern for staging directories.
+            if staging_pattern and staging_pattern.fullmatch(dirname):
+                abandoned.append(checkpoint_dir)
+                continue
+
+            step = self._parse_step(dirname)
+            if step is None:
+                continue
+            if self._is_resumable_checkpoint(checkpoint_dir):
+                checkpoints.append((step, checkpoint_dir))
+            elif self._is_valid_checkpoint(checkpoint_dir):
+                exports.append((step, checkpoint_dir))
+            else:
+                abandoned.append(checkpoint_dir)
+
+        # Model-only exports cannot replace training recovery points. Apply
+        # the configured horizon independently to both artifact categories.
+        for category in (checkpoints, exports):
+            category.sort()
+            num_to_purge = max(0, len(category) - self.keep_latest_k)
+            for step, checkpoint_dir in category[:num_to_purge]:
+                if self.purge_exempt is not None and self.purge_exempt(step):
+                    logger.info(
+                        "Checkpointer is preserving checkpoint %s outside "
+                        "keep_latest_k.",
+                        checkpoint_dir,
+                    )
                     continue
-
-                checkpoint_dir = filesystem.join(self.folder, dirname)
-                # torch_checkpointing uses this pattern for staging directories.
-                if staging_pattern and staging_pattern.fullmatch(dirname):
-                    abandoned.append(checkpoint_dir)
-                    continue
-
-                step = self._parse_step(dirname)
-                if step is None:
-                    continue
-                if self._is_resumable_checkpoint(checkpoint_dir):
-                    checkpoints.append((step, checkpoint_dir))
-                elif self._is_valid_checkpoint(checkpoint_dir):
-                    exports.append((step, checkpoint_dir))
-                else:
-                    abandoned.append(checkpoint_dir)
-
-            # Model-only exports cannot replace training recovery points. Apply
-            # the configured horizon independently to both artifact categories.
-            for category in (checkpoints, exports):
-                category.sort()
-                num_to_purge = max(0, len(category) - self.keep_latest_k)
-                for step, checkpoint_dir in category[:num_to_purge]:
-                    if self.purge_exempt is not None and self.purge_exempt(step):
-                        logger.info(
-                            "Checkpointer is preserving checkpoint %s outside "
-                            "keep_latest_k.",
-                            checkpoint_dir,
-                        )
-                        continue
-                    assert self.purge_thread is not None
-                    self.purge_queue.put(checkpoint_dir)
-
-            for checkpoint_dir in abandoned:
                 assert self.purge_thread is not None
                 self.purge_queue.put(checkpoint_dir)
+
+        for checkpoint_dir in abandoned:
+            assert self.purge_thread is not None
+            self.purge_queue.put(checkpoint_dir)

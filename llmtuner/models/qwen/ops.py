@@ -4,12 +4,14 @@
 """Qwen operator adapters shared only by the explicit Qwen model subclasses."""
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_5 import modeling_qwen3_5 as reference
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     causal_conv1d_fn,
@@ -21,9 +23,39 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     causal_conv1d_update as hf_causal_conv1d_update,
 )
 
+if TYPE_CHECKING:
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeTextConfig,
+    )
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+
+
+def initialize_packed_experts(
+    self: torch.nn.Module, config: "Qwen3MoeConfig | Qwen3_5MoeTextConfig"
+) -> None:
+    """Register Qwen packed expert storage in the model initialization order."""
+    torch.nn.Module.__init__(self)
+    self.num_experts = config.num_experts
+    self.hidden_dim = config.hidden_size
+    self.intermediate_dim = config.moe_intermediate_size
+    self.gate_up_proj = torch.nn.Parameter(
+        torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
+    )
+    self.down_proj = torch.nn.Parameter(
+        torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
+    )
+    self.act_fn = ACT2FN[config.hidden_act]
+
+
+def resolve_attention_interface(implementation: str, *, eager: Callable) -> Callable:
+    """Select Qwen's flash adapter or the caller-owned reference fallback."""
+    if implementation == "flash_attention_2":
+        return flash_attention_forward
+    return ALL_ATTENTION_FUNCTIONS.get_interface(implementation, eager)
+
 
 def eager_experts_forward(
-    module: torch.nn.Module,
+    self: torch.nn.Module,
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
@@ -31,15 +63,15 @@ def eager_experts_forward(
     """Apply packed gate/up experts and accumulate scores in expert order."""
     output = torch.zeros_like(hidden_states)
     with torch.no_grad():
-        mask = F.one_hot(top_k_index, num_classes=module.num_experts).permute(2, 1, 0)
+        mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
         active_experts = (mask.sum(dim=(-1, -2)) > 0).nonzero()
     for expert in active_experts:
         expert_idx = expert[0]
         slots, tokens = torch.where(mask[expert_idx])
-        gate, up = F.linear(
-            hidden_states[tokens], module.gate_up_proj[expert_idx]
-        ).chunk(2, dim=-1)
-        values = F.linear(module.act_fn(gate) * up, module.down_proj[expert_idx])
+        gate, up = F.linear(hidden_states[tokens], self.gate_up_proj[expert_idx]).chunk(
+            2, dim=-1
+        )
+        values = F.linear(self.act_fn(gate) * up, self.down_proj[expert_idx])
         values = values * top_k_weights[tokens, slots, None]
         output.index_add_(0, tokens, values.to(output.dtype))
     return output
@@ -49,6 +81,23 @@ def rms_norm(
     hidden_states: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> torch.Tensor:
     return torch.nn.functional.rms_norm(hidden_states, (weight.numel(),), weight, eps)
+
+
+def residual_rms_norm_forward(
+    self: torch.nn.Module, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """Normalize with Qwen's residual weight scale and device precision policy."""
+    use_eager = hidden_states.device.type != "npu"
+    weight = 1.0 + (self.weight.float() if use_eager else self.weight)
+    return rms_norm(hidden_states, weight, self.eps).to(hidden_states.dtype)
+
+
+def gated_rms_norm_forward(
+    self: torch.nn.Module, hidden_states: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    """Normalize and scale before applying the SiLU gate."""
+    normalized = rms_norm(hidden_states, self.weight, self.variance_epsilon)
+    return normalized * F.silu(gate)
 
 
 def rotary_mul(query, cos, sin):

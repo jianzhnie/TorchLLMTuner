@@ -18,11 +18,9 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import initialization as init
 from transformers.cache_utils import Cache
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_5 import modeling_qwen3_5 as hf
 from transformers.models.qwen3_5.configuration_qwen3_5 import (
     Qwen3_5Config,
@@ -33,43 +31,29 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import (
 from ...execution import ModelExecutionCapabilities
 from ..checkpoint import qwen35_multimodal_configuration
 from ..ops import (
-    flash_attention_forward,
     gated_attention_inputs,
     gated_delta_forward,
-    rms_norm,
+    gated_rms_norm_forward,
+    residual_rms_norm_forward,
+    resolve_attention_interface,
     vision_attention_forward,
 )
 
 
 def _attention_interface(implementation: str) -> Callable:
-    if implementation == "flash_attention_2":
-        return flash_attention_forward
-    return ALL_ATTENTION_FUNCTIONS.get_interface(
-        implementation, hf.eager_attention_forward
-    )
+    return resolve_attention_interface(implementation, eager=hf.eager_attention_forward)
 
 
 class Qwen3_5RMSNormGated(hf.Qwen3_5RMSNormGated):
     """Apply the norm-before-gate convention used by the training kernels."""
 
-    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """Normalize and scale hidden states before applying the SiLU gate."""
-        normalized = rms_norm(hidden_states, self.weight, self.variance_epsilon)
-        return normalized * F.silu(gate)
+    forward = gated_rms_norm_forward
 
 
 class Qwen3_5RMSNorm(hf.Qwen3_5RMSNorm):
     """Apply Qwen's 1 + weight scale through the common normalization operator."""
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Normalize hidden states with the Qwen residual scale."""
-        use_eager = hidden_states.device.type != "npu"
-        weight = 1.0 + (self.weight.float() if use_eager else self.weight)
-        return rms_norm(
-            hidden_states,
-            weight,
-            self.eps,
-        ).to(hidden_states.dtype)
+    forward = residual_rms_norm_forward
 
 
 class Qwen3_5GatedDeltaNet(hf.Qwen3_5GatedDeltaNet):

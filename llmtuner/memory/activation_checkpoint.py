@@ -276,7 +276,11 @@ def wrap_selective(
 
 
 def full_policy(_ctx, op, *args, **_kwargs) -> CheckpointPolicy:
-    """Recompute activations while preserving NPU reduction results.
+    """Recompute activations while preserving exchanges and NPU reductions.
+
+    Compiled replay can stop after launching an all-to-all but before its wait,
+    leaving registered work behind. Retain exchange outputs instead of launching
+    those communications again during replay.
 
     HCCL reduce-scatter can round differently on replay even with identical
     local inputs. Norms amplify that difference enough to change MoE routing,
@@ -284,6 +288,8 @@ def full_policy(_ctx, op, *args, **_kwargs) -> CheckpointPolicy:
     changing forward arithmetic, process-global determinism, or gradients.
     Other ops retain upstream's PREFER_RECOMPUTE policy and effect handling.
     """
+    if op == torch.ops._c10d_functional.all_to_all_single.default:
+        return CheckpointPolicy.MUST_SAVE
     if (
         op == torch.ops._c10d_functional.reduce_scatter_tensor.default
         and args[0].device.type == "npu"

@@ -31,16 +31,7 @@ class DeepseekV4CSACompressor(reference.DeepseekV4CSACompressor):
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.indexer = DeepseekV4Indexer(config)
 
-    def compress_context_parallel(
-        self, hidden_states, *, exchange_windows, exchange_previous_window
-    ):
-        """Compress owned CSA windows with explicit communication callbacks."""
-        return compress_overlap_context_parallel(
-            self,
-            hidden_states,
-            exchange_windows=exchange_windows,
-            exchange_previous_window=exchange_previous_window,
-        )
+    compress_context_parallel = compress_overlap_context_parallel
 
     def forward(
         self,

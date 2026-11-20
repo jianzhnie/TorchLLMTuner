@@ -73,16 +73,7 @@ class DeepseekV4Indexer(reference.DeepseekV4Indexer):
         if q_residual.device != hidden_states.device:
             raise ValueError("CSA indexer query and hidden input must share a device")
 
-    def compress_context_parallel(
-        self, hidden_states, *, exchange_windows, exchange_previous_window
-    ):
-        """Compress owned CSA windows with explicit communication callbacks."""
-        return compress_overlap_context_parallel(
-            self,
-            hidden_states,
-            exchange_windows=exchange_windows,
-            exchange_previous_window=exchange_previous_window,
-        )
+    compress_context_parallel = compress_overlap_context_parallel
 
     def forward(
         self,

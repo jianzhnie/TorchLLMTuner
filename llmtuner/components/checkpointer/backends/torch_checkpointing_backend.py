@@ -49,7 +49,10 @@ from ..core.state_adaptation import (
     prepare_hf_export,
     restore_checkpoint_callbacks,
 )
-from ..storage.checkpointing_metadata import adapt_metadata_gather
+from ..storage.checkpointing_metadata import (
+    adapt_metadata_gather,
+    configure_sync_metadata,
+)
 from ..storage.checkpointing_staging import adapt_npu_staging
 
 CHECKPOINTING_IMPORT_ERROR = None
@@ -495,6 +498,8 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             self._prewarmed = False
 
             self._manager = self._manager_config.build()
+            if self._cpu_synchronous_save:
+                configure_sync_metadata(self._manager)
             adapt_metadata_gather(self._manager)
             adapt_npu_staging(self._manager)
 
@@ -691,7 +696,11 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 self._save_payload(self.states),
             )
             self._prewarmed = True
-            self._pending_retention = retention
+            if self.save_future is None:
+                with synchronize_local_errors("Checkpoint completed retention"):
+                    self._purge_stale_checkpoints(**retention, completed=True)
+            else:
+                self._pending_retention = retention
 
         return True
 

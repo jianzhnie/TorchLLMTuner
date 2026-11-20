@@ -604,6 +604,7 @@ def realize_moe_blocks_tp(
                 module_path, block, tp_size=tp_size, shared_binding=bindings[block]
             )
 
+    routed_names: dict[nn.Module, frozenset[str]] = {}
     for _, block in moe_blocks:
         _, shared = bindings[block]
         shared_names: set[str] = set()
@@ -616,9 +617,11 @@ def realize_moe_blocks_tp(
         # F-shard gradient is complete, and summing it with a different
         # shard's gradient would corrupt it. Names, not ids -- FSDP runs after
         # this and replaces the Parameter objects.
-        block.tp_sharded_param_names = (
-            shard_experts_for_tp(block, tp_size=tp_size, tp_rank=tp_rank) | shared_names
-        )
+        if block.experts not in routed_names:
+            routed_names[block.experts] = shard_experts_for_tp(
+                block, tp_size=tp_size, tp_rank=tp_rank
+            )
+        block.tp_sharded_param_names = routed_names[block.experts] | shared_names
         block._tp_seq_group = group
         # An explicitly selected kernel can install forward on the instance
         # (e.g. torchtitan NPU experts). It would shadow the boundary mixin and
@@ -730,11 +733,20 @@ def resolve_tp_plan(
     parameter_paths: dict[int, list[str]] = {}
     for name, parameter in bindings["parameter_bindings"]:
         parameter_paths.setdefault(id(parameter), []).append(name)
-    # MoE slicing also replaces Parameters. A shared expert module would be
-    # sliced twice, while individually tied weights would silently lose their
-    # identity. Permit only the same shared MLP's gate/up tie: both use the
-    # identical column slice, and the shared realizer preserves that identity.
-    # Reject all other aliases before any constructor or MoE mutation runs.
+    # Whole routed-expert owners are sliced once and reused by every block.
+    # Only aliases entirely within selected owner paths are safe; partial ties
+    # across distinct owners or external registrations still lose identity.
+    routed_aliases: dict[int, set[str]] = {}
+    routed_owners: dict[int, set[nn.Module]] = {}
+    routed_roles: dict[int, set[str]] = {}
+    for module_path, block in moe_blocks:
+        prefix = f"{module_path}." if module_path else ""
+        for name, parameter in block.experts.named_parameters(remove_duplicate=False):
+            routed_aliases.setdefault(id(parameter), set()).add(
+                f"{prefix}experts.{name}"
+            )
+            routed_owners.setdefault(id(parameter), set()).add(block.experts)
+            routed_roles.setdefault(id(parameter), set()).add(name)
     for module_path, block in moe_blocks:
         shared_name, shared = _resolve_shared_expert(block)
         prefix = f"{module_path}." if module_path else ""
@@ -752,7 +764,17 @@ def resolve_tp_plan(
             sharded_parameters.extend(shared.parameters())
         for parameter in sharded_parameters:
             aliases = parameter_paths[id(parameter)]
-            if len(aliases) > 1 and set(aliases) != tied_shared_paths:
+            routed_owner_alias = (
+                len(routed_owners.get(id(parameter), ())) == 1
+                and len(routed_roles.get(id(parameter), ())) == 1
+                and set(aliases) == routed_aliases.get(id(parameter))
+                and len(aliases) == len(routed_aliases.get(id(parameter), ()))
+            )
+            if (
+                len(aliases) > 1
+                and not routed_owner_alias
+                and set(aliases) != tied_shared_paths
+            ):
                 raise ValueError(
                     f"TP over MoE {module_path!r} cannot preserve shared weight "
                     f"paths {aliases!r}; shared MoE shards require an "

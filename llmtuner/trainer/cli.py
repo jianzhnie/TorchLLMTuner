@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
 import torch.distributed as dist
 from transformers import HfArgumentParser
@@ -46,6 +47,9 @@ from llmtuner.config.parallel_config import (
 from llmtuner.config.training_config import TrainingConfig
 from llmtuner.errors import ConfigError
 from llmtuner.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from .trainer import Trainer
 
 logger = get_logger(__name__)
 
@@ -85,8 +89,10 @@ def parse_config(args: Sequence[str] | None = None) -> LLMTunerConfig:
     )
 
 
-def main() -> None:
-    cfg = parse_config()
+def run_training(
+    cfg: LLMTunerConfig, *, trainer_factory: Callable[[LLMTunerConfig], Trainer]
+) -> None:
+    """Run a parsed configuration and own console resource cleanup."""
     if cfg.checkpoint.create_seed_checkpoint:
         world_size = (
             dist.get_world_size()
@@ -106,7 +112,7 @@ def main() -> None:
     try:
         # The public lazy export keeps configuration parsing independent of the
         # training engine while all import statements stay at module scope.
-        trainer = llmtuner.Trainer(cfg)
+        trainer = trainer_factory(cfg)
         if cfg.checkpoint.create_seed_checkpoint:
             # Mirrors torchtitan ``train.py``: a seed checkpoint is the unsharded
             # step-0 model, so it must be written from a single process (any
@@ -147,6 +153,10 @@ def main() -> None:
                     )
                 except BaseException:
                     pass  # Preserve the active training or resource cleanup error.
+
+
+def main() -> None:
+    run_training(parse_config(), trainer_factory=lambda cfg: llmtuner.Trainer(cfg))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from llmtuner.components.checkpointer.core.checkpoint_keys import (
     MODEL,
     OPTIMIZER,
 )
-from llmtuner.config.utils import require_integer_at_least
+from llmtuner.config.utils import require_integer_at_least, require_string_patterns
 from llmtuner.errors import ConfigError
 from llmtuner.utils.logging import get_logger
 from llmtuner.utils.paths import is_remote
@@ -152,6 +152,9 @@ class CheckpointConfig:
                 "are kept, as the latest may still be in the process of being "
                 "saved."
             )
+        require_string_patterns(
+            self.exclude_from_loading, field_name="checkpoint.exclude_from_loading"
+        )
         if CHECKPOINT_FORMAT in self.exclude_from_loading:
             raise ConfigError("Native checkpoint format validation cannot be excluded")
         if MODEL in self.exclude_from_loading:
@@ -167,6 +170,10 @@ class CheckpointConfig:
                 f"excluded when {OPTIMIZER} is excluded."
             )
 
+        if self.initial_load_path is not None and not isinstance(
+            self.initial_load_path, str
+        ):
+            raise ConfigError("checkpoint.initial_load_path must be a string or None.")
         if self.initial_load_path:
             self.initial_load_path = self.initial_load_path.strip()
             if not (

@@ -127,8 +127,8 @@ class DistributedCheckpointManager(BaseCheckpointManager):
             ``ema`` key; on a load that restores the model but not the EMA, the
             average is cold-started from the just-loaded weights.
         states: extra states to save beyond the model and optimizer.
-        folder: absolute directory the checkpoints live in. Already joined with
-            the run's dump folder by the caller.
+        folder: run output directory. The base manager joins config.folder to
+            this path to resolve the checkpoint directory.
         sd_adapter: converts model state dicts between the native layout and
             another format (HF safetensors). ``builder`` always passes
             ``ModelStateDictAdapter``; passing none rejects the HF

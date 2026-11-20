@@ -96,19 +96,11 @@ class UpdateResult:
 
     step: int
     grad_norm: torch.Tensor | None
-    updated: bool
-    scheduler_advanced: bool
-    ema_advanced: bool
     auxiliary_metrics: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if type(self.step) is not int or self.step < 0:
             raise ValueError("Update step must be a nonnegative integer")
-        for name in ("updated", "scheduler_advanced", "ema_advanced"):
-            if type(getattr(self, name)) is not bool:
-                raise TypeError(f"Update {name} must be boolean")
-        if not self.updated and (self.scheduler_advanced or self.ema_advanced):
-            raise ValueError("Scheduler and EMA cannot advance without an update")
         if self.grad_norm is not None:
             if not isinstance(self.grad_norm, torch.Tensor):
                 raise TypeError("Update grad_norm must be a tensor or None")

@@ -73,6 +73,9 @@ class _TrainingStepOperations:
     __slots__ = ()
 
     model_parts: list[torch.nn.Module]
+    parallel_dims: ParallelTopology | None
+    param_context: ParamContext
+    _dense_backward: Callable[..., torch.Tensor]
     device: torch.device
     error_group: ProcessGroup | None
     execution_layouts: tuple[ExecutionLayout, ...]
@@ -226,6 +229,27 @@ class _TrainingStepOperations:
         (loss_sum / global_valid_tokens).backward()
         return loss_sum.detach()
 
+    def forward_backward_dense(
+        self,
+        inputs: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        extra_kwargs: dict[str, Any],
+        global_valid_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one accumulation group without selecting execution policy."""
+        with synchronize_local_errors(
+            "Training loss normalization validation", group=self.error_group
+        ):
+            validate_normalization_tokens(global_valid_tokens, device=labels.device)
+        with self.param_context(), spmd_context(self.parallel_dims):
+            return self._dense_backward(
+                inputs,
+                labels,
+                extra_kwargs=extra_kwargs,
+                global_valid_tokens=global_valid_tokens,
+            )
+
     def optimizer_step(
         self,
         step: int,
@@ -246,9 +270,6 @@ class _TrainingStepOperations:
             result = UpdateResult(
                 step=step,
                 grad_norm=grad_norm,
-                updated=True,
-                scheduler_advanced=True,
-                ema_advanced=self.ema is not None,
                 auxiliary_metrics={}
                 if auxiliary_metrics is None
                 else auxiliary_metrics,
@@ -434,27 +455,6 @@ class TrainingEngine(_TrainingStepOperations):
             # before checkpointing, EMA or the next training update observes them.
             for module in iter_fsdp_modules(model):
                 module.reshard()
-
-    def forward_backward_dense(
-        self,
-        inputs: torch.Tensor,
-        labels: torch.Tensor,
-        *,
-        extra_kwargs: dict[str, Any],
-        global_valid_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run one accumulation group without selecting execution policy."""
-        with synchronize_local_errors(
-            "Training loss normalization validation", group=self.error_group
-        ):
-            validate_normalization_tokens(global_valid_tokens, device=labels.device)
-        with self.param_context(), spmd_context(self.parallel_dims):
-            return self._dense_backward(
-                inputs,
-                labels,
-                extra_kwargs=extra_kwargs,
-                global_valid_tokens=global_valid_tokens,
-            )
 
     def finish_step(
         self,

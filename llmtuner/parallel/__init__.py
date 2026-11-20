@@ -18,10 +18,9 @@ from __future__ import annotations
 
 from ..utils.lazy_exports import resolve_export
 
-# Lazy (PEP 562): ``compatibility`` is read by ``llmtuner/config``, which must stay
-# importable without the engine layer (context_parallel pulls in the model
-# stack and its spmd surface). Eager re-exports would make any submodule
-# import -- compatibility included -- pay for the whole engine.
+# Keep submodule imports independent of unrelated parallel implementations.
+# Context parallelism pulls in the model stack and its spmd dependencies;
+# resolving public entries lazily avoids loading that stack for every import.
 _EXPORT_SOURCES = {
     "ParallelPlan": "plan",
     "PlanTarget": "plan",

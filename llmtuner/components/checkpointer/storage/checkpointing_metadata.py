@@ -67,3 +67,18 @@ def adapt_metadata_gather(manager: Any) -> bool:
     metadata._all_gather_pickled_data = MethodType(_gather_pickled_metadata, metadata)
     logger.info("Applied instance-scoped device-aware metadata gather")
     return True
+
+
+def configure_sync_metadata(manager: Any) -> None:
+    """Publish every synchronous checkpoint without background serialization.
+
+    The sync writer serializes compute_metadata's return value itself; a cache
+    hit produces payload files without a metadata marker. Configure only this
+    manager's default implementation, retaining async and custom policies.
+    """
+    metadata = getattr(manager, "_metadata_manager", None)
+    if DefaultMetadataManager is not None and type(metadata) is DefaultMetadataManager:
+        metadata._should_cache_metadata = False
+        # SyncCheckpointSaver pickles the returned metadata itself. Its writer
+        # never consumes the metadata manager's background serialized cache.
+        metadata._enable_serialization = False

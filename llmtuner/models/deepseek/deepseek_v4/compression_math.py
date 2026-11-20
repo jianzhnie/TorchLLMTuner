@@ -64,6 +64,7 @@ def compress_overlap(
 def compress_overlap_context_parallel(
     self, hidden_states, *, exchange_windows, exchange_previous_window
 ):
+    """Compress owned CSA windows with explicit communication callbacks."""
     projected = torch.cat(
         (self.kv_proj(hidden_states), self.gate_proj(hidden_states)), dim=-1
     )

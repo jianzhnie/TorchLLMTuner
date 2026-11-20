@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import dataclasses
-import typing
-from copy import copy
+from llmtuner.config.utils import hide_cli_fields
 
 from .checkpoint_config import CheckpointConfig
 from .data_config import DataloaderConfig
@@ -79,22 +77,4 @@ PROGRAMMATIC_ONLY: dict[type, frozenset[str]] = {
 
 def cli_view(cls: type) -> type:
     """``cls`` with its programmatic-only fields hidden from the parser."""
-    hidden = PROGRAMMATIC_ONLY.get(cls)
-    if not hidden:
-        return cls
-    fields = {option.name: option for option in dataclasses.fields(cls)}
-    unknown = hidden - fields.keys()
-    if unknown:
-        raise RuntimeError(
-            f"{cls.__name__} has no fields {sorted(unknown)}: "
-            "config.cli_config.PROGRAMMATIC_ONLY is stale"
-        )
-    hints = typing.get_type_hints(cls)
-    namespace: dict[str, typing.Any] = {
-        "__annotations__": {name: hints[name] for name in hidden}
-    }
-    for name in hidden:
-        option = copy(fields[name])
-        option.init = False
-        namespace[name] = option
-    return dataclasses.dataclass(type(cls.__name__, (cls,), namespace))
+    return hide_cli_fields(cls, PROGRAMMATIC_ONLY.get(cls))

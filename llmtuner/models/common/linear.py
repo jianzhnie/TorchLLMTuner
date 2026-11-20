@@ -20,7 +20,13 @@ from torch.autograd.function import once_differentiable
 
 from ...accelerator.spmd_backend import spmd
 
-__all__ = ["CastLinear", "RouterGateLinear", "build_lm_head"]
+__all__ = ["CastLinear", "RouterGateLinear", "build_lm_head", "weights_are_tied"]
+
+
+def weights_are_tied(head: nn.Module | None, embedding: nn.Module | None) -> bool:
+    """Report live weight identity, including modules without a weight."""
+    weight = getattr(head, "weight", None)
+    return weight is not None and weight is getattr(embedding, "weight", None)
 
 
 def build_lm_head(

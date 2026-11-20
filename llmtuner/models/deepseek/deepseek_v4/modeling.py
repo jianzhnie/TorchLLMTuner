@@ -45,7 +45,7 @@ from ...common.gradient_norm import (
     packed_expert_reference_norm_group,
 )
 from ...common.input_preparation import prepare_text_inputs, restore_text_batch_rows
-from ...common.linear import build_lm_head
+from ...common.linear import build_lm_head, weights_are_tied
 from ...configuration import (
     configure_reference_experts,
     validate_attention_backend,
@@ -545,10 +545,7 @@ class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):
     @property
     def enable_weight_tying(self) -> bool:
         """Report actual Parameter identity rather than configuration intent."""
-        weight = getattr(self.lm_head, "weight", None)
-        return weight is not None and weight is getattr(
-            self.model.embed_tokens, "weight", None
-        )
+        return weights_are_tied(self.lm_head, self.model.embed_tokens)
 
     @property
     def layers(self) -> nn.ModuleList:

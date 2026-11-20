@@ -33,11 +33,6 @@ from llmtuner.errors import EnvironmentUnsupportedError
 
 from .device import get_current_device
 
-try:
-    import torch.distributed.fsdp._fully_shard._fully_shard as fully_shard_module
-except ImportError:
-    fully_shard_module = None
-
 __all__ = ["CAPABILITIES", "has", "is_compiling", "require"]
 
 
@@ -83,18 +78,6 @@ def dynamo_lru_cache_knob() -> bool:
         return False
     eval_frame = getattr(getattr(torch._C, "_dynamo", None), "eval_frame", None)
     return getattr(eval_frame, "_set_lru_cache", None) is not None
-
-
-def _fsdp_unshard_is_a_context_manager() -> bool:
-    """Whether an FSDP unshard can be held open across several backwards.
-
-    Probe API shape, not numerical correctness. A context manager alone does
-    not validate shared head ownership, repeated-backward gradient reduction,
-    or checkpoint restoration. torch 2.9's handle only has ``wait()``; inspect
-    the handle class rather than guessing from the torch version.
-    """
-    handle = getattr(fully_shard_module, "_UnshardHandleImpl", None)
-    return hasattr(handle, "__enter__") and hasattr(handle, "__exit__")
 
 
 def grouped_mm_runs() -> bool:
@@ -190,18 +173,6 @@ CAPABILITIES: dict[str, Capability] = {
         consumers="memory/activation_checkpoint.py (mode='memory_budget')",
     ),
     # -- FSDP (consumers: fully_shard_parallel, trainer/runtime/assembly) ------
-    "fsdp_unshard_context": Capability(
-        _fsdp_unshard_is_a_context_manager,
-        what="an FSDP unshard that stays open for the duration of a ``with`` "
-        "block (``UnshardHandle.__enter__``); this probes API shape, not "
-        "chunked-training correctness",
-        since="no released torch through 2.12 (``UnshardHandle`` still has "
-        "only ``wait()``); the probe, not a version number, decides",
-        hint="Absent: chunked_loss_num_chunks > 1 is refused under FSDP; run "
-        "with chunked_loss_num_chunks=1. A future context-manager API still "
-        "requires validation of head ownership, gradients and restore.",
-        consumers="trainer/runtime/assembly.py (chunked loss + FSDP guard)",
-    ),
     "fsdp_per_param_mesh": Capability(
         importable(
             "torch.distributed.fsdp._fully_shard._fsdp_common",

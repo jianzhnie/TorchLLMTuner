@@ -35,7 +35,7 @@ from ...common.gradient_norm import (
     qkv_reference_norm_group,
 )
 from ...common.input_preparation import prepare_text_inputs, restore_text_batch_rows
-from ...common.linear import build_lm_head
+from ...common.linear import build_lm_head, weights_are_tied
 from ...configuration import (
     configure_reference_experts,
     validate_attention_backend,
@@ -44,7 +44,7 @@ from ...configuration import (
 from ...contracts import DecoderStructure, GatedMLPStructure, MoEBlockContract
 from ...execution import ModelExecutionCapabilities
 from ..checkpoint import qwen35_text_configuration
-from ..ops import eager_experts_forward
+from ..ops import eager_experts_forward, initialize_packed_experts
 from ..routing import (
     Qwen3_5MoeFP32TopKRouter,
     Qwen3_5MoeTopKRouter,
@@ -226,22 +226,9 @@ class Qwen3_5MoeExperts(reference.Qwen3_5MoeExperts):
         return (packed_expert_reference_norm_group(self.gate_up_proj, self.down_proj),)
 
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
-        nn.Module.__init__(self)
-        self.num_experts = config.num_experts
-        self.hidden_dim = config.hidden_size
-        self.intermediate_dim = config.moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
-        )
-        self.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
+        initialize_packed_experts(self, config)
 
-    def forward(
-        self, hidden_states: Tensor, top_k_index: Tensor, top_k_weights: Tensor
-    ) -> Tensor:
-        return eager_experts_forward(self, hidden_states, top_k_index, top_k_weights)
+    forward = eager_experts_forward
 
 
 class Qwen3_5MoeSparseMoeBlock(reference.Qwen3_5MoeSparseMoeBlock):
@@ -664,10 +651,7 @@ class Qwen3_5MoeForCausalLM(reference.Qwen3_5MoeForCausalLM):
     @property
     def enable_weight_tying(self) -> bool:
         """Report actual Parameter identity rather than configuration intent."""
-        weight = getattr(self.lm_head, "weight", None)
-        return weight is not None and weight is getattr(
-            self.model.embed_tokens, "weight", None
-        )
+        return weights_are_tied(self.lm_head, self.model.embed_tokens)
 
     @property
     def layers(self) -> nn.ModuleList:

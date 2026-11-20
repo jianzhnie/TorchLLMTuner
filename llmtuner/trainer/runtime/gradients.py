@@ -196,6 +196,11 @@ def _collect_reference_groups(
                     )
                 identities = tuple(map(id, group.parameters))
                 if identities in groups:
+                    if groups[identities].layout != group.layout:
+                        raise ValueError(
+                            "Shared reference norm parameters declare "
+                            "conflicting layouts"
+                        )
                     continue
                 unique_ids = set(identities)
                 if not identities or len(unique_ids) != len(identities):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
@@ -25,6 +25,7 @@ from llmtuner.config.training_config import (
     TrainingConfig,
     validate_activation_swap_options,
 )
+from llmtuner.config.utils import rebuild_config_group
 from llmtuner.config.validation_config import ValidationConfig
 from llmtuner.errors import ConfigError
 from llmtuner.models.registry import get_model_spec
@@ -73,31 +74,18 @@ class LLMTunerConfig:
             }.items()
             if plan is not None
         }
-        parallel_fields = {
-            item.name: getattr(parallel, item.name)
-            for item in fields(ParallelConfig)
-            if item.init
-        }
-        parallel = ParallelConfig(**(parallel_fields | plans))
-        optimizer_fields = {
-            item.name: getattr(optimizer, item.name)
-            for item in fields(OptimizerConfig)
-            if item.init
-        }
-        optimizer_fields["lr_scheduler_config"] = lr_scheduler
-        optimizer = OptimizerConfig(**optimizer_fields)
-        training_fields = {
-            item.name: getattr(training, item.name)
-            for item in fields(TrainingConfig)
-            if item.init
-        }
-        training_fields.update(
+        parallel = rebuild_config_group(ParallelConfig, parallel, **plans)
+        optimizer = rebuild_config_group(
+            OptimizerConfig, optimizer, lr_scheduler_config=lr_scheduler
+        )
+        training = rebuild_config_group(
+            TrainingConfig,
+            training,
             checkpoint_config=checkpoint,
             dataloader_config=dataloader,
             metrics_config=metrics,
             profiler_config=profiler,
         )
-        training = TrainingConfig(**training_fields)
         return cls(
             model=model, parallel=parallel, optimizer=optimizer, training=training
         )

@@ -59,6 +59,41 @@ logger = get_logger(__name__)
 __all__ = ["OptimizersContainer"]
 
 
+def build_optimizer_factories(
+    config: OptimizerConfig,
+) -> dict[str, Callable[..., Optimizer]]:
+    """Build lazy constructors; callers acquire each returned optimizer."""
+
+    def build_dist_muon(groups: list[dict]) -> DistMuon:
+        ns_devices = {group.get("ns_device") for group in groups}
+        if len(ns_devices) != 1:
+            raise ValueError(
+                "DistMuon ns_device must be identical across parameter groups"
+            )
+        for group in groups:
+            group.pop("ns_device", None)
+        return DistMuon(
+            groups,
+            compute_sharding_by_fqn=config.compute_sharding_by_fqn,
+            bucket_configs=config.bucket_configs,
+            ns_device=ns_devices.pop(),
+        )
+
+    return {
+        "Adam": torch.optim.Adam,
+        "AdamW": torch.optim.AdamW,
+        "AdamWSwap": lambda groups: AdamWSwap(
+            groups,
+            max_device_bytes=config.swap_max_device_bytes,
+            max_host_bytes=config.swap_max_host_bytes,
+            prefetch=config.swap_prefetch,
+            memory_fraction=config.swap_memory_fraction,
+            update_device=get_current_device(),
+        ),
+        "DistMuon": build_dist_muon,
+    }
+
+
 @dataclass(slots=True)
 class _OptimizerGroups:
     """Constructor groups and their matching diagnostic patterns."""
@@ -215,34 +250,7 @@ class OptimizersContainer(OptimizerCheckpointState, Optimizer):
                 matched_configs=matched_configs,
             )
 
-            def build_dist_muon(groups: list[dict]) -> DistMuon:
-                ns_devices = {group.get("ns_device") for group in groups}
-                if len(ns_devices) != 1:
-                    raise ValueError(
-                        "DistMuon ns_device must be identical across parameter groups"
-                    )
-                for group in groups:
-                    group.pop("ns_device", None)
-                return DistMuon(
-                    groups,
-                    compute_sharding_by_fqn=config.compute_sharding_by_fqn,
-                    bucket_configs=config.bucket_configs,
-                    ns_device=ns_devices.pop(),
-                )
-
-            optimizer_factories: dict[str, Callable[..., Optimizer]] = {
-                "Adam": torch.optim.Adam,
-                "AdamW": torch.optim.AdamW,
-                "AdamWSwap": lambda groups: AdamWSwap(
-                    groups,
-                    max_device_bytes=config.swap_max_device_bytes,
-                    max_host_bytes=config.swap_max_host_bytes,
-                    prefetch=config.swap_prefetch,
-                    memory_fraction=config.swap_memory_fraction,
-                    update_device=get_current_device(),
-                ),
-                "DistMuon": build_dist_muon,
-            }
+            optimizer_factories = build_optimizer_factories(config)
             for groups_by_opt_name in model_group_plans:
                 for name in groups_by_opt_name:
                     if name not in optimizer_factories:
