@@ -33,6 +33,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
+from torch.utils.checkpoint import DefaultDeviceType
 
 from llmtuner.accelerator.collectives import all_reduce
 from llmtuner.config import ParallelConfig, SelectiveACConfig
@@ -114,6 +115,9 @@ def _full(t: torch.Tensor) -> torch.Tensor:
 
 def main() -> None:
     device = init_distributed()
+    if device.type == "cpu":
+        DefaultDeviceType.set_device_type("cpu")
+    foreach = False if device.type == "cpu" else None
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 2, f"this check assumes 2 ranks, got {world}"
@@ -128,7 +132,7 @@ def main() -> None:
 
     # -- single-rank reference over the union of both ranks' batches, AC OFF --
     ref = _build_model()
-    ref_opt = torch.optim.SGD(ref.parameters(), lr=LR)
+    ref_opt = torch.optim.SGD(ref.parameters(), lr=LR, foreach=foreach)
     ref_losses: list[float] = []
     ref_step0_grads: dict[str, torch.Tensor] = {}
     for step in range(STEPS):
@@ -156,7 +160,7 @@ def main() -> None:
         )
         model = apply_fsdp(model, cfg, parallel_dims)
 
-        opt = torch.optim.SGD(model.parameters(), lr=LR)
+        opt = torch.optim.SGD(model.parameters(), lr=LR, foreach=foreach)
         losses: list[float] = []
         for step in range(STEPS):
             ids, labels = _data(step, rank)

@@ -14,7 +14,6 @@ ALL_NAMES = [
     "functorch_activation_memory_budget",
     "dynamo_lru_cache",
     "fsdp_per_param_mesh",
-    "fsdp_unshard_context",
     "torch_grouped_mm",
 ]
 

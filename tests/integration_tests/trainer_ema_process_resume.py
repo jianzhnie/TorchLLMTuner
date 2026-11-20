@@ -16,7 +16,7 @@ run two validation batches after every training step.
 Add `moe` for native Qwen3 MoE with fixed routing and auxiliary loss;
 `ep2` additionally shards experts; `dp4` selects four worker ranks.
 Add `tp2` with dp4/moe for DP2 x TP2 fixed routing at EP1.
-Add `shared_experts` with moe/ep2 to share the two experts modules before assembly.
+Add `shared_experts` with moe and ep2 or tp2 to share experts before assembly.
 CPU only; no accelerator kernel coverage.
 """
 
@@ -265,14 +265,6 @@ def worker(
 
             blocks = collect_moe_layers(trainer.model_parts[0])
             assert len(blocks) == 2
-            if shared_experts:
-                first = blocks[0].routed_experts.inner_experts
-                second = blocks[1].routed_experts.inner_experts
-                assert first is second
-                for parameter_name in ("w1_EFD", "w3_EFD", "w2_EDF"):
-                    assert getattr(first, parameter_name) is getattr(
-                        second, parameter_name
-                    )
             for block in blocks:
                 expert = block.routed_experts.inner_experts.w1_EFD
                 assert expert.shape[0] == 2
@@ -281,6 +273,12 @@ def worker(
                     assert expert.device_mesh.size() == 2
                     assert expert.to_local().numel() * 2 == expert.numel()
                 assert block.routed_experts.token_dispatcher.ep_group.size() == ep_size
+        if shared_experts:
+            first = blocks[0].routed_experts.inner_experts
+            second = blocks[1].routed_experts.inner_experts
+            assert first is second
+            for parameter_name in ("w1_EFD", "w3_EFD", "w2_EDF"):
+                assert getattr(first, parameter_name) is getattr(second, parameter_name)
         if implementation == "custom":
             from llmtuner.parallel.fully_shard_parallel.fine_grained.fine_grained_state import (  # noqa: E501
                 FineGrainedFSDPState,
@@ -445,8 +443,10 @@ def main():
     world_size = 4 if "dp4" in sys.argv[1:] else 2 if "dp2" in sys.argv[1:] else 1
     if "ep2" in sys.argv[1:] and ("moe" not in sys.argv[1:] or world_size < 2):
         raise ValueError("ep2 requires moe and dp2 or dp4")
-    if "shared_experts" in options and not {"moe", "ep2"} <= options:
-        raise ValueError("shared_experts requires moe and ep2")
+    if "shared_experts" in options and (
+        "moe" not in options or not {"ep2", "tp2"} & options
+    ):
+        raise ValueError("shared_experts requires moe and ep2 or tp2")
     ep_size = 2 if "ep2" in sys.argv[1:] else 1
     tp_size = 2 if "tp2" in sys.argv[1:] else 1
     if tp_size > 1 and (world_size != 4 or "moe" not in sys.argv[1:] or ep_size != 1):

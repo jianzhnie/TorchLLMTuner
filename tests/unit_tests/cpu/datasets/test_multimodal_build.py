@@ -218,7 +218,10 @@ def test_importing_the_text_path_needs_no_multimodal_dependencies():
         "assert isinstance(loader_builder.MULTIMODAL_IMPORT_ERROR, ImportError)\n"
     )
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(pathlib.Path(__file__).parents[3])
+    repo_root = str(pathlib.Path(__file__).resolve().parents[4])
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (repo_root, env.get("PYTHONPATH")))
+    )
     result = subprocess.run(
         [sys.executable, "-c", source],
         capture_output=True,

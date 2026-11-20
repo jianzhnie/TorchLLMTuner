@@ -3,6 +3,7 @@ import torch
 from torch import nn
 
 from llmtuner.models.common.gradient_norm import (
+    ReferenceNormGroup,
     interleave_qkv,
     packed_expert_reference_norm_group,
     qkv_reference_norm_group,
@@ -11,6 +12,38 @@ from llmtuner.trainer.runtime.gradients import (
     clip_grad_norm_,
     reference_norm_gradients,
 )
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_shared_reference_groups_require_consistent_layout(conflicting):
+    parameter = nn.Parameter(torch.ones(2))
+    parameter.grad = torch.tensor([3.0, 4.0])
+    original = parameter.grad.clone()
+    calls = []
+
+    def build():
+        calls.append("build")
+        return ((parameter.grad,),)
+
+    def validate():
+        calls.append("validate")
+
+    parts = [nn.Module(), nn.Module()]
+    for index, part in enumerate(parts):
+        part.register_parameter("weight", parameter)
+        group = ReferenceNormGroup(
+            (parameter,), build, validate, "other" if conflicting and index else "same"
+        )
+        part.reference_norm_groups = lambda group=group: (group,)
+    if conflicting:
+        with pytest.raises(ValueError, match="conflicting layouts"):
+            reference_norm_gradients([parameter], parts)
+        assert calls == []
+    else:
+        gradients = reference_norm_gradients([parameter], parts)
+        assert len(gradients) == 1 and gradients[0] is parameter.grad
+        assert calls == ["validate", "build"]
+    torch.testing.assert_close(parameter.grad, original, rtol=0, atol=0)
 
 
 def test_interleave_uses_kv_groups_not_naive_projection_concatenation():

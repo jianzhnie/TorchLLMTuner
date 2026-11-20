@@ -7,13 +7,14 @@ on purpose: that is the *runtime* registry for torch knobs a built feature
 checks; this table is about import-level hard dependencies of test modules
 (DTensor, grain, ...), which fail at collection, not at a guard.
 
-A test module declares what it needs with a top-of-file comment::
+A test module gates imports by calling this module before dependent imports::
 
-    # requires-env: dtensor, spmd_types
+    from tests.caps import require_env
+    require_env("dtensor", "spmd_types")
 
-and the conftest collection hook skips the whole module, with a uniform
-``[env] missing: ...`` reason, when a probe fails. Modules that import fine
-need no marker.
+The call skips the module with an ``[env] missing: ...`` reason when a probe
+fails. Comments alone do not gate collection. Use ``skip_without`` when only
+individual tests require an optional dependency.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ def _has_spec(module: str) -> bool:
 def importable(module: str) -> bool:
     """Whether ``module`` imports (or was already injected, e.g. by a stub)."""
     if module in sys.modules:
-        return True
+        return sys.modules[module] is not None
     if not _has_spec(module):
         return False
     try:
@@ -82,7 +83,9 @@ CAPS: dict[str, Callable[[], bool]] = {
         "llmtuner.parallel.fully_shard_parallel.fine_grained.fine_grained_state"
     ),
     # the spmd_types shims the model/parallel layers import
-    "spmd_types": lambda: importable("spmd_types"),
+    # Torch's backend autoload may import FSDP, which imports spmd_types again.
+    # Initialize Torch first rather than misclassifying that cycle as absence.
+    "spmd_types": lambda: importable("torch") and importable("spmd_types"),
     # Grain data graph (datasets/)
     "grain": lambda: importable("grain.python"),
     # flex attention (BlockMask & friends)

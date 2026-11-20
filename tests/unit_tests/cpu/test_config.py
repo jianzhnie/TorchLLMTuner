@@ -100,6 +100,32 @@ def test_cli_config_parsing_does_not_require_training_engine():
     )
 
 
+def test_invalid_seed_cli_does_not_resolve_lazy_trainer():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys\n"
+            "from types import SimpleNamespace\n"
+            "sys.modules['llmtuner.trainer.trainer'] = None\n"
+            "from llmtuner.trainer import cli\n"
+            "os.environ['WORLD_SIZE'] = '2'\n"
+            "cli.parse_config = lambda: SimpleNamespace(checkpoint=SimpleNamespace("
+            "create_seed_checkpoint=True, enable=True))\n"
+            "try:\n"
+            "    cli.main()\n"
+            "except cli.ConfigError as error:\n"
+            "    assert 'single device' in str(error)\n"
+            "else:\n"
+            "    raise AssertionError('Invalid seed configuration was accepted')\n",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 # -- ParallelConfig ----------------------------------------------------------
 
 
@@ -440,6 +466,36 @@ def test_excluding_the_optimizer_must_exclude_the_schedule_too() -> None:
     # The paired form is accepted.
     cfg = CheckpointConfig(exclude_from_loading=[OPTIMIZER, LR_SCHEDULER])
     assert set(cfg.exclude_from_loading) == {OPTIMIZER, LR_SCHEDULER}
+
+
+@pytest.mark.parametrize(
+    "excluded",
+    [None, False, 1, "ema", {"ema": True}, [None], ["ema", 1], [""], [" "]],
+)
+def test_checkpoint_excluded_states_require_string_list(excluded) -> None:
+    with pytest.raises(ConfigError, match="exclude_from_loading must be a list"):
+        CheckpointConfig(exclude_from_loading=excluded)
+
+
+@pytest.mark.parametrize("excluded", [[], ["ema"], ["optimizer", "lr_scheduler"]])
+def test_checkpoint_excluded_states_parse_through_public_cli(excluded) -> None:
+    from llmtuner.trainer.cli import parse_config
+
+    args = ["--exclude_from_loading", *excluded] if excluded else []
+    assert parse_config(args).checkpoint.exclude_from_loading == excluded
+
+
+@pytest.mark.parametrize("path", [False, True, 0, 1, [], {}, ["/weights"]])
+def test_initial_load_path_rejects_non_strings(path) -> None:
+    with pytest.raises(
+        ConfigError, match="checkpoint.initial_load_path must be a string or None"
+    ):
+        CheckpointConfig(initial_load_path=path)
+
+
+@pytest.mark.parametrize("path", [None, "", "/weights", "s3://bucket/weights"])
+def test_initial_load_path_preserves_optional_and_absolute_paths(path) -> None:
+    assert CheckpointConfig(initial_load_path=path).initial_load_path == path
 
 
 def test_a_relative_initial_load_path_is_rejected() -> None:
@@ -1209,3 +1265,28 @@ def test_auto_fill_keeps_explicit_sizes_when_metadata_unavailable(monkeypatch):
 def test_checkpoint_async_mode_rejects_nonstring_values(mode):
     with pytest.raises(ConfigError, match="checkpoint.async_mode must be one of"):
         CheckpointConfig(async_mode=mode)
+
+
+def test_rebuild_config_group_uses_target_init_fields_and_shares_nested_values():
+    from dataclasses import dataclass, field
+
+    from llmtuner.config.utils import rebuild_config_group
+
+    @dataclass
+    class Group:
+        size: int = 1
+        nested: list[int] = field(default_factory=list)
+        derived: int = field(default=7, init=False)
+
+    @dataclass
+    class CLIGroup(Group):
+        nested: list[int] = field(default_factory=list, init=False)
+
+    source = CLIGroup(size=3)
+    source.nested.append(4)
+    source.derived = 99
+    result = rebuild_config_group(Group, source, size=5)
+    assert type(result) is Group
+    assert result.size == 5 and source.size == 3
+    assert result.nested is source.nested
+    assert result.derived == 7 and source.derived == 99

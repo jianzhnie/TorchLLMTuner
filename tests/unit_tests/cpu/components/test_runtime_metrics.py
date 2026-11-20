@@ -58,7 +58,7 @@ def test_step_reporting_preserves_accumulation_and_normalization(monkeypatch):
         }
         loss = torch.tensor(12.0)
         denominator = torch.tensor(8)
-        update = UpdateResult(1, torch.tensor(3.0), True, True, False)
+        update = UpdateResult(1, torch.tensor(3.0))
         result = metrics.build_step_metrics(
             ntokens_seen=16,
             device=torch.device("cpu"),

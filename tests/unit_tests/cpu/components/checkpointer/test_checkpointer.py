@@ -3806,3 +3806,78 @@ def test_optional_native_model_export_is_valid_but_not_automatic_resume(
         torch.testing.assert_close(model.state_dict(), exported, rtol=0, atol=0)
     finally:
         imported.close()
+
+
+@pytest.mark.parametrize("deleting_rank", [False, True])
+def test_retention_worker_exists_only_on_deleting_rank(
+    tmp_path, monkeypatch, deleting_rank
+):
+    from llmtuner.components.checkpointer.core import base
+
+    monkeypatch.setattr(base, "is_main_process", lambda: deleting_rank)
+    manager = DistributedCheckpointManager(
+        Config(enable=True, keep_latest_k=2),
+        model_parts=[],
+        optimizer=None,
+        lr_scheduler=None,
+        states={},
+        folder=str(tmp_path),
+    )
+    abandoned = tmp_path / "checkpoint" / "step-1"
+    abandoned.mkdir(parents=True)
+    try:
+        if deleting_rank:
+            assert manager.purge_thread.is_alive()
+        else:
+            assert manager.purge_thread is None
+            assert not hasattr(manager, "purge_queue")
+        manager._purge_stale_checkpoints(saving_step=2)
+    finally:
+        manager.close()
+    assert abandoned.exists() != deleting_rank
+    if deleting_rank:
+        assert not manager.purge_thread.is_alive()
+
+
+@pytest.mark.parametrize("keep_latest_k", [0, 2])
+def test_optional_sync_backend_publishes_each_checkpoint_metadata(
+    tmp_path, keep_latest_k
+):
+    import importlib.util
+
+    if importlib.util.find_spec("torch_checkpointing") is None:
+        pytest.skip("torch_checkpointing is not installed")
+    from llmtuner.components.checkpointer.backends.torch_checkpointing_backend import (
+        TorchCheckpointingManager,
+    )
+
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    manager = TorchCheckpointingManager(
+        Config(enable=True, interval=1, keep_latest_k=keep_latest_k),
+        model_parts=[model],
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={},
+        folder=str(tmp_path),
+    )
+    try:
+        for step in range(1, 5):
+            with torch.no_grad():
+                model.weight.fill_(step)
+            assert manager.save(step)
+            manager.maybe_wait_for_saving()
+            metadata = manager._manager._metadata_manager
+            assert metadata._serialization_future is None
+            assert metadata._cached_serialized_metadata is None
+            assert not metadata._metadata_executor._threads
+            checkpoint = manager._create_checkpoint_id(step)
+            assert manager._is_resumable_checkpoint(checkpoint)
+            assert manager._find_load_step() == step
+    finally:
+        manager.close()
+    expected = (
+        ["step-3", "step-4"] if keep_latest_k else [f"step-{i}" for i in range(1, 5)]
+    )
+    assert sorted(path.name for path in (tmp_path / "checkpoint").iterdir()) == expected

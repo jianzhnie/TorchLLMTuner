@@ -643,9 +643,10 @@ def test_tp_expert_sharding_preserves_freezing():
 @pytest.mark.parametrize(
     "sharing",
     [
-        "experts_module",
         "expert_parameter",
         "external",
+        "owner_external",
+        "unselected_block",
         "shared_external",
         "shared_axes",
     ],
@@ -656,12 +657,18 @@ def test_tp_rejects_shared_moe_shards_before_mutating_model(sharing):
     second = _MoeBlock(4, 16, 8, top_k=2)
     model.layers.append(nn.ModuleDict({"mlp": second}))
     model.layers[-1].moe_block_name = "mlp"
-    if sharing == "experts_module":
-        second.experts = first.experts
-    elif sharing == "expert_parameter":
+    if sharing == "expert_parameter":
         second.experts.gate_up_proj = first.experts.gate_up_proj
     elif sharing == "external":
         model.external_weight = first.experts.gate_up_proj
+    elif sharing == "owner_external":
+        model.external_experts = first.experts
+    elif sharing == "unselected_block":
+        second.experts = first.experts
+        model.tp_config = {
+            path.replace("layers.*", "layers.0"): spec
+            for path, spec in MOE_PLAN.items()
+        }
     else:
         first.shared_expert = _SharedMLP(16, 16)
         shared = first.shared_expert
@@ -672,6 +679,8 @@ def test_tp_rejects_shared_moe_shards_before_mutating_model(sharing):
             shared.down_proj.weight = shared.gate_proj.weight
     parameters = dict(model.named_parameters(remove_duplicate=False))
     values = {name: p.detach().clone() for name, p in parameters.items()}
+    storage = {name: p.untyped_storage().data_ptr() for name, p in parameters.items()}
+    rng_state = torch.get_rng_state().clone()
     classes = [type(first), type(second)]
     with pytest.raises(ValueError, match="shared.*paths"):
         apply_tp(
@@ -681,10 +690,60 @@ def test_tp_rejects_shared_moe_shards_before_mutating_model(sharing):
         )
     for name, parameter in model.named_parameters(remove_duplicate=False):
         assert parameter is parameters[name]
+        assert parameter.untyped_storage().data_ptr() == storage[name]
         torch.testing.assert_close(parameter, values[name], rtol=0, atol=0)
+    assert torch.equal(torch.get_rng_state(), rng_state)
     assert [type(first), type(second)] == classes
     assert not isinstance(first, FeatureParallelSequenceBoundary)
     assert not isinstance(second, FeatureParallelSequenceBoundary)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_tp_shards_shared_routed_owner_once(rank):
+    model = _MoeModel()
+    first = model.layers[0]["mlp"]
+    second = _MoeBlock(4, 16, 8, top_k=2)
+    second.experts = first.experts
+    model.layers.append(nn.ModuleDict({"mlp": second}))
+    model.layers[-1].moe_block_name = "mlp"
+    gate_up = first.experts.gate_up_proj.detach().clone()
+    down = first.experts.down_proj.detach().clone()
+    original_parameters = dict(first.experts.named_parameters())
+    original_parameters["gate_up_proj"].requires_grad_(False)
+    replacements = []
+    cfg = ParallelConfig(tensor_parallel_size=2)
+    apply_tp(
+        model,
+        mesh=_FakeMesh(2, rank),
+        cfg=cfg,
+        on_replacement=lambda modules, parameters: replacements.append(parameters),
+    )
+    assert first.experts is second.experts
+    assert len(replacements) == 1
+    assert not first.experts.gate_up_proj.requires_grad
+    assert first.experts.down_proj.requires_grad
+    for name, original in original_parameters.items():
+        current = getattr(first.experts, name)
+        assert replacements[0][original] == (current,)
+        spec = first.experts._tp_init_specs[name]
+        assert spec.global_shape == tuple(original.shape)
+        assert (spec.size, spec.rank) == (2, rank)
+        assert spec.packed is (name == "gate_up_proj")
+        for path in ("layers.0.mlp", "layers.1.mlp"):
+            assert model.get_parameter(f"{path}.experts.{name}") is current
+    expected = torch.cat(
+        [half.chunk(2, dim=1)[rank] for half in gate_up.chunk(2, dim=1)], dim=1
+    )
+    torch.testing.assert_close(first.experts.gate_up_proj, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        first.experts.down_proj, down.chunk(2, dim=2)[rank], rtol=0, atol=0
+    )
+    assert first.tp_sharded_param_names == second.tp_sharded_param_names
+    for path in ("layers.0.mlp", "layers.1.mlp"):
+        assert f"{path}.experts.gate_up_proj" in model._tp_checkpoint_layouts
+    parameter = first.experts.gate_up_proj
+    apply_tp(model, mesh=_FakeMesh(2, rank), cfg=cfg)
+    assert first.experts.gate_up_proj is parameter
 
 
 @pytest.mark.parametrize("same_module", [False, True])

@@ -98,7 +98,11 @@ def check_failure(failing_rank, phase):
         assert calls == expected_calls
         assert not manager._initialized
         if phase in {"logging", "thread"}:
-            assert not manager.purge_thread.is_alive()
+            if dist.get_rank() == 0:
+                assert not manager.purge_thread.is_alive()
+            else:
+                assert manager.purge_thread is None
+                assert not hasattr(manager, "purge_queue")
         manager.close()
         assert calls == expected_calls
         dist.barrier()
@@ -110,7 +114,9 @@ def main():
     dist.init_process_group("gloo", timeout=timedelta(seconds=10))
     try:
         for phase in ("build", "storage", "dependency", "logging", "thread"):
-            for failing_rank in (0, 1):
+            # Only rank 0 owns a retention thread; other local services still
+            # inject failures independently on either rank.
+            for failing_rank in (0,) if phase == "thread" else (0, 1):
                 check_failure(failing_rank, phase)
     finally:
         dist.destroy_process_group()

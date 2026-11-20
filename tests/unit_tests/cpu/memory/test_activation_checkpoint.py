@@ -760,16 +760,10 @@ def test_selective_ac_matches_uncheckpointed_bitwise_on_moe() -> None:
 
 
 def test_full_ac_matches_uncheckpointed_bitwise_on_moe() -> None:
-    """FullAC replays the MoE block's dispatch/combine in backward -- that
-    replay must be numerically identical to the forward.
+    """Local MoE replay preserves outputs and every parameter gradient.
 
-    llmtuner's supported dispatchers (local reorder, all_to_all_single with
-    fixed split sizes) are deterministic, so a replayed dispatch reproduces
-    the forward's token order and the gradients route to the right tokens.
-    This is the property upstream had to re-establish for DeepEP by saving its
-    dispatch/combine instead of replaying them; llmtuner refuses those
-    backends at config time, so the replay path pinned here is the only one
-    FullAC can hit.
+    This fixture does not create an EP process group. Distributed all-to-all
+    outputs are saved by full_policy and require a separate torchrun check.
     """
     ref = _moe_model()
     ref_logits = _moe_loss_and_backward(ref)

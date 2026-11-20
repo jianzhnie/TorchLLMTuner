@@ -51,7 +51,6 @@ def main():
                     build_step_metrics(
                         ntokens_seen=7,
                         device=device,
-                        pp_has_last_stage=False,
                         accumulation=AccumulationResult(
                             torch.tensor(
                                 shard_sums[dp][coordinate], dtype=dtype, device=device
@@ -63,9 +62,7 @@ def main():
                         ),
                         local_valid_tokens=counts[dp],
                         reduction_meshes=meshes,
-                        update=UpdateResult(
-                            1, torch.tensor(2.0, device=device), True, True, False
-                        ),
+                        update=UpdateResult(1, torch.tensor(2.0, device=device)),
                         lr_metrics={"lr/SGD": 0.1},
                     )
                     if sum(counts)

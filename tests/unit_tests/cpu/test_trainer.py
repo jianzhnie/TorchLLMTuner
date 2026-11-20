@@ -1612,7 +1612,10 @@ def test_create_seed_checkpoint_writes_a_step_0_checkpoint_and_exits(tmp_path) -
     repo_root = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     )
-    env = {**os.environ, "PYTHONPATH": repo_root}
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (repo_root, env.get("PYTHONPATH")))
+    )
     result = subprocess.run(
         [
             sys.executable,

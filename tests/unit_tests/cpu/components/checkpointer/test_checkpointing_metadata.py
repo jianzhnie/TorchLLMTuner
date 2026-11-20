@@ -136,3 +136,39 @@ def test_metadata_failure_stays_inside_its_local_error_boundary(monkeypatch, pha
             "decoding": ["size", "payload"],
         }[phase]
     )
+
+
+def test_sync_metadata_cache_adapter_is_instance_scoped(monkeypatch):
+    class DefaultMetadataManager:
+        _should_cache_metadata = True
+        _enable_serialization = True
+
+    target = DefaultMetadataManager()
+    other = DefaultMetadataManager()
+    monkeypatch.setattr(metadata, "DefaultMetadataManager", DefaultMetadataManager)
+    metadata.configure_sync_metadata(SimpleNamespace(_metadata_manager=target))
+    assert target._should_cache_metadata is False
+    assert target._enable_serialization is False
+    assert other._should_cache_metadata is True
+    assert other._enable_serialization is True
+    assert DefaultMetadataManager._should_cache_metadata is True
+
+
+def test_sync_metadata_cache_adapter_preserves_custom_implementations(monkeypatch):
+    class DefaultMetadataManager:
+        _should_cache_metadata = True
+        _enable_serialization = True
+
+    class CustomMetadataManager(DefaultMetadataManager):
+        pass
+
+    custom = CustomMetadataManager()
+    monkeypatch.setattr(metadata, "DefaultMetadataManager", DefaultMetadataManager)
+    metadata.configure_sync_metadata(SimpleNamespace(_metadata_manager=custom))
+    metadata.configure_sync_metadata(SimpleNamespace())
+    assert custom._should_cache_metadata is True
+    assert custom._enable_serialization is True
+    monkeypatch.setattr(metadata, "DefaultMetadataManager", None)
+    metadata.configure_sync_metadata(SimpleNamespace(_metadata_manager=custom))
+    assert custom._should_cache_metadata is True
+    assert custom._enable_serialization is True

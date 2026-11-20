@@ -1,6 +1,8 @@
 """Pre-clipping observations must preserve the gradient used by Trainer."""
 
-# requires-env: dtensor
+from tests.caps import require_env
+
+require_env("dtensor")
 
 from types import SimpleNamespace
 
